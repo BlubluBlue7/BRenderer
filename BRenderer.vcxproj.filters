@@ -21,7 +21,22 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="Camera.cpp">
+      <Filter>BRenderer</Filter>
+    </ClCompile>
     <ClCompile Include="main.cpp">
+      <Filter>BRenderer</Filter>
+    </ClCompile>
+    <ClCompile Include="Mesh.cpp">
+      <Filter>BRenderer</Filter>
+    </ClCompile>
+    <ClCompile Include="MeshGPU.cpp">
+      <Filter>BRenderer</Filter>
+    </ClCompile>
+    <ClCompile Include="MeshMgr.cpp">
+      <Filter>BRenderer</Filter>
+    </ClCompile>
+    <ClCompile Include="ModelLoader.cpp">
       <Filter>BRenderer</Filter>
     </ClCompile>
     <ClCompile Include="Platform\Window.cpp">
@@ -30,30 +45,27 @@
     <ClCompile Include="Renderer.cpp">
       <Filter>BRenderer</Filter>
     </ClCompile>
-    <ClCompile Include="Mesh.cpp">
-      <Filter>BRenderer</Filter>
-    </ClCompile>
-    <ClCompile Include="MeshMgr.cpp">
-      <Filter>BRenderer</Filter>
-    </ClCompile>
-    <ClCompile Include="MeshGPU.cpp">
-      <Filter>BRenderer</Filter>
-    </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="Platform\Window.h">
-      <Filter>Platform</Filter>
-    </ClInclude>
-    <ClInclude Include="Renderer.h">
+    <ClInclude Include="Camera.h">
       <Filter>BRenderer</Filter>
     </ClInclude>
     <ClInclude Include="Mesh.h">
       <Filter>BRenderer</Filter>
     </ClInclude>
+    <ClInclude Include="MeshGPU.h">
+      <Filter>BRenderer</Filter>
+    </ClInclude>
     <ClInclude Include="MeshMgr.h">
       <Filter>BRenderer</Filter>
     </ClInclude>
-    <ClInclude Include="MeshGPU.h">
+    <ClInclude Include="ModelLoader.h">
+      <Filter>BRenderer</Filter>
+    </ClInclude>
+    <ClInclude Include="Platform\Window.h">
+      <Filter>Platform</Filter>
+    </ClInclude>
+    <ClInclude Include="Renderer.h">
       <Filter>BRenderer</Filter>
     </ClInclude>
   </ItemGroup>

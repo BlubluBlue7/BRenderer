@@ -1,5 +1,4 @@
 #pragma once
-#pragma once
 #include <d3d11.h>
 #include <wrl/client.h>
 #include "Mesh.h"
@@ -9,10 +8,10 @@ class MeshGPU
 public:
     MeshGPU() = default;
 
-    // ÉÏ´« Mesh Êı¾İµ½ GPU
+    // ä¸Šä¼  Mesh æ•°æ®åˆ° GPU
     bool UploadToGPU(ID3D11Device* device, ID3D11DeviceContext* context, const Mesh& mesh);
 
-    // °ó¶¨²¢»æÖÆ
+    // ç»‘å®šå¹¶ç»˜åˆ¶
     void Bind(ID3D11DeviceContext* context);
     void Draw(ID3D11DeviceContext* context);
 

@@ -4,7 +4,8 @@
 struct Vertex
 {
     float position[3];
-    float color[3];  // 可扩展为法线/UV/切线等
+    float normal[3];  // 娉曠嚎鍚戦噺锛堢敤浜庡厜鐓ц绠楋級
+    float color[3];   // 椤剁偣棰滆壊锛堟潗璐ㄩ鑹诧級
 };
 
 class Mesh

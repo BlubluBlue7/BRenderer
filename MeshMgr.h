@@ -12,12 +12,12 @@ public:
     MeshMgr(ID3D11Device* device, ID3D11DeviceContext* context)
         : device(device), context(context) {}
 
-    // 添加 Mesh
+    // 鍒涘缓 Mesh
     std::shared_ptr<Mesh> CreateMesh(const std::string& name,
         const std::vector<Vertex>& verts,
         const std::vector<uint32_t>& indices = {});
 
-    // 获取 GPU 对象
+    // 鑾峰彇 GPU 璧勬簮
     std::shared_ptr<MeshGPU> GetMeshGPU(const std::string& name);
 
 private:

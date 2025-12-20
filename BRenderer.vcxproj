@@ -131,17 +131,21 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="Camera.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="Mesh.cpp" />
     <ClCompile Include="MeshGPU.cpp" />
     <ClCompile Include="MeshMgr.cpp" />
+    <ClCompile Include="ModelLoader.cpp" />
     <ClCompile Include="Platform\Window.cpp" />
     <ClCompile Include="Renderer.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="Camera.h" />
     <ClInclude Include="Mesh.h" />
     <ClInclude Include="MeshGPU.h" />
     <ClInclude Include="MeshMgr.h" />
+    <ClInclude Include="ModelLoader.h" />
     <ClInclude Include="Platform\Window.h" />
     <ClInclude Include="Renderer.h" />
   </ItemGroup>
