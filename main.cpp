@@ -4,26 +4,63 @@
 #include <windows.h>
 #include <chrono>
 #include <algorithm>
+#include <string>
+#include <objbase.h>  // COM初始化
+
+#pragma comment(lib, "ole32.lib")  // CoInitialize/CoUninitialize
 
 // ============================================================================
 // 程序入口点
 // ============================================================================
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 {
+    // 初始化COM（WIC纹理加载需要）
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(hr))
+    {
+        MessageBoxW(nullptr, L"Failed to initialize COM!", L"Error", MB_OK | MB_ICONERROR);
+        return -1;
+    }
     // ========================================================================
     // 步骤 1: 创建窗口
     // ========================================================================
     Window window;
     if (!window.Create(1280, 720, L"DX11 Renderer - Model Viewer"))
+    {
+        MessageBoxW(nullptr, L"Failed to create window!", L"Error", MB_OK | MB_ICONERROR);
         return -1;
+    }
 
     // ========================================================================
     // 步骤 2: 初始化渲染器
     // 创建 D3D11 设备、交换链、Shader 等资源
     // ========================================================================
     Renderer renderer;
-    if (!renderer.Initialize(window.GetHWND(), 1280, 720))
+    bool initResult = renderer.Initialize(window.GetHWND(), 1280, 720);
+    if (!initResult)
+    {
+        // ====================================================================
+        // 调试断点位置：在此处设置断点以调试初始化失败
+        // ====================================================================
+        const wchar_t* errorMsg = renderer.GetLastError();
+        std::wstring fullErrorMsg = L"Failed to initialize renderer!\n\n";
+        if (errorMsg && wcslen(errorMsg) > 0)
+        {
+            fullErrorMsg += errorMsg;
+        }
+        else
+        {
+            fullErrorMsg += L"Please check if DirectX 11 is available and Shader files exist.";
+        }
+        
+        // 调试输出到Output窗口
+        OutputDebugStringW(L"=== Renderer Initialization Failed ===\n");
+        OutputDebugStringW(fullErrorMsg.c_str());
+        OutputDebugStringW(L"\n=====================================\n");
+        
+        MessageBoxW(nullptr, fullErrorMsg.c_str(), L"Error", MB_OK | MB_ICONERROR);
         return -1;
+    }
 
     // ========================================================================
     // 步骤 3: 创建相机
@@ -107,5 +144,9 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
     // 释放所有 D3D11 资源
     // ========================================================================
     renderer.Cleanup();
+    
+    // 清理COM
+    CoUninitialize();
+    
     return 0;
 }

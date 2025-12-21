@@ -4,14 +4,178 @@
 #include <sstream>
 #include <algorithm>
 #include <cmath>
+#include <assimp/Importer.hpp>
+#include <assimp/scene.h>
+#include <assimp/postprocess.h>
 
 using namespace DirectX;
 
 // ============================================================================
-// 从 OBJ 文件加载模型
-// 支持基本的 OBJ 格式：顶点位置、纹理坐标、法线、面
+// 从文件加载模型（支持 OBJ 和 FBX 等多种格式）
 // ============================================================================
 bool ModelLoader::LoadFromFile(const std::string& filename, std::vector<Vertex>& vertices, std::vector<uint32_t>& indices)
+{
+    // 检查文件扩展名
+    size_t dotPos = filename.find_last_of('.');
+    if (dotPos == std::string::npos)
+        return false;
+    
+    std::string ext = filename.substr(dotPos + 1);
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    
+    // 优先使用 Assimp 加载（支持 FBX、OBJ 等多种格式）
+    if (ext == "fbx" || ext == "obj" || ext == "dae" || ext == "3ds" || ext == "blend" || ext == "x" || ext == "md5mesh")
+    {
+        if (LoadWithAssimp(filename, vertices, indices))
+            return true;
+        // 如果 Assimp 加载失败，对于 OBJ 文件可以尝试简单解析器
+        if (ext == "obj")
+            return LoadOBJ(filename, vertices, indices);
+        return false;
+    }
+    
+    // 其他格式尝试用 Assimp
+    return LoadWithAssimp(filename, vertices, indices);
+}
+
+// ============================================================================
+// 使用 Assimp 加载模型（支持 FBX、OBJ 等多种格式）
+// ============================================================================
+bool ModelLoader::LoadWithAssimp(const std::string& filename, std::vector<Vertex>& vertices, std::vector<uint32_t>& indices)
+{
+    Assimp::Importer importer;
+    
+    // 加载场景，应用一些后处理选项
+    // aiProcess_Triangulate: 将所有多边形转换为三角形
+    // aiProcess_GenNormals: 如果没有法线，生成法线
+    // aiProcess_CalcTangentSpace: 计算切线和副切线
+    // aiProcess_JoinIdenticalVertices: 合并相同的顶点
+    const aiScene* scene = importer.ReadFile(
+        filename,
+        aiProcess_Triangulate | 
+        aiProcess_GenNormals | 
+        aiProcess_JoinIdenticalVertices |
+        aiProcess_CalcTangentSpace
+    );
+    
+    // 检查加载是否成功
+    if (!scene || scene->mFlags & AI_SCENE_FLAGS_INCOMPLETE || !scene->mRootNode)
+    {
+        return false;
+    }
+    
+    vertices.clear();
+    indices.clear();
+    
+    // 处理场景中的所有网格
+    for (unsigned int meshIndex = 0; meshIndex < scene->mNumMeshes; meshIndex++)
+    {
+        aiMesh* mesh = scene->mMeshes[meshIndex];
+        
+        // 获取起始索引（用于多个网格合并）
+        uint32_t indexOffset = static_cast<uint32_t>(vertices.size());
+        
+        // 处理顶点
+        for (unsigned int i = 0; i < mesh->mNumVertices; i++)
+        {
+            Vertex vertex;
+            
+            // 位置
+            if (mesh->mVertices)
+            {
+                vertex.position[0] = mesh->mVertices[i].x;
+                vertex.position[1] = mesh->mVertices[i].y;
+                vertex.position[2] = mesh->mVertices[i].z;
+            }
+            else
+            {
+                vertex.position[0] = 0.0f;
+                vertex.position[1] = 0.0f;
+                vertex.position[2] = 0.0f;
+            }
+            
+            // 法线
+            if (mesh->mNormals)
+            {
+                vertex.normal[0] = mesh->mNormals[i].x;
+                vertex.normal[1] = mesh->mNormals[i].y;
+                vertex.normal[2] = mesh->mNormals[i].z;
+            }
+            else
+            {
+                vertex.normal[0] = 0.0f;
+                vertex.normal[1] = 1.0f;
+                vertex.normal[2] = 0.0f;
+            }
+            
+            // 纹理坐标（如果存在，使用第一个纹理坐标通道）
+            if (mesh->mTextureCoords[0])
+            {
+                vertex.texCoord[0] = mesh->mTextureCoords[0][i].x;
+                vertex.texCoord[1] = mesh->mTextureCoords[0][i].y;
+            }
+            else
+            {
+                // 如果没有纹理坐标，使用默认值(0,0)
+                vertex.texCoord[0] = 0.0f;
+                vertex.texCoord[1] = 0.0f;
+            }
+            
+            // 顶点颜色（如果存在，使用第一个颜色通道；否则使用默认白色）
+            if (mesh->mColors[0])
+            {
+                vertex.color[0] = mesh->mColors[0][i].r;
+                vertex.color[1] = mesh->mColors[0][i].g;
+                vertex.color[2] = mesh->mColors[0][i].b;
+            }
+            else
+            {
+                // 如果没有顶点颜色，使用默认的浅灰色
+                vertex.color[0] = 0.8f;
+                vertex.color[1] = 0.8f;
+                vertex.color[2] = 0.8f;
+            }
+            
+            vertices.push_back(vertex);
+        }
+        
+        // 处理面（索引）
+        for (unsigned int i = 0; i < mesh->mNumFaces; i++)
+        {
+            aiFace face = mesh->mFaces[i];
+            // 由于已经应用了 aiProcess_Triangulate，每个面应该都是三角形
+            for (unsigned int j = 0; j < face.mNumIndices; j++)
+            {
+                indices.push_back(indexOffset + face.mIndices[j]);
+            }
+        }
+    }
+    
+    // 如果没有法线，计算法线（检查是否有任何法线为零）
+    bool needsNormals = false;
+    if (vertices.size() > 0)
+    {
+        for (const auto& v : vertices)
+        {
+            if (v.normal[0] == 0.0f && v.normal[1] == 0.0f && v.normal[2] == 0.0f)
+            {
+                needsNormals = true;
+                break;
+            }
+        }
+        if (needsNormals)
+        {
+            CalculateNormals(vertices, indices);
+        }
+    }
+    
+    return !vertices.empty();
+}
+
+// ============================================================================
+// 使用简单解析器加载 OBJ 文件（备用方法）
+// ============================================================================
+bool ModelLoader::LoadOBJ(const std::string& filename, std::vector<Vertex>& vertices, std::vector<uint32_t>& indices)
 {
     std::ifstream file(filename);
     if (!file.is_open())
@@ -156,6 +320,18 @@ bool ModelLoader::LoadFromFile(const std::string& filename, std::vector<Vertex>&
                     vertex.normal[2] = 0.0f;
                 }
 
+                // 纹理坐标（如果有）
+                if (fv.texIdx >= 0 && fv.texIdx < (int)texCoords.size())
+                {
+                    vertex.texCoord[0] = texCoords[fv.texIdx].x;
+                    vertex.texCoord[1] = texCoords[fv.texIdx].y;
+                }
+                else
+                {
+                    vertex.texCoord[0] = 0.0f;
+                    vertex.texCoord[1] = 0.0f;
+                }
+
                 // 默认颜色（白色）
                 vertex.color[0] = 1.0f;
                 vertex.color[1] = 1.0f;
@@ -173,7 +349,12 @@ bool ModelLoader::LoadFromFile(const std::string& filename, std::vector<Vertex>&
                         v.position[2] == vertex.position[2] &&
                         v.normal[0] == vertex.normal[0] &&
                         v.normal[1] == vertex.normal[1] &&
-                        v.normal[2] == vertex.normal[2])
+                        v.normal[2] == vertex.normal[2] &&
+                        v.texCoord[0] == vertex.texCoord[0] &&
+                        v.texCoord[1] == vertex.texCoord[1] &&
+                        v.color[0] == vertex.color[0] &&
+                        v.color[1] == vertex.color[1] &&
+                        v.color[2] == vertex.color[2])
                     {
                         found = true;
                         existingIndex = (uint32_t)j;

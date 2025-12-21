@@ -2,6 +2,7 @@
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
+#include <string>
 #include "MeshMgr.h"
 
 class Camera;
@@ -15,6 +16,9 @@ public:
     
     // 设置相机
     void SetCamera(Camera* camera) { m_camera = camera; }
+    
+    // 获取最后的错误信息
+    const wchar_t* GetLastError() const { return m_lastError.c_str(); }
 
 private:
     // 从文件编译 Shader
@@ -40,9 +44,19 @@ private:
     Microsoft::WRL::ComPtr<ID3DBlob>              m_vsBlob;
     Microsoft::WRL::ComPtr<ID3D11Buffer>          m_constantBuffer;  // 常量缓冲区（用于传递变换矩阵）
     Microsoft::WRL::ComPtr<ID3D11Buffer>          m_lightBuffer;      // 光照常量缓冲区（用于传递光照参数）
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_textureSRV;    // 纹理资源视图
+    Microsoft::WRL::ComPtr<ID3D11SamplerState>    m_samplerState;     // 纹理采样器状态
     MeshMgr* m_meshMgr;
     Camera* m_camera = nullptr;  // 相机指针
 
     int m_width = 0;
     int m_height = 0;
+    std::wstring m_lastError;  // 最后的错误信息
+    
+    // 加载纹理
+    bool LoadTexture(const std::wstring& filename);
+    // 创建默认纹理（白色纹理）
+    bool CreateDefaultTexture();
+    // 创建采样器状态
+    bool CreateSamplerState();
 };
