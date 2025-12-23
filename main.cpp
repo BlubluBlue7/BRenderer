@@ -5,15 +5,82 @@
 #include <chrono>
 #include <algorithm>
 #include <string>
+#include <fstream>
 #include <objbase.h>  // COM初始化
 
 #pragma comment(lib, "ole32.lib")  // CoInitialize/CoUninitialize
+
+// ============================================================================
+// 辅助函数：同时输出到 OutputDebugStringW 和日志文件
+// 在 Cursor 环境中，可以查看日志文件来查看调试信息
+// ============================================================================
+static std::wofstream g_logFile;
+static bool g_logFileInitialized = false;
+
+void InitLogFile()
+{
+    if (!g_logFileInitialized)
+    {
+        wchar_t exePath[MAX_PATH] = { 0 };
+        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+        std::wstring logPath = exePath;
+        size_t lastSlash = logPath.find_last_of(L"\\/");
+        if (lastSlash != std::wstring::npos)
+        {
+            logPath = logPath.substr(0, lastSlash + 1) + L"BRenderer.log";
+        }
+        else
+        {
+            logPath = L"BRenderer.log";
+        }
+        
+        g_logFile.open(logPath, std::ios::out | std::ios::app);
+        g_logFileInitialized = true;
+        
+        // 写入启动标记
+        if (g_logFile.is_open())
+        {
+            g_logFile << L"=== Application Started ===\n";
+            g_logFile.flush();
+        }
+    }
+}
+
+void DebugLog(const wchar_t* message)
+{
+    // 输出到 OutputDebugStringW（供 DebugView 或 Visual Studio 查看）
+    OutputDebugStringW(message);
+    
+    // 同时写入日志文件（供 Cursor 查看）
+    InitLogFile();
+    if (g_logFile.is_open())
+    {
+        g_logFile << message;
+        g_logFile.flush();  // 立即刷新，确保日志实时写入
+    }
+}
 
 // ============================================================================
 // 程序入口点
 // ============================================================================
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 {
+    // 设置 DLL 搜索路径，确保能找到 vcpkg 的 DLL
+    // 这必须在任何 DLL 加载之前调用
+    wchar_t exePath[MAX_PATH] = { 0 };
+    if (GetModuleFileNameW(nullptr, exePath, MAX_PATH) > 0)
+    {
+        std::wstring exeDir = exePath;
+        size_t lastSlash = exeDir.find_last_of(L"\\/");
+        if (lastSlash != std::wstring::npos)
+        {
+            exeDir = exeDir.substr(0, lastSlash + 1);
+            // 将 exe 目录添加到 DLL 搜索路径
+            SetDllDirectoryW(exeDir.c_str());
+            DebugLog((L"Set DLL directory to: " + exeDir + L"\n").c_str());
+        }
+    }
+    
     // 初始化COM（WIC纹理加载需要）
     HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     if (FAILED(hr))
@@ -47,16 +114,17 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
         if (errorMsg && wcslen(errorMsg) > 0)
         {
             fullErrorMsg += errorMsg;
+        
         }
         else
         {
             fullErrorMsg += L"Please check if DirectX 11 is available and Shader files exist.";
         }
         
-        // 调试输出到Output窗口
-        OutputDebugStringW(L"=== Renderer Initialization Failed ===\n");
-        OutputDebugStringW(fullErrorMsg.c_str());
-        OutputDebugStringW(L"\n=====================================\n");
+        // 调试输出（同时输出到 OutputDebugStringW 和日志文件）
+        DebugLog(L"=== Renderer Initialization Failed ===\n");
+        DebugLog(fullErrorMsg.c_str());
+        DebugLog(L"\n=====================================\n");
         
         MessageBoxW(nullptr, fullErrorMsg.c_str(), L"Error", MB_OK | MB_ICONERROR);
         return -1;

@@ -155,7 +155,13 @@ bool Renderer::Initialize(HWND hwnd, int width, int height)
         return false;
 
     // ========================================================================
-    // 步骤 7: 创建纹理采样器
+    // 步骤 7: 创建深度模板缓冲区
+    // ========================================================================
+    if (!CreateDepthStencil())
+        return false;
+
+    // ========================================================================
+    // 步骤 8: 创建纹理采样器
     // ========================================================================
     if (!CreateSamplerState())
         return false;
@@ -167,6 +173,9 @@ bool Renderer::Initialize(HWND hwnd, int width, int height)
     bool textureLoaded = false;
     if (exePath[0] != 0)
     {
+        OutputDebugStringW(L"exePath: ");
+        OutputDebugStringW(exePath);
+        OutputDebugStringW(L"\n");
         char exePathA[MAX_PATH];
         WideCharToMultiByte(CP_ACP, 0, exePath, -1, exePathA, MAX_PATH, nullptr, nullptr);
         std::string exeDir = exePathA;
@@ -323,18 +332,24 @@ void Renderer::RenderFrame(float deltaTime)
     // 步骤 1: 设置渲染目标
     // 告诉 GPU 将渲染结果输出到哪个渲染目标（这里是后缓冲区）
     // ========================================================================
-    m_context->OMSetRenderTargets(1, m_rtv.GetAddressOf(), nullptr);
+    m_context->OMSetRenderTargets(1, m_rtv.GetAddressOf(), m_dsv.Get());
     // 参数说明：
     // - 1: 渲染目标数量
     // - m_rtv.GetAddressOf(): 渲染目标视图数组
-    // - nullptr: 深度模板缓冲区（这里不使用）
+    // - m_dsv.Get(): 深度模板视图（用于深度测试）
 
     // ========================================================================
-    // 步骤 2: 清空渲染目标
+    // 步骤 2: 清空渲染目标和深度缓冲区
     // 用指定颜色填充整个渲染目标，清除上一帧的内容
     // ========================================================================
     float clearColor[4] = { 0.2f, 0.3f, 0.6f, 1.0f }; // RGBA: 深蓝色背景
     m_context->ClearRenderTargetView(m_rtv.Get(), clearColor);
+    
+    // 清空深度缓冲区（设置为1.0，表示最远距离）
+    if (m_dsv)
+    {
+        m_context->ClearDepthStencilView(m_dsv.Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
+    }
 
     // ========================================================================
     // 步骤 3: 设置视口
@@ -371,10 +386,16 @@ void Renderer::RenderFrame(float deltaTime)
     // 绑定光照常量缓冲区到像素着色器（register b1）
     m_context->PSSetConstantBuffers(1, 1, m_lightBuffer.GetAddressOf());
     
-    // 绑定纹理和采样器到像素着色器
+    // 绑定纹理和采样器到像素着色器（必须始终绑定，即使纹理不存在也要绑定默认纹理）
     if (m_textureSRV)
     {
         m_context->PSSetShaderResources(0, 1, m_textureSRV.GetAddressOf());
+    }
+    else
+    {
+        // 如果没有纹理，清除纹理绑定
+        ID3D11ShaderResourceView* nullSRV = nullptr;
+        m_context->PSSetShaderResources(0, 1, &nullSRV);
     }
     if (m_samplerState)
     {
@@ -429,10 +450,65 @@ void Renderer::Cleanup()
     m_vsBlob.Reset();        // 顶点着色器编译后的二进制数据
     m_textureSRV.Reset();    // 纹理资源视图
     m_samplerState.Reset();  // 采样器状态
+    m_depthStencilState.Reset();  // 深度模板状态
+    m_dsv.Reset();           // 深度模板视图
     m_rtv.Reset();           // 渲染目标视图
     m_swapChain.Reset();     // 交换链
     m_context.Reset();       // 设备上下文
     m_device.Reset();        // 设备
+}
+
+// ============================================================================
+// 创建深度模板缓冲区和状态
+// ============================================================================
+bool Renderer::CreateDepthStencil()
+{
+    // 创建深度模板纹理
+    D3D11_TEXTURE2D_DESC depthStencilDesc = {};
+    depthStencilDesc.Width = m_width;
+    depthStencilDesc.Height = m_height;
+    depthStencilDesc.MipLevels = 1;
+    depthStencilDesc.ArraySize = 1;
+    depthStencilDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;  // 24位深度 + 8位模板
+    depthStencilDesc.SampleDesc.Count = 1;
+    depthStencilDesc.SampleDesc.Quality = 0;
+    depthStencilDesc.Usage = D3D11_USAGE_DEFAULT;
+    depthStencilDesc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+    depthStencilDesc.CPUAccessFlags = 0;
+    depthStencilDesc.MiscFlags = 0;
+
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> depthStencilTexture;
+    HRESULT hr = m_device->CreateTexture2D(&depthStencilDesc, nullptr, depthStencilTexture.GetAddressOf());
+    if (FAILED(hr))
+        return false;
+
+    // 创建深度模板视图
+    D3D11_DEPTH_STENCIL_VIEW_DESC dsvDesc = {};
+    dsvDesc.Format = depthStencilDesc.Format;
+    dsvDesc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+    dsvDesc.Texture2D.MipSlice = 0;
+
+    hr = m_device->CreateDepthStencilView(depthStencilTexture.Get(), &dsvDesc, m_dsv.GetAddressOf());
+    if (FAILED(hr))
+        return false;
+
+    // 创建深度模板状态（启用深度测试）
+    D3D11_DEPTH_STENCIL_DESC depthStencilStateDesc = {};
+    depthStencilStateDesc.DepthEnable = TRUE;                    // 启用深度测试
+    depthStencilStateDesc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;  // 允许写入深度值
+    depthStencilStateDesc.DepthFunc = D3D11_COMPARISON_LESS;     // 小于时通过（近的物体遮挡远的）
+    depthStencilStateDesc.StencilEnable = FALSE;                 // 不使用模板测试
+    depthStencilStateDesc.StencilReadMask = 0xFF;
+    depthStencilStateDesc.StencilWriteMask = 0xFF;
+
+    hr = m_device->CreateDepthStencilState(&depthStencilStateDesc, m_depthStencilState.GetAddressOf());
+    if (FAILED(hr))
+        return false;
+
+    // 启用深度模板状态
+    m_context->OMSetDepthStencilState(m_depthStencilState.Get(), 0);
+
+    return true;
 }
 
 // ============================================================================
@@ -505,14 +581,160 @@ bool Renderer::CreateDefaultTexture()
 
 // ============================================================================
 // 加载纹理（使用WIC加载图片文件）
-// 注意：完整实现需要使用WIC或DirectXTex库来加载图片文件
+// 支持 PNG、JPG、BMP、TGA 等格式
 // ============================================================================
 bool Renderer::LoadTexture(const std::wstring& filename)
 {
-    // TODO: 实现WIC图片加载
-    // 暂时返回false，使用默认纹理
-    // 需要使用Windows Imaging Component (WIC) 或 DirectXTex 库来加载 PNG/JPG 等格式
-    return false;
+    if (filename.empty())
+    {
+        m_lastError = L"LoadTexture: filename is empty";
+        return false;
+    }
+
+    // 检查文件是否存在
+    HANDLE hFile = CreateFileW(
+        filename.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr
+    );
+    if (hFile == INVALID_HANDLE_VALUE)
+    {
+        m_lastError = L"LoadTexture: File not found: " + filename;
+        return false;
+    }
+    CloseHandle(hFile);
+
+    // 创建 WIC 工厂
+    Microsoft::WRL::ComPtr<IWICImagingFactory> wicFactory;
+    HRESULT hr = CoCreateInstance(
+        CLSID_WICImagingFactory,
+        nullptr,
+        CLSCTX_INPROC_SERVER,
+        IID_PPV_ARGS(wicFactory.GetAddressOf())
+    );
+    if (FAILED(hr))
+    {
+        m_lastError = L"LoadTexture: Failed to create WIC factory. HRESULT: " + std::to_wstring(hr);
+        return false;
+    }
+
+    // 创建解码器
+    Microsoft::WRL::ComPtr<IWICBitmapDecoder> decoder;
+    hr = wicFactory->CreateDecoderFromFilename(
+        filename.c_str(),
+        nullptr,
+        GENERIC_READ,
+        WICDecodeMetadataCacheOnDemand,
+        decoder.GetAddressOf()
+    );
+    if (FAILED(hr))
+    {
+        m_lastError = L"LoadTexture: Failed to create decoder. HRESULT: " + std::to_wstring(hr);
+        return false;
+    }
+
+    // 获取第一帧（大多数图片只有一帧）
+    Microsoft::WRL::ComPtr<IWICBitmapFrameDecode> frame;
+    hr = decoder->GetFrame(0, frame.GetAddressOf());
+    if (FAILED(hr))
+    {
+        m_lastError = L"LoadTexture: Failed to get frame. HRESULT: " + std::to_wstring(hr);
+        return false;
+    }
+
+    // 获取图片尺寸
+    UINT width = 0, height = 0;
+    hr = frame->GetSize(&width, &height);
+    if (FAILED(hr) || width == 0 || height == 0)
+    {
+        m_lastError = L"LoadTexture: Invalid image dimensions";
+        return false;
+    }
+
+    // 创建格式转换器
+    Microsoft::WRL::ComPtr<IWICFormatConverter> converter;
+    hr = wicFactory->CreateFormatConverter(converter.GetAddressOf());
+    if (FAILED(hr))
+    {
+        m_lastError = L"LoadTexture: Failed to create format converter. HRESULT: " + std::to_wstring(hr);
+        return false;
+    }
+
+    // 转换为 RGBA 格式（32位，每通道8位）
+    hr = converter->Initialize(
+        frame.Get(),
+        GUID_WICPixelFormat32bppRGBA,
+        WICBitmapDitherTypeNone,
+        nullptr,
+        0.0f,
+        WICBitmapPaletteTypeCustom
+    );
+    if (FAILED(hr))
+    {
+        m_lastError = L"LoadTexture: Failed to initialize format converter. HRESULT: " + std::to_wstring(hr);
+        return false;
+    }
+
+    // 计算行字节数（RGBA = 4字节，对齐到4字节边界）
+    UINT stride = (width * 4 + 3) & ~3;  // 对齐到4字节
+    UINT imageSize = stride * height;
+
+    // 分配内存存储像素数据
+    std::vector<BYTE> pixels(imageSize);
+    hr = converter->CopyPixels(nullptr, stride, imageSize, pixels.data());
+    if (FAILED(hr))
+    {
+        m_lastError = L"LoadTexture: Failed to copy pixels. HRESULT: " + std::to_wstring(hr);
+        return false;
+    }
+
+    // 创建 D3D11 纹理
+    D3D11_TEXTURE2D_DESC texDesc = {};
+    texDesc.Width = width;
+    texDesc.Height = height;
+    texDesc.MipLevels = 1;
+    texDesc.ArraySize = 1;
+    texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    texDesc.SampleDesc.Count = 1;
+    texDesc.SampleDesc.Quality = 0;
+    texDesc.Usage = D3D11_USAGE_DEFAULT;
+    texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    texDesc.CPUAccessFlags = 0;
+    texDesc.MiscFlags = 0;
+
+    D3D11_SUBRESOURCE_DATA initData = {};
+    initData.pSysMem = pixels.data();
+    initData.SysMemPitch = stride;
+    initData.SysMemSlicePitch = 0;
+
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+    hr = m_device->CreateTexture2D(&texDesc, &initData, texture.GetAddressOf());
+    if (FAILED(hr))
+    {
+        m_lastError = L"LoadTexture: Failed to create texture. HRESULT: " + std::to_wstring(hr);
+        return false;
+    }
+
+    // 创建着色器资源视图
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Format = texDesc.Format;
+    srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Texture2D.MipLevels = 1;
+    srvDesc.Texture2D.MostDetailedMip = 0;
+
+    hr = m_device->CreateShaderResourceView(texture.Get(), &srvDesc, m_textureSRV.GetAddressOf());
+    if (FAILED(hr))
+    {
+        m_lastError = L"LoadTexture: Failed to create shader resource view. HRESULT: " + std::to_wstring(hr);
+        return false;
+    }
+
+    // 成功加载纹理
+    return true;
 }
 
 // ============================================================================
@@ -991,9 +1213,9 @@ void Renderer::UpdateConstantBuffers()
         XMVECTOR lightDir = XMVector3Normalize(XMLoadFloat3(&lb->lightDirection));
         XMStoreFloat3(&lb->lightDirection, lightDir);
         
-        // 光源颜色和强度
+        // 光源颜色和强度（增加强度以确保纹理可见）
         lb->lightColor = XMFLOAT3(1.0f, 1.0f, 1.0f);  // 白色光
-        lb->lightIntensity = 1.0f;                     // 光源强度
+        lb->lightIntensity = 1.5f;                     // 光源强度（提高到1.5）
         
         // ========================================================================
         // PBR 材质参数
@@ -1013,8 +1235,8 @@ void Renderer::UpdateConstantBuffers()
         // ========================================================================
         // 环境光参数
         // ========================================================================
-        // 环境光颜色（模拟天空光）
-        lb->ambientColor = XMFLOAT3(0.1f, 0.1f, 0.2f);
+        // 环境光颜色（模拟天空光，增加亮度以确保纹理可见）
+        lb->ambientColor = XMFLOAT3(0.3f, 0.3f, 0.4f);
         
         // ========================================================================
         // 相机位置

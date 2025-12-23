@@ -38,6 +38,8 @@ private:
     Microsoft::WRL::ComPtr<ID3D11DeviceContext>    m_context;
     Microsoft::WRL::ComPtr<IDXGISwapChain>         m_swapChain;
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> m_rtv;
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilView> m_dsv;             // 深度模板视图
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilState> m_depthStencilState;  // 深度模板状态
     Microsoft::WRL::ComPtr<ID3D11VertexShader>    m_vs;
     Microsoft::WRL::ComPtr<ID3D11PixelShader>     m_ps;
     Microsoft::WRL::ComPtr<ID3D11InputLayout>     m_inputLayout;
@@ -59,4 +61,6 @@ private:
     bool CreateDefaultTexture();
     // 创建采样器状态
     bool CreateSamplerState();
+    // 创建深度模板缓冲区和状态
+    bool CreateDepthStencil();
 };

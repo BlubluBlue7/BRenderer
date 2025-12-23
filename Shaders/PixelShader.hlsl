@@ -92,76 +92,38 @@ float3 fresnelSchlick(float cosTheta, float3 F0)
 // SV_TARGET 表示这是输出到渲染目标的颜色
 float4 PS(PSInput input) : SV_TARGET
 {
-    // 归一化向量
-    float3 N = normalize(input.normal);           // 法线
-    float3 V = normalize(cameraPosition - input.worldPos);  // 视线方向
-    float3 L = normalize(-lightDirection);         // 光源方向
-    float3 H = normalize(V + L);                   // 半角向量
-    
     // 从纹理采样颜色（如果纹理存在）
     float4 texColor = diffuseTexture.Sample(textureSampler, input.texCoord);
     
-    // 使用纹理颜色作为主要颜色源
-    // 纹理颜色与albedo相乘：纹理颜色 * 材质颜色
-    // albedo默认是白色(1,1,1)，所以纹理颜色会直接显示
-    // 如果albedo不是白色，可以用来调整纹理的整体色调
+    // 使用纹理颜色作为基础颜色
     float3 finalAlbedo = texColor.rgb * albedo;
     
-    // 计算基础反射率 F0
-    // 对于非金属，F0 约为 0.04
-    // 对于金属，F0 等于反照率
-    float3 F0 = lerp(float3(0.04f, 0.04f, 0.04f), finalAlbedo, metallic);
+    // 归一化法线
+    float3 N = normalize(input.normal);
     
-    // ========================================================================
-    // Cook-Torrance BRDF 计算
-    // ========================================================================
+    // 光源方向
+    float3 L = normalize(-lightDirection);
     
-    // 1. 法线分布函数（D）
-    float D = DistributionGGX(N, H, roughness);
-    
-    // 2. 几何函数（G）
-    float G = GeometrySmith(N, V, L, roughness);
-    
-    // 3. 菲涅尔方程（F）
-    float3 F = fresnelSchlick(max(dot(H, V), 0.0f), F0);
-    
-    // 4. 计算 Cook-Torrance 镜面反射项
+    // 简单的Lambert漫反射
     float NdotL = max(dot(N, L), 0.0f);
-    float NdotV = max(dot(N, V), 0.0f);
     
-    float3 numerator = D * G * F;
-    float denominator = 4.0f * NdotV * NdotL + 0.001f;  // 防止除零
-    float3 specular = numerator / denominator;
+    // 环境光（高强度，确保纹理总是可见）
+    float3 ambient = finalAlbedo * 0.8f;
     
-    // 5. 计算漫反射项
-    // 能量守恒：镜面反射 + 漫反射 = 1
-    float3 kS = F;  // 镜面反射系数
-    float3 kD = (1.0f - kS) * (1.0f - metallic);  // 漫反射系数（金属不产生漫反射）
+    // 漫反射光照
+    float3 diffuse = finalAlbedo * lightColor * lightIntensity * NdotL * 0.6f;
     
-    // Lambertian 漫反射
-    float3 diffuse = kD * finalAlbedo / 3.14159f;
+    // 最终颜色 = 环境光 + 漫反射光照
+    // 确保最终颜色至少是纹理颜色的75%
+    float3 finalColor = max(ambient + diffuse, finalAlbedo * 0.75f);
     
-    // ========================================================================
-    // 组合光照
-    // ========================================================================
+    // 确保顶点颜色不会让颜色变黑
+    // 使用max确保顶点颜色至少是50%亮度
+    float3 vertexColor = max(input.color, float3(0.5f, 0.5f, 0.5f));
+    finalColor *= vertexColor;
     
-    // 直接光照：漫反射 + 镜面反射
-    float3 Lo = (diffuse + specular) * lightColor * lightIntensity * NdotL;
+    // 最后确保最终颜色不会太暗（至少是纹理颜色的60%）
+    finalColor = max(finalColor, finalAlbedo * 0.6f);
     
-    // 环境光（简化的 IBL，这里使用常数）
-    float3 ambient = ambientColor * finalAlbedo * 0.1f;
-    
-    // 最终颜色
-    float3 finalColor = ambient + Lo;
-    
-    // 色调映射（简单的 Reinhard 色调映射）
-    finalColor = finalColor / (finalColor + float3(1.0f, 1.0f, 1.0f));
-    
-    // Gamma 校正
-    finalColor = pow(finalColor, float3(1.0f / 2.2f, 1.0f / 2.2f, 1.0f / 2.2f));
-    
-    // 混合顶点颜色（如果提供）
-    finalColor *= input.color;
-    
-    return float4(finalColor, 1.0f);
+    return float4(finalColor, texColor.a);
 }

@@ -114,6 +114,37 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalDependencies>d3d11.lib;dxgi.lib;d3dcompiler.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
+    <PostBuildEvent>
+      <Command>REM Copy Assimp and all dependency DLLs from vcpkg installation directory (Debug)
+set "VCPKG_DEBUG_BIN=D:\Study\Project\vcpkg\installed\x64-windows\debug\bin"
+if not exist "%VCPKG_DEBUG_BIN%" set "VCPKG_DEBUG_BIN=%VcpkgRoot%installed\x64-windows\debug\bin"
+if not exist "%VCPKG_DEBUG_BIN%" set "VCPKG_DEBUG_BIN=%VcpkgInstalledDir%\x64-windows\debug\bin"
+
+echo Copying DLLs from: %VCPKG_DEBUG_BIN%
+if exist "%VCPKG_DEBUG_BIN%\assimp-vc143-mtd.dll" (
+    copy /Y "%VCPKG_DEBUG_BIN%\assimp-vc143-mtd.dll" "$(OutDir)"
+    echo   - assimp-vc143-mtd.dll copied
+) else (
+    echo   - ERROR: assimp-vc143-mtd.dll not found!
+)
+if exist "%VCPKG_DEBUG_BIN%\poly2tri.dll" (
+    copy /Y "%VCPKG_DEBUG_BIN%\poly2tri.dll" "$(OutDir)"
+    echo   - poly2tri.dll copied
+)
+if exist "%VCPKG_DEBUG_BIN%\zlibd1.dll" (
+    copy /Y "%VCPKG_DEBUG_BIN%\zlibd1.dll" "$(OutDir)"
+    echo   - zlibd1.dll copied
+)
+if exist "%VCPKG_DEBUG_BIN%\minizip.dll" (
+    copy /Y "%VCPKG_DEBUG_BIN%\minizip.dll" "$(OutDir)"
+    echo   - minizip.dll copied
+)
+if exist "%VCPKG_DEBUG_BIN%\pugixml.dll" (
+    copy /Y "%VCPKG_DEBUG_BIN%\pugixml.dll" "$(OutDir)"
+    echo   - pugixml.dll copied
+)
+echo DLL copy completed.</Command>
+    </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
@@ -131,6 +162,18 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalDependencies>d3d11.lib;dxgi.lib;d3dcompiler.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
+    <PostBuildEvent>
+      <Command>REM Copy Assimp and all dependency DLLs from vcpkg installation directory (Release)
+set "VCPKG_RELEASE_BIN=D:\Study\Project\vcpkg\installed\x64-windows\bin"
+if not exist "%VCPKG_RELEASE_BIN%" set "VCPKG_RELEASE_BIN=%VcpkgRoot%installed\x64-windows\bin"
+if not exist "%VCPKG_RELEASE_BIN%" set "VCPKG_RELEASE_BIN=%VcpkgInstalledDir%\x64-windows\bin"
+
+if exist "%VCPKG_RELEASE_BIN%\assimp-vc143-mt.dll" copy /Y "%VCPKG_RELEASE_BIN%\assimp-vc143-mt.dll" "$(OutDir)"
+if exist "%VCPKG_RELEASE_BIN%\poly2tri.dll" copy /Y "%VCPKG_RELEASE_BIN%\poly2tri.dll" "$(OutDir)"
+if exist "%VCPKG_RELEASE_BIN%\zlib1.dll" copy /Y "%VCPKG_RELEASE_BIN%\zlib1.dll" "$(OutDir)"
+if exist "%VCPKG_RELEASE_BIN%\minizip.dll" copy /Y "%VCPKG_RELEASE_BIN%\minizip.dll" "$(OutDir)"
+if exist "%VCPKG_RELEASE_BIN%\pugixml.dll" copy /Y "%VCPKG_RELEASE_BIN%\pugixml.dll" "$(OutDir)"</Command>
+    </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="Camera.cpp" />
