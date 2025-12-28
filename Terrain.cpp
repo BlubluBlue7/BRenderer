@@ -190,15 +190,16 @@ void Terrain::GenerateTerrainMesh(const std::vector<float>& heightData)
             uint32_t bottomLeft = (z + 1) * m_params.width + x;
             uint32_t bottomRight = bottomLeft + 1;
             
-            // 第一个三角形（左上、右上、左下）
+            // 第一个三角形（逆时针顺序：左上、左下、右上）
+            // DirectX默认逆时针为正面，所以需要逆时针顺序
             m_indices.push_back(topLeft);
-            m_indices.push_back(topRight);
             m_indices.push_back(bottomLeft);
+            m_indices.push_back(topRight);
             
-            // 第二个三角形（右上、右下、左下）
+            // 第二个三角形（逆时针顺序：右上、左下、右下）
             m_indices.push_back(topRight);
-            m_indices.push_back(bottomRight);
             m_indices.push_back(bottomLeft);
+            m_indices.push_back(bottomRight);
         }
     }
     
@@ -303,7 +304,18 @@ bool Terrain::CreateBuffers(ID3D11Device* device)
 void Terrain::Render(ID3D11DeviceContext* context)
 {
     if (!context || !m_vertexBuffer || !m_indexBuffer)
+    {
+        static bool warned = false;
+        if (!warned)
+        {
+            OutputDebugStringW(L"[TERRAIN DEBUG] Terrain::Render: Missing resources!\n");
+            if (!context) OutputDebugStringW(L"  - Context is null\n");
+            if (!m_vertexBuffer) OutputDebugStringW(L"  - Vertex buffer is null\n");
+            if (!m_indexBuffer) OutputDebugStringW(L"  - Index buffer is null\n");
+            warned = true;
+        }
         return;
+    }
     
     // 设置顶点缓冲区
     UINT stride = sizeof(Vertex);
@@ -315,6 +327,16 @@ void Terrain::Render(ID3D11DeviceContext* context)
     
     // 设置图元类型
     context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    
+    // 调试：确认DrawIndexed被调用
+    static bool drawLogged = false;
+    if (!drawLogged)
+    {
+        wchar_t msg[256];
+        swprintf_s(msg, L"[TERRAIN DEBUG] Terrain::Render: Calling DrawIndexed(%d, 0, 0)\n", m_indexCount);
+        OutputDebugStringW(msg);
+        drawLogged = true;
+    }
     
     // 绘制
     context->DrawIndexed(m_indexCount, 0, 0);

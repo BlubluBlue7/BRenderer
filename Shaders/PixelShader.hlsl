@@ -175,6 +175,8 @@ float3 GetSpecularIBL(float3 N, float3 V, float3 F0, float roughness)
 // SV_TARGET 表示这是输出到渲染目标的颜色
 float4 PS(PSInput input) : SV_TARGET
 {
+    // 移除调试代码，恢复正常渲染
+    
     // 修复Y轴颠倒：翻转V坐标（因为DirectX和某些图像格式的坐标系统不同）
     float2 flippedTexCoord = float2(input.texCoord.x, 1.0f - input.texCoord.y);
     

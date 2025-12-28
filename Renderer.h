@@ -68,6 +68,12 @@ private:
     Microsoft::WRL::ComPtr<ID3D11VertexShader>    m_skyboxVS;
     Microsoft::WRL::ComPtr<ID3D11PixelShader>     m_skyboxPS;
     Microsoft::WRL::ComPtr<ID3D11InputLayout>     m_skyboxInputLayout;
+    
+    // 地形相关shader资源
+    Microsoft::WRL::ComPtr<ID3D11VertexShader>    m_terrainVS;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader>     m_terrainPS;
+    Microsoft::WRL::ComPtr<ID3D11InputLayout>     m_terrainInputLayout;
+    Microsoft::WRL::ComPtr<ID3DBlob>              m_terrainVSBlob;
     Microsoft::WRL::ComPtr<ID3D11Buffer>          m_skyboxVertexBuffer;
     Microsoft::WRL::ComPtr<ID3D11Buffer>          m_skyboxIndexBuffer;
     Microsoft::WRL::ComPtr<ID3D11DepthStencilState> m_skyboxDepthStencilState;  // 天空盒深度状态（LESS_EQUAL）
@@ -130,6 +136,7 @@ private:
     void RenderSkybox();  // 渲染天空盒
     
     // 地形相关函数
+    bool CreateTerrainShaders();  // 创建地形shader
     bool InitializeTerrain();  // 初始化地形
     void RenderTerrain();  // 渲染地形
 };
