@@ -16,9 +16,9 @@ inline float clamp(float value, float min, float max)
 // 构造函数：初始化相机参数
 // ============================================================================
 Camera::Camera()
-    : m_position(0.0f, 1.5f, 3.0f)   // 初始位置：在角色前方稍高位置（正常视角）
-    , m_pitch(-0.1f)                  // 初始俯仰角：稍微向下看（看向角色）
-    , m_yaw(XM_PI)                    // 初始偏航角：朝向 Z 轴负方向（看向原点，即角色位置）
+    : m_position(0.0f, 100.0f, 100.0f)  // 初始位置：更高的位置，以便看到地形和模型（地形200x200，中心在原点）
+    , m_pitch(-0.6f)                     // 初始俯仰角：向下看（看向地形）
+    , m_yaw(XM_PI * 0.75f)              // 初始偏航角：看向地形中心（大约-135度，看向原点方向）
     , m_moveSpeed(5.0f)               // 移动速度：5 单位/秒
     , m_rotationSpeed(2.0f)           // 旋转速度：2 弧度/秒
     , m_mouseSensitivity(0.002f)     // 鼠标灵敏度
@@ -98,7 +98,7 @@ XMMATRIX Camera::GetProjectionMatrix(float aspectRatio) const
 {
     float fov = XM_PI / 4.0f;  // 45 度视野
     float nearPlane = 0.1f;
-    float farPlane = 100.0f;
+    float farPlane = 500.0f;   // 增加远平面距离以看到更大的地形（200x200）
     
     return XMMatrixPerspectiveFovLH(fov, aspectRatio, nearPlane, farPlane);
 }

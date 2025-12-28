@@ -1,10 +1,20 @@
 #pragma once
+
+// 确保在包含 Windows.h 相关头文件之前定义 NOMINMAX，避免 min/max 宏冲突
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+// 先包含标准库头文件
 #include <unordered_map>
 #include <string>
 #include <memory>
+
+// 然后包含Windows和DirectX头文件
+#include <windows.h>
+#include <d3d11.h>
 #include "Mesh.h"
 #include "MeshGPU.h"
-#include <d3d11.h>
 
 class MeshMgr
 {

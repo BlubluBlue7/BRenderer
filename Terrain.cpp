@@ -1,8 +1,13 @@
+// 确保在包含 Windows.h 相关头文件之前定义 NOMINMAX，避免 min/max 宏冲突
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 #include "Terrain.h"
 #include "Mesh.h"  // 使用Vertex结构
+
 #include <fstream>
 #include <algorithm>
-#include <DirectXMath.h>
 #include <cmath>
 
 // stb_image 用于加载高度图

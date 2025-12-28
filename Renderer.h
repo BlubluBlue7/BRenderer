@@ -1,12 +1,20 @@
 #pragma once
 
+// 确保在包含 Windows.h 相关头文件之前定义 NOMINMAX，避免 min/max 宏冲突
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+// 先包含标准库头文件
+#include <string>
+#include <vector>
+#include <unordered_map>
+
+// 然后包含Windows和DirectX头文件
 #include <windows.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
-#include <string>
-#include <vector>
-#include <unordered_map>
 #include "MeshMgr.h"
 
 class Camera;
@@ -124,4 +132,4 @@ private:
     // 地形相关函数
     bool InitializeTerrain();  // 初始化地形
     void RenderTerrain();  // 渲染地形
-}
+};

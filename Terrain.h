@@ -1,8 +1,19 @@
 #pragma once
-#include <d3d11.h>
-#include <wrl/client.h>
+
+// 确保在包含 Windows.h 相关头文件之前定义 NOMINMAX，避免 min/max 宏冲突
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+// 先包含标准库头文件
 #include <vector>
 #include <string>
+
+// 然后包含Windows和DirectX头文件
+#include <windows.h>
+#include <d3d11.h>
+#include <wrl/client.h>
+#include <DirectXMath.h>
 #include "Mesh.h"  // 需要Vertex结构体的完整定义
 
 // 地形参数结构

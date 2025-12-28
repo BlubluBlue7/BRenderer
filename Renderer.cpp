@@ -538,6 +538,9 @@ void Renderer::RenderFrame(float deltaTime)
     // 步骤 6: 设置 Shader 和输入布局（用于场景渲染和地形）
     // 将编译好的 Shader 和输入布局绑定到渲染管线
     // ========================================================================
+    // 设置深度状态（天空盒可能改变了深度状态）
+    m_context->OMSetDepthStencilState(m_depthStencilState.Get(), 0);
+    
     // 设置输入布局：告诉 GPU 如何解析顶点数据
     m_context->IASetInputLayout(m_inputLayout.Get());
     // 设置顶点着色器：处理每个顶点的变换
@@ -545,27 +548,18 @@ void Renderer::RenderFrame(float deltaTime)
     // 设置像素着色器：处理每个像素的颜色
     m_context->PSSetShader(m_ps.Get(), nullptr, 0);
     
+    // 绑定常量缓冲区到顶点着色器（register b0）- 地形和模型都需要
+    m_context->VSSetConstantBuffers(0, 1, m_constantBuffer.GetAddressOf());
+    // 绑定光照常量缓冲区到像素着色器（register b1）
+    m_context->PSSetConstantBuffers(1, 1, m_lightBuffer.GetAddressOf());
+    
     // ========================================================================
     // 步骤 6.5: 渲染地形（在场景之前渲染，在天空盒之后）
     // ========================================================================
     RenderTerrain();
     
-    // 绑定常量缓冲区到顶点着色器（register b0）
-    m_context->VSSetConstantBuffers(0, 1, m_constantBuffer.GetAddressOf());
-    // 绑定光照常量缓冲区到像素着色器（register b1）
-    m_context->PSSetConstantBuffers(1, 1, m_lightBuffer.GetAddressOf());
-    
-    // 绑定纹理和采样器到像素着色器（必须始终绑定，即使纹理不存在也要绑定默认纹理）
-    if (m_textureSRV)
-    {
-        m_context->PSSetShaderResources(0, 1, m_textureSRV.GetAddressOf());
-    }
-    else
-    {
-        // 如果没有纹理，清除纹理绑定
-        ID3D11ShaderResourceView* nullSRV = nullptr;
-        m_context->PSSetShaderResources(0, 1, &nullSRV);
-    }
+    // 注意：地形渲染后不需要重新绑定纹理，因为模型渲染时会重新绑定
+    // 这里只确保采样器状态正确（地形可能没有设置s0采样器）
     if (m_samplerState)
     {
         m_context->PSSetSamplers(0, 1, m_samplerState.GetAddressOf());
@@ -629,8 +623,15 @@ void Renderer::RenderFrame(float deltaTime)
                     };
                     m_context->PSSetShaderResources(3, 2, iblSRVs);
                     
-                    // 绑定IBL采样器（s1）
-                    m_context->PSSetSamplers(1, 1, m_iblSamplerState.GetAddressOf());
+                    // 绑定采样器（s0用于普通纹理，s1用于IBL纹理）
+                    if (m_samplerState)
+                    {
+                        m_context->PSSetSamplers(0, 1, m_samplerState.GetAddressOf());
+                    }
+                    if (m_iblSamplerState)
+                    {
+                        m_context->PSSetSamplers(1, 1, m_iblSamplerState.GetAddressOf());
+                    }
                 }
                 else
                 {
@@ -654,8 +655,15 @@ void Renderer::RenderFrame(float deltaTime)
                     };
                     m_context->PSSetShaderResources(3, 2, iblSRVs);
                     
-                    // 绑定IBL采样器（s1）
-                    m_context->PSSetSamplers(1, 1, m_iblSamplerState.GetAddressOf());
+                    // 绑定采样器（s0用于普通纹理，s1用于IBL纹理）
+                    if (m_samplerState)
+                    {
+                        m_context->PSSetSamplers(0, 1, m_samplerState.GetAddressOf());
+                    }
+                    if (m_iblSamplerState)
+                    {
+                        m_context->PSSetSamplers(1, 1, m_iblSamplerState.GetAddressOf());
+                    }
                 }
                 
                 // 绘制该子网格
@@ -688,8 +696,15 @@ void Renderer::RenderFrame(float deltaTime)
             };
             m_context->PSSetShaderResources(3, 2, iblSRVs);
             
-            // 绑定IBL采样器（s1）
-            m_context->PSSetSamplers(1, 1, m_iblSamplerState.GetAddressOf());
+            // 绑定采样器（s0用于普通纹理，s1用于IBL纹理）
+            if (m_samplerState)
+            {
+                m_context->PSSetSamplers(0, 1, m_samplerState.GetAddressOf());
+            }
+            if (m_iblSamplerState)
+            {
+                m_context->PSSetSamplers(1, 1, m_iblSamplerState.GetAddressOf());
+            }
             
             // 执行绘制命令，GPU 开始渲染
             modelGPU->Draw(m_context.Get());
@@ -1142,23 +1157,12 @@ Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> Renderer::LoadTextureFile(const
     
     if (isBaseColor)
     {
-        // 尝试使用SRGB格式
-        srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        // 注意：DirectX 11 不允许为 UNORM 格式的纹理创建 SRGB 格式的 SRV
+        // 因为纹理本身是用 UNORM 格式创建的，SRV 格式必须与纹理格式兼容
+        // 如果要用 SRGB，应该在创建纹理时就使用 SRGB 格式
+        // 这里直接使用 UNORM 格式，PBR shader 可以在 shader 中手动进行 gamma 校正
+        srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         hr = m_device->CreateShaderResourceView(texture.Get(), &srvDesc, result.GetAddressOf());
-        
-        // 如果SRGB格式失败，回退到UNORM格式（在shader中手动转换）
-        if (FAILED(hr))
-        {
-            std::wstring errorMsg = L"Warning: Failed to create SRGB SRV for BaseColor texture, falling back to UNORM. HRESULT: 0x";
-            wchar_t hrStr[16];
-            swprintf_s(hrStr, L"%08X", hr);
-            errorMsg += hrStr;
-            errorMsg += L"\n";
-            OutputDebugStringW(errorMsg.c_str());
-            
-            srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-            hr = m_device->CreateShaderResourceView(texture.Get(), &srvDesc, result.GetAddressOf());
-        }
     }
     else
     {
@@ -1278,16 +1282,10 @@ bool Renderer::LoadTextures(const std::vector<std::wstring>& materialNames, cons
                 srvDesc.Texture2D.MipLevels = 1;
                 srvDesc.Texture2D.MostDetailedMip = 0;
                 
-                // 尝试使用SRGB格式
-                srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+                // 注意：DirectX 11 不允许为 UNORM 格式的纹理创建 SRGB 格式的 SRV
+                // 直接使用 UNORM 格式，PBR shader 可以在 shader 中手动进行 gamma 校正
+                srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
                 hr = m_device->CreateShaderResourceView(texture.Get(), &srvDesc, matTex.baseColorSRV.GetAddressOf());
-                
-                // 如果SRGB格式失败，回退到UNORM格式
-                if (FAILED(hr))
-                {
-                    srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-                    hr = m_device->CreateShaderResourceView(texture.Get(), &srvDesc, matTex.baseColorSRV.GetAddressOf());
-                }
             }
         }
         
@@ -2086,6 +2084,7 @@ bool Renderer::GenerateBRDFLUT()
 #pragma push_macro("jmp_buf")
 
 #define STB_IMAGE_IMPLEMENTATION
+#define STBI_WINDOWS_UTF8   // 可选（Windows 路径）
 #include "stb_image.h"
 
 // 恢复宏定义
@@ -2709,6 +2708,11 @@ bool Renderer::InitializeTerrain()
     if (m_terrain->CreateProcedural(m_device.Get(), params))
     {
         OutputDebugStringW(L"Procedural terrain created successfully.\n");
+        wchar_t msg[256];
+        swprintf_s(msg, L"Terrain: %d x %d vertices, %d indices\n", 
+                   params.width * params.height, 
+                   m_terrain->GetIndexCount());
+        OutputDebugStringW(msg);
         return true;
     }
     
@@ -2724,7 +2728,16 @@ bool Renderer::InitializeTerrain()
 void Renderer::RenderTerrain()
 {
     if (!m_terrain)
+    {
+        // 调试：输出地形未创建
+        static bool warned = false;
+        if (!warned)
+        {
+            OutputDebugStringW(L"RenderTerrain: Terrain is null!\n");
+            warned = true;
+        }
         return;
+    }
     
     // 地形使用与场景相同的shader和输入布局
     // 确保shader和输入布局已经设置（应该在RenderFrame的步骤6中设置）
@@ -2738,7 +2751,8 @@ void Renderer::RenderTerrain()
     {
         ConstantBuffer* cb = (ConstantBuffer*)mapped.pData;
         
-        // 获取当前的view和projection矩阵（保存下来）
+        // 保存当前的world矩阵（用于模型渲染）
+        XMFLOAT4X4 savedWorld = cb->world;
         XMFLOAT4X4 savedView = cb->view;
         XMFLOAT4X4 savedProjection = cb->projection;
         
@@ -2753,27 +2767,59 @@ void Renderer::RenderTerrain()
         XMStoreFloat4x4(&cb->worldViewProj, XMMatrixTranspose(worldViewProj));
         
         m_context->Unmap(m_constantBuffer.Get(), 0);
+        
+        // 绑定地形纹理（暂时使用默认纹理）
+        ID3D11ShaderResourceView* srvs[3] = {
+            m_textureSRV.Get(),  // BaseColor
+            m_textureSRV.Get(),  // Normal（暂时使用默认）
+            m_textureSRV.Get()   // MRA（暂时使用默认）
+        };
+        m_context->PSSetShaderResources(0, 3, srvs);
+        
+        // 绑定IBL纹理
+        ID3D11ShaderResourceView* iblSRVs[2] = {
+            m_environmentMapSRV.Get(),
+            m_brdfLutSRV.Get()
+        };
+        m_context->PSSetShaderResources(3, 2, iblSRVs);
+        
+        // 绑定采样器（s0用于普通纹理，s1用于IBL纹理）
+        if (m_samplerState)
+        {
+            m_context->PSSetSamplers(0, 1, m_samplerState.GetAddressOf());
+        }
+        if (m_iblSamplerState)
+        {
+            m_context->PSSetSamplers(1, 1, m_iblSamplerState.GetAddressOf());
+        }
+        
+        // 绘制地形（地形会使用自己的顶点和索引缓冲区）
+        // 调试输出
+        static bool terrainDrawLogged = false;
+        if (!terrainDrawLogged)
+        {
+            wchar_t msg[256];
+            swprintf_s(msg, L"Drawing terrain: %d indices\n", m_terrain->GetIndexCount());
+            OutputDebugStringW(msg);
+            terrainDrawLogged = true;
+        }
+        m_terrain->Render(m_context.Get());
+        
+        // 恢复原来的world矩阵（用于模型渲染）
+        hr = m_context->Map(m_constantBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+        if (SUCCEEDED(hr))
+        {
+            cb = (ConstantBuffer*)mapped.pData;
+            cb->world = savedWorld;
+            
+            // 重新计算worldViewProj矩阵（使用模型的world矩阵）
+            XMMATRIX worldMatrix = XMLoadFloat4x4(&savedWorld);
+            XMMATRIX viewMat = XMLoadFloat4x4(&savedView);
+            XMMATRIX projMat = XMLoadFloat4x4(&savedProjection);
+            XMMATRIX wvp = worldMatrix * viewMat * projMat;
+            XMStoreFloat4x4(&cb->worldViewProj, XMMatrixTranspose(wvp));
+            
+            m_context->Unmap(m_constantBuffer.Get(), 0);
+        }
     }
-    
-    // 绑定地形纹理（暂时使用默认纹理）
-    ID3D11ShaderResourceView* srvs[3] = {
-        m_textureSRV.Get(),  // BaseColor
-        m_textureSRV.Get(),  // Normal（暂时使用默认）
-        m_textureSRV.Get()   // MRA（暂时使用默认）
-    };
-    m_context->PSSetShaderResources(0, 3, srvs);
-    
-    // 绑定IBL纹理
-    ID3D11ShaderResourceView* iblSRVs[2] = {
-        m_environmentMapSRV.Get(),
-        m_brdfLutSRV.Get()
-    };
-    m_context->PSSetShaderResources(3, 2, iblSRVs);
-    m_context->PSSetSamplers(1, 1, m_iblSamplerState.GetAddressOf());
-    
-    // 绘制地形（地形会使用自己的顶点和索引缓冲区）
-    m_terrain->Render(m_context.Get());
-    
-    // 注意：这里我们没有恢复原来的world矩阵，因为UpdateConstantBuffers会在下一帧重新设置
-    // 如果模型渲染在地形之后，可能需要在这里恢复world矩阵
 }

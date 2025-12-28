@@ -1,15 +1,3 @@
-#if !defined(_MSC_VER)
-#error "NOT USING MSVC"
-#endif
-
-#if !defined(_M_X64)
-#error "NOT X64 BUILD"
-#endif
-
-#if defined(__clang__) || defined(__GNUC__)
-#error "CLANG / GCC IS USED"
-#endif
-
 #include "Platform/Window.h"
 #include "Renderer.h"
 #include "Camera.h"
