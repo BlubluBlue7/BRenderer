@@ -569,18 +569,44 @@ void Renderer::RenderFrame(float deltaTime)
     // 步骤 6: 渲染网格
     // 绑定网格资源并执行绘制命令
     // ========================================================================
+    // 地形渲染后，需要重新更新常量缓冲区（因为地形修改了world矩阵）
+    // 确保模型的world矩阵是正确的
+    UpdateConstantBuffers(deltaTime);
+    
     // 尝试渲染模型，如果不存在则渲染三角形
     std::shared_ptr<MeshGPU> modelGPU = m_meshMgr->GetMeshGPU("Model");
     if (!modelGPU)
+    {
+        OutputDebugStringW(L"Model not found, trying Triangle...\n");
         modelGPU = m_meshMgr->GetMeshGPU("Triangle");
+    }
+    else
+    {
+        static bool modelFoundLogged = false;
+        if (!modelFoundLogged)
+        {
+            OutputDebugStringW(L"Model found!\n");
+            modelFoundLogged = true;
+        }
+    }
     
     if (modelGPU)
     {
+        // 调试输出
+        static bool modelRenderLogged = false;
+        if (!modelRenderLogged)
+        {
+            wchar_t msg[256];
+            swprintf_s(msg, L"Rendering model: %d submeshes\n", modelGPU->GetSubmeshCount());
+            OutputDebugStringW(msg);
+            modelRenderLogged = true;
+        }
+        
         // 绑定顶点缓冲区和索引缓冲区到输入装配阶段
         modelGPU->Bind(m_context.Get());
         
         // 检查是否有子网格（多材质支持）
-        if (modelGPU->GetSubmeshCount() > 0 && !m_materialTextures.empty())
+        if (modelGPU->GetSubmeshCount() > 0)
         {
             // 按子网格绘制，每个子网格使用不同的纹理
             for (uint32_t i = 0; i < modelGPU->GetSubmeshCount(); ++i)
@@ -588,85 +614,60 @@ void Renderer::RenderFrame(float deltaTime)
                 const Submesh& submesh = modelGPU->GetSubmesh(i);
                 
                 // 查找对应的材质纹理
-                auto it = m_materialTextures.find(submesh.materialName);
-                if (it != m_materialTextures.end())
+                ID3D11ShaderResourceView* srvs[3] = {
+                    m_textureSRV.Get(),  // BaseColor（默认纹理）
+                    m_textureSRV.Get(),  // Normal（默认纹理）
+                    m_textureSRV.Get()   // MRA（默认纹理）
+                };
+                
+                if (!m_materialTextures.empty())
                 {
-                    const MaterialTextures& matTex = it->second;
-                    
-                    // 绑定多个纹理到像素着色器
-                    // t0 = BaseColor, t1 = Normal, t2 = MRA
-                    ID3D11ShaderResourceView* srvs[3] = {
-                        matTex.baseColorSRV.Get(),
-                        matTex.normalSRV.Get(),
-                        matTex.mraSRV.Get()
-                    };
-                    
-                    // 确保所有纹理都存在，如果不存在则使用默认纹理
-                    if (!srvs[0]) 
+                    auto it = m_materialTextures.find(submesh.materialName);
+                    if (it != m_materialTextures.end())
                     {
-                        srvs[0] = m_textureSRV.Get();
-                        // 输出警告：使用默认纹理
-                        std::wstring warnMsg = L"Warning: Using default texture for BaseColor of material: ";
-                        warnMsg += std::wstring(submesh.materialName.begin(), submesh.materialName.end());
-                        warnMsg += L"\n";
-                        OutputDebugStringW(warnMsg.c_str());
-                    }
-                    if (!srvs[1]) srvs[1] = m_textureSRV.Get();
-                    if (!srvs[2]) srvs[2] = m_textureSRV.Get();
-                    
-                    m_context->PSSetShaderResources(0, 3, srvs);
-                    
-                    // 绑定IBL纹理（t3 = 环境贴图, t4 = BRDF LUT）
-                    ID3D11ShaderResourceView* iblSRVs[2] = {
-                        m_environmentMapSRV.Get(),
-                        m_brdfLutSRV.Get()
-                    };
-                    m_context->PSSetShaderResources(3, 2, iblSRVs);
-                    
-                    // 绑定采样器（s0用于普通纹理，s1用于IBL纹理）
-                    if (m_samplerState)
-                    {
-                        m_context->PSSetSamplers(0, 1, m_samplerState.GetAddressOf());
-                    }
-                    if (m_iblSamplerState)
-                    {
-                        m_context->PSSetSamplers(1, 1, m_iblSamplerState.GetAddressOf());
-                    }
-                }
-                else
-                {
-                    // 如果找不到材质，使用默认纹理
-                    std::wstring warnMsg = L"Warning: Material not found: ";
-                    warnMsg += std::wstring(submesh.materialName.begin(), submesh.materialName.end());
-                    warnMsg += L"\n";
-                    OutputDebugStringW(warnMsg.c_str());
-                    
-                    ID3D11ShaderResourceView* defaultSRVs[3] = {
-                        m_textureSRV.Get(),
-                        m_textureSRV.Get(),
-                        m_textureSRV.Get()
-                    };
-                    m_context->PSSetShaderResources(0, 3, defaultSRVs);
-                    
-                    // 绑定IBL纹理（t3 = 环境贴图, t4 = BRDF LUT）
-                    ID3D11ShaderResourceView* iblSRVs[2] = {
-                        m_environmentMapSRV.Get(),
-                        m_brdfLutSRV.Get()
-                    };
-                    m_context->PSSetShaderResources(3, 2, iblSRVs);
-                    
-                    // 绑定采样器（s0用于普通纹理，s1用于IBL纹理）
-                    if (m_samplerState)
-                    {
-                        m_context->PSSetSamplers(0, 1, m_samplerState.GetAddressOf());
-                    }
-                    if (m_iblSamplerState)
-                    {
-                        m_context->PSSetSamplers(1, 1, m_iblSamplerState.GetAddressOf());
+                        const MaterialTextures& matTex = it->second;
+                        
+                        // 绑定多个纹理到像素着色器
+                        // t0 = BaseColor, t1 = Normal, t2 = MRA
+                        srvs[0] = matTex.baseColorSRV.Get();
+                        srvs[1] = matTex.normalSRV.Get();
+                        srvs[2] = matTex.mraSRV.Get();
+                        
+                        // 确保所有纹理都存在，如果不存在则使用默认纹理
+                        if (!srvs[0]) srvs[0] = m_textureSRV.Get();
+                        if (!srvs[1]) srvs[1] = m_textureSRV.Get();
+                        if (!srvs[2]) srvs[2] = m_textureSRV.Get();
                     }
                 }
                 
+                m_context->PSSetShaderResources(0, 3, srvs);
+                
+                // 绑定IBL纹理（t3 = 环境贴图, t4 = BRDF LUT）
+                ID3D11ShaderResourceView* iblSRVs[2] = {
+                    m_environmentMapSRV.Get(),
+                    m_brdfLutSRV.Get()
+                };
+                m_context->PSSetShaderResources(3, 2, iblSRVs);
+                
+                // 绑定采样器（s0用于普通纹理，s1用于IBL纹理）
+                if (m_samplerState)
+                {
+                    m_context->PSSetSamplers(0, 1, m_samplerState.GetAddressOf());
+                }
+                if (m_iblSamplerState)
+                {
+                    m_context->PSSetSamplers(1, 1, m_iblSamplerState.GetAddressOf());
+                }
+                
                 // 绘制该子网格
+                static bool drawSubmeshLogged = false;
+                if (!drawSubmeshLogged && i == 0)
+                {
+                    wchar_t msg[256];
+                    swprintf_s(msg, L"Drawing submesh %d\n", i);
+                    OutputDebugStringW(msg);
+                    drawSubmeshLogged = true;
+                }
                 modelGPU->DrawSubmesh(m_context.Get(), i);
             }
         }
@@ -1811,8 +1812,10 @@ void Renderer::UpdateConstantBuffers(float deltaTime)
         // 旋转模型摆正：从头顶看向脚底 -> 正常视角
         // 绕X轴旋转-90度（顺时针90度），让模型从躺着的状态变成站着的状态
         XMMATRIX rotation = XMMatrixRotationX(-XM_PI / 2.0f);  // -90度 = -π/2弧度
-        // 组合变换：先缩放，再旋转
-        XMMATRIX world = scale * rotation;
+        // 将模型向上移动，确保在地形上方（地形高度范围大约是0-30，模型中心在y=0，所以需要向上移动）
+        XMMATRIX translation = XMMatrixTranslation(0.0f, 5.0f, 0.0f);  // 向上移动5个单位
+        // 组合变换：先缩放，再旋转，最后平移
+        XMMATRIX world = scale * rotation * translation;
         
         // 视图矩阵和投影矩阵：从相机获取
         XMMATRIX view;
