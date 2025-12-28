@@ -45,6 +45,9 @@
     <ClCompile Include="Renderer.cpp">
       <Filter>BRenderer</Filter>
     </ClCompile>
+    <ClCompile Include="Terrain.cpp">
+      <Filter>BRenderer</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Camera.h">
@@ -66,6 +69,9 @@
       <Filter>Platform</Filter>
     </ClInclude>
     <ClInclude Include="Renderer.h">
+      <Filter>BRenderer</Filter>
+    </ClInclude>
+    <ClInclude Include="Terrain.h">
       <Filter>BRenderer</Filter>
     </ClInclude>
   </ItemGroup>

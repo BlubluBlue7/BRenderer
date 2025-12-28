@@ -1,7 +1,14 @@
 #pragma once
+
+// 确保在包含 DirectXMath.h 之前定义必要的宏，避免冲突
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 #include <DirectXMath.h>
 
-using namespace DirectX;
+// 注意：不在头文件中使用using namespace，避免命名空间污染
+// 在实现文件中使用using namespace DirectX;
 
 // ============================================================================
 // 相机类
@@ -16,13 +23,13 @@ public:
     void Update(float deltaTime);
     
     // 获取视图矩阵
-    XMMATRIX GetViewMatrix() const;
+    DirectX::XMMATRIX GetViewMatrix() const;
     
     // 获取投影矩阵
-    XMMATRIX GetProjectionMatrix(float aspectRatio) const;
+    DirectX::XMMATRIX GetProjectionMatrix(float aspectRatio) const;
     
     // 获取相机位置
-    XMFLOAT3 GetPosition() const { return m_position; }
+    DirectX::XMFLOAT3 GetPosition() const { return m_position; }
     
     // 鼠标输入处理
     void OnMouseMove(int deltaX, int deltaY);
@@ -38,7 +45,7 @@ public:
 
 private:
     // 相机位置
-    XMFLOAT3 m_position;
+    DirectX::XMFLOAT3 m_position;
     
     // 相机旋转（俯仰角和偏航角）
     float m_pitch;  // 上下旋转（弧度）
@@ -58,10 +65,10 @@ private:
     bool m_moveDown;
     
     // 计算前方向量
-    XMFLOAT3 GetForwardVector() const;
+    DirectX::XMFLOAT3 GetForwardVector() const;
     // 计算右方向量
-    XMFLOAT3 GetRightVector() const;
+    DirectX::XMFLOAT3 GetRightVector() const;
     // 计算上方向量
-    XMFLOAT3 GetUpVector() const;
+    DirectX::XMFLOAT3 GetUpVector() const;
 };
 

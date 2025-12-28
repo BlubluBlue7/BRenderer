@@ -1,4 +1,7 @@
 #include "Camera.h"
+#include <DirectXMath.h>
+
+using namespace DirectX;
 #include <algorithm>
 
 // clamp 辅助函数（C++17 之前不支持 std::clamp）
@@ -13,9 +16,9 @@ inline float clamp(float value, float min, float max)
 // 构造函数：初始化相机参数
 // ============================================================================
 Camera::Camera()
-    : m_position(0.0f, 0.0f, -5.0f)  // 初始位置：在 Z 轴负方向
-    , m_pitch(0.0f)                   // 初始俯仰角：水平
-    , m_yaw(0.0f)                     // 初始偏航角：朝向 Z 轴正方向
+    : m_position(0.0f, 1.5f, 3.0f)   // 初始位置：在角色前方稍高位置（正常视角）
+    , m_pitch(-0.1f)                  // 初始俯仰角：稍微向下看（看向角色）
+    , m_yaw(XM_PI)                    // 初始偏航角：朝向 Z 轴负方向（看向原点，即角色位置）
     , m_moveSpeed(5.0f)               // 移动速度：5 单位/秒
     , m_rotationSpeed(2.0f)           // 旋转速度：2 弧度/秒
     , m_mouseSensitivity(0.002f)     // 鼠标灵敏度

@@ -40,6 +40,37 @@ std::shared_ptr<Mesh> MeshMgr::CreateMesh(const std::string& name,
 }
 
 // ============================================================================
+// 创建网格（带子网格信息）
+// ============================================================================
+std::shared_ptr<Mesh> MeshMgr::CreateMesh(const std::string& name,
+    const std::vector<Vertex>& verts,
+    const std::vector<uint32_t>& indices,
+    const std::vector<Submesh>& submeshes)
+{
+    // 创建 CPU 端的网格对象
+    auto mesh = std::make_shared<Mesh>();
+    mesh->SetVertices(verts);
+    mesh->SetIndices(indices);
+    mesh->SetSubmeshes(submeshes);  // 设置子网格信息
+    
+    // 将网格存储到映射表中
+    meshes[name] = mesh;
+    
+    // 创建 GPU 端的网格资源
+    auto gpuMesh = std::make_shared<MeshGPU>();
+    if (!gpuMesh->UploadToGPU(device, context, *mesh))
+    {
+        meshes.erase(name);
+        return nullptr;
+    }
+    
+    // 将 GPU 网格资源存储到映射表中
+    gpuMeshes[name] = gpuMesh;
+    
+    return mesh;
+}
+
+// ============================================================================
 // 获取 GPU 网格资源
 // 根据名称查找并返回对应的 GPU 网格资源，用于渲染
 // ============================================================================

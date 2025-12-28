@@ -1,4 +1,10 @@
 #pragma once
+
+// 在包含 Windows.h 之前定义 NOMINMAX，避免 min/max 宏冲突
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 #include <windows.h>
 #include <functional>
 

@@ -3,17 +3,23 @@
 #include "Camera.h"
 #include "ModelLoader.h"
 #include "MeshGPU.h"
+#include "Terrain.h"
 
+// 在包含 Windows.h 之前定义 NOMINMAX，避免 min/max 宏冲突
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
 #include <d3dcompiler.h>
+#include <wincodec.h>  // WIC (Windows Imaging Component)
 #include <DirectXMath.h>
 #include <fstream>
 #include <vector>
 #include <cstring>
 #include <memory>
-#include <wincodec.h>  // WIC (Windows Imaging Component)
+#include <algorithm>  // for std::max, std::transform
+
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "dxguid.lib")
 #pragma comment(lib, "windowscodecs.lib")  // WIC库
@@ -33,23 +39,48 @@ struct ConstantBuffer
 // PBR 光照常量缓冲区结构体（必须对齐到16字节边界，大小必须是16字节的倍数）
 struct alignas(16) LightBuffer
 {
-    XMFLOAT3 lightDirection;  // 光源方向 (12 bytes)
-    float lightIntensity;      // 光源强度 (4 bytes) -> 16 bytes total
+    // 注意：在HLSL常量缓冲区中，float3会被对齐到16字节（相当于float4）
+    // 所以C++结构必须匹配HLSL的对齐方式
+    // 使用XMFLOAT4而不是XMFLOAT3，以确保对齐正确
     
-    XMFLOAT3 lightColor;       // 光源颜色 (12 bytes)
-    float padding1;            // 对齐填充 (4 bytes) -> 16 bytes total
+    // 注意：在HLSL中，float3会被对齐到16字节（相当于float4）
+    // 为了完全匹配，我们在C++和HLSL中都使用float4/XMFLOAT4
     
-    XMFLOAT3 cameraPosition;   // 相机位置 (12 bytes)
-    float padding2;            // 对齐填充 (4 bytes) -> 16 bytes total
+    XMFLOAT4 lightDirection;  // 光源方向 (16 bytes) - 只使用xyz分量
+    float lightIntensity;      // 光源强度 (4 bytes) -> 20 bytes，但会被对齐到下一个16字节边界
+    float padding1a;           // 对齐填充 (4 bytes)
+    float padding1b;           // 对齐填充 (4 bytes)
+    float padding1c;           // 对齐填充 (4 bytes) -> 总共32字节（匹配HLSL的float3对齐）
+    
+    XMFLOAT4 lightColor;       // 光源颜色 (16 bytes) - 只使用xyz分量
+    float padding1;            // 对齐填充 (4 bytes)
+    float padding1d;           // 对齐填充 (4 bytes)
+    float padding1e;           // 对齐填充 (4 bytes)
+    float padding1f;           // 对齐填充 (4 bytes) -> 总共32字节
+    
+    XMFLOAT4 cameraPosition;   // 相机位置 (16 bytes) - 只使用xyz分量
+    float padding2;            // 对齐填充 (4 bytes)
+    float padding2a;           // 对齐填充 (4 bytes)
+    float padding2b;           // 对齐填充 (4 bytes)
+    float padding2c;           // 对齐填充 (4 bytes) -> 总共32字节
     
     // PBR 材质参数
-    XMFLOAT3 albedo;           // 反照率（基础颜色）(12 bytes)
-    float metallic;            // 金属度 (4 bytes) -> 16 bytes total
+    XMFLOAT4 albedo;           // 反照率（基础颜色）(16 bytes) - 只使用xyz分量
+    float metallic;            // 金属度 (4 bytes)
+    float padding2d;           // 对齐填充 (4 bytes)
+    float padding2e;           // 对齐填充 (4 bytes)
+    float padding2f;           // 对齐填充 (4 bytes) -> 总共32字节
     
     float roughness;           // 粗糙度 (4 bytes)
     float padding3a;           // 对齐填充 (4 bytes)
-    XMFLOAT3 ambientColor;     // 环境光颜色 (12 bytes)
-    float padding3b;           // 对齐填充 (4 bytes) -> 16 bytes total
+    float padding3b;           // 对齐填充 (4 bytes)
+    float padding3c;           // 对齐填充 (4 bytes) -> 16 bytes total
+    
+    XMFLOAT4 ambientColor;     // 环境光颜色 (16 bytes) - 只使用xyz分量
+    float padding4;            // 对齐填充 (4 bytes)
+    float padding4a;           // 对齐填充 (4 bytes)
+    float padding4b;           // 对齐填充 (4 bytes)
+    float padding4c;           // 对齐填充 (4 bytes) -> 总共32字节
     // 总共: 16 * 6 = 96 bytes (16字节的倍数)
 };
 
@@ -165,6 +196,112 @@ bool Renderer::Initialize(HWND hwnd, int width, int height)
     // ========================================================================
     if (!CreateSamplerState())
         return false;
+    
+    // ========================================================================
+    // 步骤 9: 创建IBL采样器
+    // ========================================================================
+    if (!CreateIBLSamplerState())
+        return false;
+    
+    // ========================================================================
+    // 步骤 10: 生成BRDF LUT
+    // ========================================================================
+    if (!GenerateBRDFLUT())
+    {
+        OutputDebugStringW(L"Warning: Failed to generate BRDF LUT. IBL may not work correctly.\n");
+    }
+    
+    // ========================================================================
+    // 步骤 11: 创建天空盒
+    // ========================================================================
+    if (!CreateSkyboxShaders())
+    {
+        OutputDebugStringW(L"Warning: Failed to create skybox shaders.\n");
+        return false;
+    }
+    if (!CreateSkyboxGeometry())
+    {
+        OutputDebugStringW(L"Warning: Failed to create skybox geometry.\n");
+        return false;
+    }
+    if (!CreateSkyboxDepthState())
+    {
+        OutputDebugStringW(L"Warning: Failed to create skybox depth state.\n");
+        return false;
+    }
+    OutputDebugStringW(L"Skybox resources created successfully.\n");
+    
+    // ========================================================================
+    // 步骤 12: 初始化地形
+    // ========================================================================
+    if (!InitializeTerrain())
+    {
+        OutputDebugStringW(L"Warning: Failed to initialize terrain.\n");
+    }
+    
+    // ========================================================================
+    // 步骤 13: 加载环境贴图
+    // ========================================================================
+    // 尝试加载 .exr 或 .hdr 环境贴图，如果失败则使用默认环境贴图
+    wchar_t exePathEnv[MAX_PATH] = { 0 };
+    GetModuleFileNameW(nullptr, exePathEnv, MAX_PATH);
+    std::wstring exeDir = exePathEnv;
+    size_t lastSlash = exeDir.find_last_of(L"\\/");
+    if (lastSlash != std::wstring::npos)
+    {
+        exeDir = exeDir.substr(0, lastSlash + 1);
+        
+        std::wstring projectRoot = exeDir;
+        for (int i = 0; i < 2; ++i)
+        {
+            size_t slash = projectRoot.find_last_of(L"\\/", projectRoot.length() - 2);
+            if (slash != std::wstring::npos)
+                projectRoot = projectRoot.substr(0, slash + 1);
+        }
+        
+        // 尝试加载环境贴图文件（按优先级顺序）
+        std::vector<std::wstring> envMapPaths = {
+            projectRoot + L"Res/environment.hdr",
+            projectRoot + L"environment.hdr"
+        };
+        
+        bool envMapLoaded = false;
+        for (const auto& envPath : envMapPaths)
+        {
+            OutputDebugStringW(L"Trying to load environment map from: ");
+            OutputDebugStringW(envPath.c_str());
+            OutputDebugStringW(L"\n");
+            
+            if (LoadEnvironmentMap(envPath))
+            {
+                envMapLoaded = true;
+                OutputDebugStringW(L"Successfully loaded environment map!\n");
+                break;
+            }
+        }
+        
+        if (!envMapLoaded)
+        {
+            // 如果所有路径都失败，使用默认环境贴图
+            OutputDebugStringW(L"Failed to load environment map from any path, using default (sky blue gradient).\n");
+            if (!LoadEnvironmentMap(L""))
+            {
+                OutputDebugStringW(L"Warning: Failed to load default environment map. IBL may not work correctly.\n");
+            }
+            else
+            {
+                OutputDebugStringW(L"Using default environment map (sky blue gradient).\n");
+            }
+        }
+    }
+    else
+    {
+        // 如果无法确定路径，使用默认环境贴图
+        if (!LoadEnvironmentMap(L""))
+        {
+            OutputDebugStringW(L"Warning: Failed to load default environment map. IBL may not work correctly.\n");
+        }
+    }
 
     // ========================================================================
     // 步骤 8: 加载纹理（如果存在）
@@ -246,10 +383,12 @@ bool Renderer::Initialize(HWND hwnd, int width, int height)
     // ========================================================================
     std::vector<Vertex> verts;
     std::vector<uint32_t> indices;
+    std::vector<Submesh> submeshes;
     
     // 尝试加载模型文件（如果存在）
     // 支持从多个路径加载：Res目录、exe目录、项目根目录
     bool modelLoaded = false;
+    std::string loadedProjectRoot;
     
     // 使用之前获取的exe路径
     if (exePath[0] != 0)
@@ -290,13 +429,16 @@ bool Renderer::Initialize(HWND hwnd, int width, int height)
                 exeDir + "model.obj"
             };
             
-            // 尝试加载模型
+            // 尝试加载模型（使用支持子网格的加载函数）
             for (const auto& path : pathsToTry)
             {
-                if (ModelLoader::LoadFromFile(path, verts, indices))
+                if (ModelLoader::LoadFromFileWithSubmeshes(path, verts, indices, submeshes))
                 {
                     modelLoaded = true;
-                    m_meshMgr->CreateMesh("Model", verts, indices);
+                    loadedProjectRoot = projectRoot;
+                    
+                    // 创建Mesh并设置子网格信息
+                    auto mesh = m_meshMgr->CreateMesh("Model", verts, indices, submeshes);
                     break;
                 }
             }
@@ -315,6 +457,16 @@ bool Renderer::Initialize(HWND hwnd, int width, int height)
             {{-0.5f,-0.5f, 0.0f},  {0.0f, 0.0f, 1.0f},  {0.0f, 0.0f, 1.0f},  {0.0f, 1.0f}}
         };
         m_meshMgr->CreateMesh("Triangle", verts);
+    }
+    else if (!submeshes.empty())
+    {
+        // 如果模型加载成功且有子网格，加载对应的纹理
+        std::vector<std::wstring> materialNames;
+        for (const auto& submesh : submeshes)
+        {
+            materialNames.push_back(std::wstring(submesh.materialName.begin(), submesh.materialName.end()));
+        }
+        LoadTextures(materialNames, loadedProjectRoot);
     }
 
     return true;
@@ -341,8 +493,9 @@ void Renderer::RenderFrame(float deltaTime)
     // ========================================================================
     // 步骤 2: 清空渲染目标和深度缓冲区
     // 用指定颜色填充整个渲染目标，清除上一帧的内容
+    // 注意：由于会渲染天空盒，可以清除为黑色（天空盒会覆盖）
     // ========================================================================
-    float clearColor[4] = { 0.2f, 0.3f, 0.6f, 1.0f }; // RGBA: 深蓝色背景
+    float clearColor[4] = { 0.0f, 0.0f, 0.0f, 1.0f }; // RGBA: 黑色背景（天空盒会覆盖）
     m_context->ClearRenderTargetView(m_rtv.Get(), clearColor);
     
     // 清空深度缓冲区（设置为1.0，表示最远距离）
@@ -368,10 +521,21 @@ void Renderer::RenderFrame(float deltaTime)
     // 步骤 4: 更新常量缓冲区
     // 将变换矩阵和光照参数传递给 Shader
     // ========================================================================
-    UpdateConstantBuffers();
+    // 累积光源旋转时间（如果未暂停）
+    if (!m_lightRotationPaused)
+    {
+        m_lightRotationTime += deltaTime;
+    }
+    
+    UpdateConstantBuffers(deltaTime);
 
     // ========================================================================
-    // 步骤 5: 设置 Shader 和输入布局
+    // 步骤 5: 渲染天空盒（在场景之前渲染）
+    // ========================================================================
+    RenderSkybox();
+
+    // ========================================================================
+    // 步骤 6: 设置 Shader 和输入布局（用于场景渲染和地形）
     // 将编译好的 Shader 和输入布局绑定到渲染管线
     // ========================================================================
     // 设置输入布局：告诉 GPU 如何解析顶点数据
@@ -380,6 +544,11 @@ void Renderer::RenderFrame(float deltaTime)
     m_context->VSSetShader(m_vs.Get(), nullptr, 0);
     // 设置像素着色器：处理每个像素的颜色
     m_context->PSSetShader(m_ps.Get(), nullptr, 0);
+    
+    // ========================================================================
+    // 步骤 6.5: 渲染地形（在场景之前渲染，在天空盒之后）
+    // ========================================================================
+    RenderTerrain();
     
     // 绑定常量缓冲区到顶点着色器（register b0）
     m_context->VSSetConstantBuffers(0, 1, m_constantBuffer.GetAddressOf());
@@ -415,8 +584,116 @@ void Renderer::RenderFrame(float deltaTime)
     {
         // 绑定顶点缓冲区和索引缓冲区到输入装配阶段
         modelGPU->Bind(m_context.Get());
-        // 执行绘制命令，GPU 开始渲染
-        modelGPU->Draw(m_context.Get());
+        
+        // 检查是否有子网格（多材质支持）
+        if (modelGPU->GetSubmeshCount() > 0 && !m_materialTextures.empty())
+        {
+            // 按子网格绘制，每个子网格使用不同的纹理
+            for (uint32_t i = 0; i < modelGPU->GetSubmeshCount(); ++i)
+            {
+                const Submesh& submesh = modelGPU->GetSubmesh(i);
+                
+                // 查找对应的材质纹理
+                auto it = m_materialTextures.find(submesh.materialName);
+                if (it != m_materialTextures.end())
+                {
+                    const MaterialTextures& matTex = it->second;
+                    
+                    // 绑定多个纹理到像素着色器
+                    // t0 = BaseColor, t1 = Normal, t2 = MRA
+                    ID3D11ShaderResourceView* srvs[3] = {
+                        matTex.baseColorSRV.Get(),
+                        matTex.normalSRV.Get(),
+                        matTex.mraSRV.Get()
+                    };
+                    
+                    // 确保所有纹理都存在，如果不存在则使用默认纹理
+                    if (!srvs[0]) 
+                    {
+                        srvs[0] = m_textureSRV.Get();
+                        // 输出警告：使用默认纹理
+                        std::wstring warnMsg = L"Warning: Using default texture for BaseColor of material: ";
+                        warnMsg += std::wstring(submesh.materialName.begin(), submesh.materialName.end());
+                        warnMsg += L"\n";
+                        OutputDebugStringW(warnMsg.c_str());
+                    }
+                    if (!srvs[1]) srvs[1] = m_textureSRV.Get();
+                    if (!srvs[2]) srvs[2] = m_textureSRV.Get();
+                    
+                    m_context->PSSetShaderResources(0, 3, srvs);
+                    
+                    // 绑定IBL纹理（t3 = 环境贴图, t4 = BRDF LUT）
+                    ID3D11ShaderResourceView* iblSRVs[2] = {
+                        m_environmentMapSRV.Get(),
+                        m_brdfLutSRV.Get()
+                    };
+                    m_context->PSSetShaderResources(3, 2, iblSRVs);
+                    
+                    // 绑定IBL采样器（s1）
+                    m_context->PSSetSamplers(1, 1, m_iblSamplerState.GetAddressOf());
+                }
+                else
+                {
+                    // 如果找不到材质，使用默认纹理
+                    std::wstring warnMsg = L"Warning: Material not found: ";
+                    warnMsg += std::wstring(submesh.materialName.begin(), submesh.materialName.end());
+                    warnMsg += L"\n";
+                    OutputDebugStringW(warnMsg.c_str());
+                    
+                    ID3D11ShaderResourceView* defaultSRVs[3] = {
+                        m_textureSRV.Get(),
+                        m_textureSRV.Get(),
+                        m_textureSRV.Get()
+                    };
+                    m_context->PSSetShaderResources(0, 3, defaultSRVs);
+                    
+                    // 绑定IBL纹理（t3 = 环境贴图, t4 = BRDF LUT）
+                    ID3D11ShaderResourceView* iblSRVs[2] = {
+                        m_environmentMapSRV.Get(),
+                        m_brdfLutSRV.Get()
+                    };
+                    m_context->PSSetShaderResources(3, 2, iblSRVs);
+                    
+                    // 绑定IBL采样器（s1）
+                    m_context->PSSetSamplers(1, 1, m_iblSamplerState.GetAddressOf());
+                }
+                
+                // 绘制该子网格
+                modelGPU->DrawSubmesh(m_context.Get(), i);
+            }
+        }
+        else
+        {
+            // 没有子网格，使用传统方式绘制（向后兼容）
+            // 绑定纹理（如果有）
+            ID3D11ShaderResourceView* srvs[3] = {
+                m_textureSRV.Get(),
+                m_textureSRV.Get(),
+                m_textureSRV.Get()
+            };
+            
+            if (m_textureSRV)
+            {
+                srvs[0] = m_textureSRV.Get();
+                srvs[1] = m_textureSRV.Get();
+                srvs[2] = m_textureSRV.Get();
+            }
+            
+            m_context->PSSetShaderResources(0, 3, srvs);
+            
+            // 绑定IBL纹理（t3 = 环境贴图, t4 = BRDF LUT）
+            ID3D11ShaderResourceView* iblSRVs[2] = {
+                m_environmentMapSRV.Get(),
+                m_brdfLutSRV.Get()
+            };
+            m_context->PSSetShaderResources(3, 2, iblSRVs);
+            
+            // 绑定IBL采样器（s1）
+            m_context->PSSetSamplers(1, 1, m_iblSamplerState.GetAddressOf());
+            
+            // 执行绘制命令，GPU 开始渲染
+            modelGPU->Draw(m_context.Get());
+        }
     }
 
     // ========================================================================
@@ -434,6 +711,13 @@ void Renderer::RenderFrame(float deltaTime)
 // ============================================================================
 void Renderer::Cleanup()
 {
+    // 释放地形
+    if (m_terrain)
+    {
+        delete m_terrain;
+        m_terrain = nullptr;
+    }
+    
     // 释放网格管理器
     if (m_meshMgr)
     {
@@ -735,6 +1019,372 @@ bool Renderer::LoadTexture(const std::wstring& filename)
 
     // 成功加载纹理
     return true;
+}
+
+// ============================================================================
+// 加载纹理文件（内部辅助函数，返回SRV）
+// ============================================================================
+Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> Renderer::LoadTextureFile(const std::wstring& filename, bool isBaseColor)
+{
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> result;
+    
+    if (filename.empty())
+        return result;
+    
+    // 检查文件是否存在
+    HANDLE hFile = CreateFileW(
+        filename.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr
+    );
+    if (hFile == INVALID_HANDLE_VALUE)
+        return result;
+    CloseHandle(hFile);
+    
+    // 创建 WIC 工厂
+    Microsoft::WRL::ComPtr<IWICImagingFactory> wicFactory;
+    HRESULT hr = CoCreateInstance(
+        CLSID_WICImagingFactory,
+        nullptr,
+        CLSCTX_INPROC_SERVER,
+        IID_PPV_ARGS(wicFactory.GetAddressOf())
+    );
+    if (FAILED(hr))
+        return result;
+    
+    // 创建解码器
+    Microsoft::WRL::ComPtr<IWICBitmapDecoder> decoder;
+    hr = wicFactory->CreateDecoderFromFilename(
+        filename.c_str(),
+        nullptr,
+        GENERIC_READ,
+        WICDecodeMetadataCacheOnDemand,
+        decoder.GetAddressOf()
+    );
+    if (FAILED(hr))
+        return result;
+    
+    // 获取第一帧
+    Microsoft::WRL::ComPtr<IWICBitmapFrameDecode> frame;
+    hr = decoder->GetFrame(0, frame.GetAddressOf());
+    if (FAILED(hr))
+        return result;
+    
+    // 获取图片尺寸
+    UINT width = 0, height = 0;
+    hr = frame->GetSize(&width, &height);
+    if (FAILED(hr) || width == 0 || height == 0)
+        return result;
+    
+    // 创建格式转换器
+    Microsoft::WRL::ComPtr<IWICFormatConverter> converter;
+    hr = wicFactory->CreateFormatConverter(converter.GetAddressOf());
+    if (FAILED(hr))
+        return result;
+    
+    // 转换为 RGBA 格式
+    hr = converter->Initialize(
+        frame.Get(),
+        GUID_WICPixelFormat32bppRGBA,
+        WICBitmapDitherTypeNone,
+        nullptr,
+        0.0f,
+        WICBitmapPaletteTypeCustom
+    );
+    if (FAILED(hr))
+        return result;
+    
+    // 计算行字节数
+    UINT stride = (width * 4 + 3) & ~3;
+    UINT imageSize = stride * height;
+    
+    // 分配内存
+    std::vector<BYTE> pixels(imageSize);
+    hr = converter->CopyPixels(nullptr, stride, imageSize, pixels.data());
+    if (FAILED(hr))
+        return result;
+    
+    // 创建 D3D11 纹理
+    D3D11_TEXTURE2D_DESC texDesc = {};
+    texDesc.Width = width;
+    texDesc.Height = height;
+    texDesc.MipLevels = 1;
+    texDesc.ArraySize = 1;
+    texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    texDesc.SampleDesc.Count = 1;
+    texDesc.SampleDesc.Quality = 0;
+    texDesc.Usage = D3D11_USAGE_DEFAULT;
+    texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    texDesc.CPUAccessFlags = 0;
+    texDesc.MiscFlags = 0;
+    
+    D3D11_SUBRESOURCE_DATA initData = {};
+    initData.pSysMem = pixels.data();
+    initData.SysMemPitch = stride;
+    initData.SysMemSlicePitch = 0;
+    
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+    hr = m_device->CreateTexture2D(&texDesc, &initData, texture.GetAddressOf());
+    if (FAILED(hr))
+        return result;
+    
+    // 创建着色器资源视图
+    // BaseColor贴图使用SRGB格式，让DX11自动进行sRGB到线性的转换
+    // Normal和MRA贴图必须使用UNORM格式（线性空间）
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Texture2D.MipLevels = 1;
+    srvDesc.Texture2D.MostDetailedMip = 0;
+    
+    if (isBaseColor)
+    {
+        // 尝试使用SRGB格式
+        srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        hr = m_device->CreateShaderResourceView(texture.Get(), &srvDesc, result.GetAddressOf());
+        
+        // 如果SRGB格式失败，回退到UNORM格式（在shader中手动转换）
+        if (FAILED(hr))
+        {
+            std::wstring errorMsg = L"Warning: Failed to create SRGB SRV for BaseColor texture, falling back to UNORM. HRESULT: 0x";
+            wchar_t hrStr[16];
+            swprintf_s(hrStr, L"%08X", hr);
+            errorMsg += hrStr;
+            errorMsg += L"\n";
+            OutputDebugStringW(errorMsg.c_str());
+            
+            srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            hr = m_device->CreateShaderResourceView(texture.Get(), &srvDesc, result.GetAddressOf());
+        }
+    }
+    else
+    {
+        // Normal和MRA贴图使用UNORM格式
+        srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        hr = m_device->CreateShaderResourceView(texture.Get(), &srvDesc, result.GetAddressOf());
+    }
+    
+    if (FAILED(hr))
+    {
+        std::wstring errorMsg = L"Error: Failed to create SRV. HRESULT: 0x";
+        wchar_t hrStr[16];
+        swprintf_s(hrStr, L"%08X", hr);
+        errorMsg += hrStr;
+        errorMsg += L"\n";
+        OutputDebugStringW(errorMsg.c_str());
+        result.Reset();
+    }
+    
+    return result;
+}
+
+// ============================================================================
+// 加载多个纹理（根据材质名称列表）
+// ============================================================================
+bool Renderer::LoadTextures(const std::vector<std::wstring>& materialNames, const std::string& projectRoot)
+{
+    m_materialTextures.clear();
+    
+    std::wstring resPath = std::wstring(projectRoot.begin(), projectRoot.end()) + L"Res/";
+    
+    // 为每个材质加载所有纹理
+    for (const auto& materialName : materialNames)
+    {
+        MaterialTextures matTex;
+        
+        // 提取纹理名称（从MI_Manny_01转换为Manny_01，用于T_Manny_01格式）
+        std::wstring textureName = materialName;
+        if (textureName.length() > 3 && textureName.substr(0, 3) == L"MI_")
+        {
+            textureName = textureName.substr(3);  // 移除"MI_"前缀
+        }
+        
+        // ========================================================================
+        // 1. 加载BaseColor纹理
+        // ========================================================================
+        // 尝试多种可能的文件名格式
+        std::vector<std::wstring> baseColorPaths = {
+            resPath + materialName + L"_BaseColor.png",     // MI_Manny_01_New_BaseColor_0.png
+        };
+        
+        bool baseColorLoaded = false;
+        for (const auto& path : baseColorPaths)
+        {
+            matTex.baseColorSRV = LoadTextureFile(path, true);  // BaseColor使用SRGB格式
+            if (matTex.baseColorSRV)
+            {
+                OutputDebugStringW((L"Loaded BaseColor: " + path + L"\n").c_str());
+                baseColorLoaded = true;
+                break;
+            }
+        }
+        
+        if (!baseColorLoaded)
+        {
+            std::wstring debugMsg = L"Debug: Tried to load BaseColor for material: ";
+            debugMsg += materialName;
+            debugMsg += L" (textureName: ";
+            debugMsg += textureName;
+            debugMsg += L"), tried paths:\n";
+            for (const auto& path : baseColorPaths)
+            {
+                debugMsg += L"  - ";
+                debugMsg += path;
+                debugMsg += L"\n";
+            }
+            OutputDebugStringW(debugMsg.c_str());
+        }
+        
+        // 如果BaseColor加载失败，使用默认纹理（SRGB格式）
+        if (!matTex.baseColorSRV)
+        {
+            std::wstring warnMsg = L"Warning: Failed to load BaseColor texture for material: ";
+            warnMsg += materialName;
+            warnMsg += L", using default white texture (SRGB)\n";
+            OutputDebugStringW(warnMsg.c_str());
+            
+            // 创建SRGB格式的默认BaseColor纹理
+            const UINT width = 1;
+            const UINT height = 1;
+            UINT8 pixels[4] = { 255, 255, 255, 255 };  // RGBA: 白色
+            
+            D3D11_TEXTURE2D_DESC texDesc = {};
+            texDesc.Width = width;
+            texDesc.Height = height;
+            texDesc.MipLevels = 1;
+            texDesc.ArraySize = 1;
+            texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            texDesc.SampleDesc.Count = 1;
+            texDesc.SampleDesc.Quality = 0;
+            texDesc.Usage = D3D11_USAGE_DEFAULT;
+            texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            texDesc.CPUAccessFlags = 0;
+            texDesc.MiscFlags = 0;
+            
+            D3D11_SUBRESOURCE_DATA initData = {};
+            initData.pSysMem = pixels;
+            initData.SysMemPitch = width * 4;
+            initData.SysMemSlicePitch = 0;
+            
+            Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+            HRESULT hr = m_device->CreateTexture2D(&texDesc, &initData, texture.GetAddressOf());
+            if (SUCCEEDED(hr))
+            {
+                D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+                srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                srvDesc.Texture2D.MipLevels = 1;
+                srvDesc.Texture2D.MostDetailedMip = 0;
+                
+                // 尝试使用SRGB格式
+                srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+                hr = m_device->CreateShaderResourceView(texture.Get(), &srvDesc, matTex.baseColorSRV.GetAddressOf());
+                
+                // 如果SRGB格式失败，回退到UNORM格式
+                if (FAILED(hr))
+                {
+                    srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                    hr = m_device->CreateShaderResourceView(texture.Get(), &srvDesc, matTex.baseColorSRV.GetAddressOf());
+                }
+            }
+        }
+        
+        // ========================================================================
+        // 2. 加载法线贴图（BN = BaseNormal）
+        // ========================================================================
+        std::vector<std::wstring> normalPaths = {
+            resPath + L"T_" + textureName + L"_BN.png",      // T_Manny_01_BN.png
+        };
+        
+        for (const auto& path : normalPaths)
+        {
+            matTex.normalSRV = LoadTextureFile(path);
+            if (matTex.normalSRV)
+            {
+                OutputDebugStringW((L"Loaded Normal: " + path + L"\n").c_str());
+                break;
+            }
+        }
+        
+        // 如果法线贴图加载失败，使用默认蓝色纹理（表示无法线偏移）
+        if (!matTex.normalSRV)
+        {
+            if (CreateDefaultTexture())
+                matTex.normalSRV = m_textureSRV;
+        }
+        
+        // ========================================================================
+        // 3. 加载MRA贴图（Metallic-Roughness-AO）
+        // ========================================================================
+        std::vector<std::wstring> mraPaths = {
+            resPath + L"T_" + textureName + L"_MRA.png",     // T_Manny_01_MRA.png
+        };
+        
+        for (const auto& path : mraPaths)
+        {
+            matTex.mraSRV = LoadTextureFile(path);
+            if (matTex.mraSRV)
+            {
+                OutputDebugStringW((L"Loaded MRA: " + path + L"\n").c_str());
+                break;
+            }
+        }
+        
+        // 如果MRA贴图加载失败，创建默认MRA纹理（金属度=0, 粗糙度=0.5, AO=1.0）
+        // 而不是使用白色纹理，这样可以与真实MRA贴图区分
+        if (!matTex.mraSRV)
+        {
+            std::wstring warnMsg = L"Warning: Failed to load MRA texture for material: ";
+            warnMsg += materialName;
+            warnMsg += L", using default MRA values\n";
+            OutputDebugStringW(warnMsg.c_str());
+            
+            // 创建默认MRA纹理：R=0(非金属), G=0.5(中等粗糙度), B=1.0(无AO)
+            // 这样在着色器中可以判断：如果金属度=0且粗糙度=0.5且AO=1.0，可能是默认值
+            const UINT width = 1;
+            const UINT height = 1;
+            UINT8 pixels[4] = { 0, 128, 255, 255 };  // RGBA: R=0(金属度), G=128(粗糙度0.5), B=255(AO=1.0)
+            
+            D3D11_TEXTURE2D_DESC texDesc = {};
+            texDesc.Width = width;
+            texDesc.Height = height;
+            texDesc.MipLevels = 1;
+            texDesc.ArraySize = 1;
+            texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            texDesc.SampleDesc.Count = 1;
+            texDesc.SampleDesc.Quality = 0;
+            texDesc.Usage = D3D11_USAGE_DEFAULT;
+            texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            texDesc.CPUAccessFlags = 0;
+            texDesc.MiscFlags = 0;
+            
+            D3D11_SUBRESOURCE_DATA initData = {};
+            initData.pSysMem = pixels;
+            initData.SysMemPitch = width * 4;
+            initData.SysMemSlicePitch = 0;
+            
+            Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+            HRESULT hr = m_device->CreateTexture2D(&texDesc, &initData, texture.GetAddressOf());
+            if (SUCCEEDED(hr))
+            {
+                D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+                srvDesc.Format = texDesc.Format;
+                srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                srvDesc.Texture2D.MipLevels = 1;
+                srvDesc.Texture2D.MostDetailedMip = 0;
+                
+                hr = m_device->CreateShaderResourceView(texture.Get(), &srvDesc, matTex.mraSRV.GetAddressOf());
+            }
+        }
+        
+        // 存储材质纹理
+        std::string materialNameA(materialName.begin(), materialName.end());
+        m_materialTextures[materialNameA] = matTex;
+    }
+    
+    return !m_materialTextures.empty();
 }
 
 // ============================================================================
@@ -1145,7 +1795,7 @@ bool Renderer::CreateConstantBuffers()
 // 更新常量缓冲区
 // 每帧调用，更新变换矩阵和光照参数
 // ============================================================================
-void Renderer::UpdateConstantBuffers()
+void Renderer::UpdateConstantBuffers(float deltaTime)
 {
     // ========================================================================
     // 更新变换矩阵常量缓冲区
@@ -1160,7 +1810,11 @@ void Renderer::UpdateConstantBuffers()
         // 世界矩阵：物体在世界空间中的位置和方向
         // 应用0.2倍缩放，使模型变小
         XMMATRIX scale = XMMatrixScaling(0.2f, 0.2f, 0.2f);
-        XMMATRIX world = scale;  // 应用缩放
+        // 旋转模型摆正：从头顶看向脚底 -> 正常视角
+        // 绕X轴旋转-90度（顺时针90度），让模型从躺着的状态变成站着的状态
+        XMMATRIX rotation = XMMatrixRotationX(-XM_PI / 2.0f);  // -90度 = -π/2弧度
+        // 组合变换：先缩放，再旋转
+        XMMATRIX world = scale * rotation;
         
         // 视图矩阵和投影矩阵：从相机获取
         XMMATRIX view;
@@ -1208,21 +1862,42 @@ void Renderer::UpdateConstantBuffers()
         // 光源参数
         // ========================================================================
         // 光源方向（归一化的方向向量，指向光源）
-        // 这里使用从右上角照射的光源
-        lb->lightDirection = XMFLOAT3(-0.5f, -0.5f, -0.5f);
-        XMVECTOR lightDir = XMVector3Normalize(XMLoadFloat3(&lb->lightDirection));
-        XMStoreFloat3(&lb->lightDirection, lightDir);
+        // 让光源绕着角色缓慢旋转（在XZ平面上绕Y轴旋转）
+        // 光源高度保持一定（从上方照射），旋转速度：每15秒转一圈
+        float rotationSpeed = 2.0f * XM_PI / 15.0f;  // 每15秒转一圈（2π弧度），缓慢旋转
+        float angle = m_lightRotationTime * rotationSpeed;
         
-        // 光源颜色和强度（增加强度以确保纹理可见）
-        lb->lightColor = XMFLOAT3(1.0f, 1.0f, 1.0f);  // 白色光
-        lb->lightIntensity = 1.5f;                     // 光源强度（提高到1.5）
+        // 计算光源位置（在XZ平面上的圆形轨道，Y轴保持一定高度）
+        // 光源距离角色的距离（在XZ平面上的半径）
+        float lightRadius = 1.0f;
+        // 光源高度（从上方照射，负值表示在Y轴上方）
+        float lightHeight = -0.5f;  // 从上方约30度角照射（更接近垂直，光照更强）
+        
+        // 计算光源在世界空间的位置（XZ平面上的圆形轨道）
+        float lightX = cosf(angle) * lightRadius;
+        float lightZ = sinf(angle) * lightRadius;
+        float lightY = lightHeight;
+        
+        // 光源方向（从角色位置(0,0,0)指向光源位置，然后归一化）
+        // 注意：lightDirection在shader中会被取反，所以这里存储的是从表面指向光源的方向
+        XMVECTOR lightPos = XMVectorSet(lightX, lightY, lightZ, 0.0f);
+        XMVECTOR lightDir = XMVector3Normalize(lightPos);  // 归一化
+        
+        // 转换为XMFLOAT4并存储（匹配HLSL的float3对齐）
+        XMFLOAT4 lightDirFloat4;
+        XMStoreFloat4(&lightDirFloat4, XMVectorSetW(lightDir, 0.0f));
+        lb->lightDirection = lightDirFloat4;
+        
+        // 光源颜色和强度
+        lb->lightColor = XMFLOAT4(1.0f, 1.0f, 1.0f, 0.0f);  // 白色光
+        lb->lightIntensity = 2.0f;                     // 光源强度（提高亮度）
         
         // ========================================================================
         // PBR 材质参数
         // ========================================================================
         // 反照率（基础颜色）- 白色(1,1,1)，确保纹理颜色完全显示
         // 如果需要调整整体色调，可以修改这个值
-        lb->albedo = XMFLOAT3(1.0f, 1.0f, 1.0f);
+        lb->albedo = XMFLOAT4(1.0f, 1.0f, 1.0f, 0.0f);
         
         // 金属度（0.0 = 非金属，1.0 = 金属）
         // 设置为 0.0 表示非金属材质（如塑料、陶瓷）
@@ -1235,21 +1910,870 @@ void Renderer::UpdateConstantBuffers()
         // ========================================================================
         // 环境光参数
         // ========================================================================
-        // 环境光颜色（模拟天空光，增加亮度以确保纹理可见）
-        lb->ambientColor = XMFLOAT3(0.3f, 0.3f, 0.4f);
+        // 环境光颜色（模拟天空光）
+        lb->ambientColor = XMFLOAT4(0.1f, 0.1f, 0.15f, 0.0f);
+        
+        // 确保padding值被初始化（避免未定义值）
+        lb->padding3a = 0.0f;
+        lb->padding3b = 0.0f;
+        lb->padding3c = 0.0f;
+        lb->padding4 = 0.0f;
         
         // ========================================================================
         // 相机位置
         // ========================================================================
         if (m_camera)
         {
-            lb->cameraPosition = m_camera->GetPosition();
+            XMFLOAT3 camPos = m_camera->GetPosition();
+            lb->cameraPosition = XMFLOAT4(camPos.x, camPos.y, camPos.z, 0.0f);
         }
         else
         {
-            lb->cameraPosition = XMFLOAT3(0.0f, 0.0f, -2.0f);
+            lb->cameraPosition = XMFLOAT4(0.0f, 0.0f, -2.0f, 0.0f);
         }
         
         m_context->Unmap(m_lightBuffer.Get(), 0);
     }
+}
+
+// ============================================================================
+// 创建IBL采样器状态（支持mipmap和clamp）
+// ============================================================================
+bool Renderer::CreateIBLSamplerState()
+{
+    D3D11_SAMPLER_DESC samplerDesc = {};
+    samplerDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;  // 线性过滤，支持mipmap
+    samplerDesc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;     // Clamp模式（环境贴图）
+    samplerDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+    samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    samplerDesc.MipLODBias = 0.0f;
+    samplerDesc.MaxAnisotropy = 1;
+    samplerDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    samplerDesc.BorderColor[0] = 0.0f;
+    samplerDesc.BorderColor[1] = 0.0f;
+    samplerDesc.BorderColor[2] = 0.0f;
+    samplerDesc.BorderColor[3] = 0.0f;
+    samplerDesc.MinLOD = 0.0f;
+    samplerDesc.MaxLOD = D3D11_FLOAT32_MAX;  // 支持所有mip级别
+
+    HRESULT hr = m_device->CreateSamplerState(&samplerDesc, m_iblSamplerState.GetAddressOf());
+    return SUCCEEDED(hr);
+}
+
+// ============================================================================
+// 生成BRDF查找表（LUT）
+// BRDF LUT用于镜面反射IBL的Split-Sum Approximation
+// ============================================================================
+bool Renderer::GenerateBRDFLUT()
+{
+    const UINT lutSize = 512;  // LUT分辨率（512x512）
+    
+    // 分配内存存储LUT数据（RG16F格式：2个float16通道）
+    std::vector<float> lutData(lutSize * lutSize * 2);  // R和G通道
+    
+    // 生成BRDF LUT
+    // 基于UE5的实现：IntegrateBRDF(NdotV, roughness)
+    for (UINT y = 0; y < lutSize; ++y)
+    {
+        for (UINT x = 0; x < lutSize; ++x)
+        {
+            float NdotV = (x + 0.5f) / lutSize;  // [0, 1]
+            float roughness = (y + 0.5f) / lutSize;  // [0, 1]
+            
+            // 避免除零（使用括号避免Windows宏冲突）
+            NdotV = (std::max)(NdotV, 0.0001f);
+            roughness = (std::max)(roughness, 0.0001f);
+            
+            XMVECTOR V = XMVectorSet(sqrtf(1.0f - NdotV * NdotV), 0.0f, NdotV, 0.0f);
+            XMVECTOR N = XMVectorSet(0.0f, 0.0f, 1.0f, 0.0f);
+            
+            float A = 0.0f;
+            float B = 0.0f;
+            
+            // 数值积分（Monte Carlo方法）
+            const UINT numSamples = 1024;
+            for (UINT i = 0; i < numSamples; ++i)
+            {
+                // 生成随机方向（Hammersley序列）
+                float Xi_x = (float)i / (float)numSamples;
+                float Xi_y = float(i % 2) * 0.5f + float((i / 2) % 2) * 0.25f + float((i / 4) % 2) * 0.125f;
+                
+                // 重要性采样（GGX分布）
+                float a = roughness * roughness;
+                float a2 = a * a;
+                float phi = 2.0f * XM_PI * Xi_x;
+                float cosTheta = sqrtf((1.0f - Xi_y) / (1.0f + (a2 - 1.0f) * Xi_y));
+                float sinTheta = sqrtf(1.0f - cosTheta * cosTheta);
+                
+                XMVECTOR H = XMVectorSet(cosf(phi) * sinTheta, sinf(phi) * sinTheta, cosTheta, 0.0f);
+                XMVECTOR V_dot_H = XMVector3Dot(V, H);
+                float vDotH = XMVectorGetX(V_dot_H);
+                XMVECTOR L = XMVectorSubtract(XMVectorScale(H, 2.0f * vDotH), V);
+                L = XMVector3Normalize(L);
+                
+                float NdotL = (std::max)(XMVectorGetZ(L), 0.0f);
+                float NdotH = (std::max)(XMVectorGetZ(H), 0.0f);
+                float VdotH = (std::max)(vDotH, 0.0f);
+                
+                if (NdotL > 0.0f)
+                {
+                    // 简化的几何函数计算
+                    float NdotV_val = NdotV;
+                    float k = (roughness + 1.0f) * (roughness + 1.0f) / 8.0f;
+                    float G1_V = NdotV_val / (NdotV_val * (1.0f - k) + k);
+                    float G1_L = NdotL / (NdotL * (1.0f - k) + k);
+                    float G = G1_V * G1_L;
+                    
+                    float G_Vis = (G * VdotH) / (NdotH * NdotV + 0.0001f);
+                    float Fc = powf(1.0f - VdotH, 5.0f);
+                    
+                    A += (1.0f - Fc) * G_Vis;
+                    B += Fc * G_Vis;
+                }
+            }
+            
+            A /= float(numSamples);
+            B /= float(numSamples);
+            
+            // 存储到LUT（R通道 = A, G通道 = B）
+            UINT index = (y * lutSize + x) * 2;
+            lutData[index] = A;
+            lutData[index + 1] = B;
+        }
+    }
+    
+    // 创建纹理（使用R32G32_FLOAT格式，因为数据是float32）
+    D3D11_TEXTURE2D_DESC texDesc = {};
+    texDesc.Width = lutSize;
+    texDesc.Height = lutSize;
+    texDesc.MipLevels = 1;
+    texDesc.ArraySize = 1;
+    texDesc.Format = DXGI_FORMAT_R32G32_FLOAT;  // 2个float32通道（匹配数据格式）
+    texDesc.SampleDesc.Count = 1;
+    texDesc.SampleDesc.Quality = 0;
+    texDesc.Usage = D3D11_USAGE_DEFAULT;
+    texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    texDesc.CPUAccessFlags = 0;
+    texDesc.MiscFlags = 0;
+    
+    D3D11_SUBRESOURCE_DATA initData = {};
+    initData.pSysMem = lutData.data();
+    initData.SysMemPitch = lutSize * 2 * sizeof(float);  // 每行2个float32，共8字节
+    initData.SysMemSlicePitch = 0;
+    
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+    HRESULT hr = m_device->CreateTexture2D(&texDesc, &initData, texture.GetAddressOf());
+    if (FAILED(hr))
+        return false;
+    
+    // 创建着色器资源视图
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Format = texDesc.Format;
+    srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Texture2D.MipLevels = 1;
+    srvDesc.Texture2D.MostDetailedMip = 0;
+    
+    hr = m_device->CreateShaderResourceView(texture.Get(), &srvDesc, m_brdfLutSRV.GetAddressOf());
+    return SUCCEEDED(hr);
+}
+
+// stb_image 用于加载 HDR/EXR 格式
+// 注意：必须在所有系统头文件之后包含，避免宏定义冲突
+// 下载地址：https://github.com/nothings/stb/blob/master/stb_image.h
+// 保存可能被破坏的宏定义
+#pragma push_macro("setjmp")
+#pragma push_macro("longjmp")
+#pragma push_macro("jmp_buf")
+
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+
+// 恢复宏定义
+#pragma pop_macro("jmp_buf")
+#pragma pop_macro("longjmp")
+#pragma pop_macro("setjmp")
+
+// ============================================================================
+// 加载环境贴图（HDR环境贴图，转换为立方体贴图）
+// 注意：简化实现，这里先创建一个简单的默认环境贴图
+// 完整实现需要支持HDR文件加载和立方体贴图生成
+// ============================================================================
+bool Renderer::LoadEnvironmentMap(const std::wstring& filename)
+{
+    // 如果提供了文件名，尝试加载 .exr 或 .hdr 文件
+    if (!filename.empty())
+    {
+        // 检查文件扩展名
+        std::wstring ext = filename;
+        size_t dotPos = ext.find_last_of(L".");
+        if (dotPos != std::wstring::npos)
+        {
+            ext = ext.substr(dotPos + 1);
+            std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
+            
+            // 注意：stb_image 只支持 HDR 格式，不支持 EXR 格式
+            // 如果文件是 EXR 格式，需要转换为 HDR 或使用支持 EXR 的库（如 tinyexr）
+            if (ext == L"exr")
+            {
+                OutputDebugStringW(L"Warning: EXR format is not supported by stb_image. Skipping: ");
+                OutputDebugStringW(filename.c_str());
+                OutputDebugStringW(L"\n");
+                OutputDebugStringW(L"Please convert EXR to HDR format or use a library that supports EXR (such as tinyexr).\n");
+                return false;  // 跳过这个文件，尝试下一个
+            }
+            
+            if (ext == L"hdr")
+            {
+                // 转换宽字符串为多字节字符串
+                int size_needed = WideCharToMultiByte(CP_UTF8, 0, filename.c_str(), -1, nullptr, 0, nullptr, nullptr);
+                std::string filenameA(size_needed, 0);
+                WideCharToMultiByte(CP_UTF8, 0, filename.c_str(), -1, &filenameA[0], size_needed, nullptr, nullptr);
+                
+                // 使用 stb_image 加载 HDR 文件
+                // 注意：stb_image 只支持 HDR 格式，不支持 EXR 格式
+                // 如果文件是 EXR 格式，stbi_loadf 会返回 null，需要使用其他库（如 tinyexr）
+                int width, height, channels;
+                float* hdrData = stbi_loadf(filenameA.c_str(), &width, &height, &channels, 4);  // 强制4通道（RGBA）
+                
+                if (hdrData && width > 0 && height > 0)
+                {
+                    // 调试：输出HDR文件信息
+                    char debugMsg[256];
+                    sprintf_s(debugMsg, "HDR file loaded: width=%d, height=%d, channels=%d\n", width, height, channels);
+                    OutputDebugStringA(debugMsg);
+                    
+                    // 调试：检查前几个像素的值
+                    float sampleR = hdrData[0];
+                    float sampleG = hdrData[1];
+                    float sampleB = hdrData[2];
+                    sprintf_s(debugMsg, "First pixel (top-left): R=%.3f, G=%.3f, B=%.3f\n", sampleR, sampleG, sampleB);
+                    OutputDebugStringA(debugMsg);
+                    
+                    // 将 HDR 图像转换为立方体贴图
+                    // 假设输入是等距柱状投影（Equirectangular）格式
+                    const UINT cubeSize = 1024;  // 立方体贴图每面大小（提高分辨率以减少接缝）
+                    
+                    // 创建立方体贴图
+                    D3D11_TEXTURE2D_DESC texDesc = {};
+                    texDesc.Width = cubeSize;
+                    texDesc.Height = cubeSize;
+                    texDesc.MipLevels = 1;
+                    texDesc.ArraySize = 6;  // 立方体贴图有6个面
+                    texDesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;  // HDR格式
+                    texDesc.SampleDesc.Count = 1;
+                    texDesc.SampleDesc.Quality = 0;
+                    texDesc.Usage = D3D11_USAGE_DEFAULT;
+                    texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                    texDesc.CPUAccessFlags = 0;
+                    texDesc.MiscFlags = D3D11_RESOURCE_MISC_TEXTURECUBE;  // 标记为立方体贴图
+                    
+                    // 为每个面生成数据（从等距柱状投影转换为立方体贴图）
+                    std::vector<D3D11_SUBRESOURCE_DATA> subresourceData(6);
+                    std::vector<std::vector<float>> faceData(6);
+                    
+                    // 立方体贴图的6个面方向（标准DirectX立方体贴图顺序：+X, -X, +Y, -Y, +Z, -Z）
+                    // 每个面的定义：[forward方向, up方向]
+                    // 注意：right = up × forward（叉积），方向向量dir = forward + u*right + v*up
+                    XMVECTOR faceDirections[6][2] = {
+                        { XMVectorSet(-1.0f, 0.0f, 0.0f, 0.0f), XMVectorSet(0.0f, -1.0f, 0.0f, 0.0f) },  // +X: forward=(-1,0,0), up=(0,-1,0), right=(0,0,-1) - 翻转forward
+                        { XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f), XMVectorSet(0.0f, -1.0f, 0.0f, 0.0f) }, // -X: forward=(1,0,0), up=(0,-1,0), right=(0,0,1) - 翻转forward
+                        { XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f), XMVectorSet(0.0f, 0.0f, 1.0f, 0.0f) }, // +Y: forward=(0,1,0), up=(0,0,1), right=(-1,0,0)
+                        { XMVectorSet(0.0f, -1.0f, 0.0f, 0.0f), XMVectorSet(0.0f, 0.0f, -1.0f, 0.0f) }, // -Y: forward=(0,-1,0), up=(0,0,-1), right=(1,0,0)
+                        { XMVectorSet(0.0f, 0.0f, 1.0f, 0.0f), XMVectorSet(0.0f, -1.0f, 0.0f, 0.0f) },  // +Z: forward=(0,0,1), up=(0,-1,0), right=(1,0,0) - 翻转up
+                        { XMVectorSet(0.0f, 0.0f, -1.0f, 0.0f), XMVectorSet(0.0f, -1.0f, 0.0f, 0.0f) }  // -Z: forward=(0,0,-1), up=(0,-1,0), right=(-1,0,0) - 翻转up
+                    };
+                    
+                    for (UINT face = 0; face < 6; ++face)
+                    {
+                        faceData[face].resize(cubeSize * cubeSize * 4);  // RGBA，每个float
+                        
+                        XMVECTOR forward = faceDirections[face][0];  // 面的法线方向（向前）
+                        XMVECTOR up = faceDirections[face][1];       // 面的上方向
+                        XMVECTOR right = XMVector3Cross(up, forward);  // right = up × forward（右手坐标系）
+                        
+                        for (UINT y = 0; y < cubeSize; ++y)
+                        {
+                            for (UINT x = 0; x < cubeSize; ++x)
+                            {
+                                // 将立方体贴图坐标转换为方向向量
+                                float u = (float(x) + 0.5f) / float(cubeSize) * 2.0f - 1.0f;
+                                float v = (float(y) + 0.5f) / float(cubeSize) * 2.0f - 1.0f;
+                                
+                                // 对于上下两个面（+Y和-Y），可能需要翻转UV以确保正确的方向
+                                // 但这取决于具体的立方体贴图标准，先不翻转试试
+                                
+                                XMVECTOR dir = XMVector3Normalize(
+                                    XMVectorAdd(
+                                        XMVectorAdd(XMVectorScale(right, u), XMVectorScale(up, v)),
+                                        forward
+                                    )
+                                );
+                                
+                                // 将方向向量转换为等距柱状投影坐标
+                                // 等距柱状投影：phi[0,2π]对应X[0,width], theta[0,π]对应Y[0,height]
+                                // theta=0是顶部（+Y），theta=π是底部（-Y）
+                                float dirX = XMVectorGetX(dir);
+                                float dirY = XMVectorGetY(dir);
+                                float dirZ = XMVectorGetZ(dir);
+                                
+                                float phi = atan2f(dirX, dirZ) + XM_PI;  // [0, 2π]
+                                float theta = acosf(dirY);  // [0, π]，y=1时theta=0（顶部），y=-1时theta=π（底部）
+                                
+                                // 采样 HDR 图像（使用双线性过滤以减少接缝）
+                                float hdrU = phi / (2.0f * XM_PI) * width;
+                                float hdrV = theta / XM_PI * height;
+                                
+                                // 双线性过滤
+                                int hdrX0 = (int)floorf(hdrU);
+                                int hdrY0 = (int)floorf(hdrV);
+                                int hdrX1 = hdrX0 + 1;
+                                int hdrY1 = hdrY0 + 1;
+                                
+                                float fx = hdrU - hdrX0;
+                                float fy = hdrV - hdrY0;
+                                
+                                // 处理边界（X方向需要包裹，因为等距柱状投影在phi=0和2π处是连续的）
+                                // Y方向需要限制，因为theta在0和π处有边界
+                                hdrX0 = hdrX0 % width;
+                                if (hdrX0 < 0) hdrX0 += width;
+                                hdrX1 = hdrX1 % width;
+                                if (hdrX1 < 0) hdrX1 += width;
+                                
+                                hdrY0 = (hdrY0 < 0) ? 0 : ((hdrY0 >= height) ? height - 1 : hdrY0);
+                                hdrY1 = (hdrY1 < 0) ? 0 : ((hdrY1 >= height) ? height - 1 : hdrY1);
+                                
+                                // 采样4个像素
+                                int idx00 = (hdrY0 * width + hdrX0) * 4;
+                                int idx10 = (hdrY0 * width + hdrX1) * 4;
+                                int idx01 = (hdrY1 * width + hdrX0) * 4;
+                                int idx11 = (hdrY1 * width + hdrX1) * 4;
+                                
+                                // 双线性插值
+                                float r = (1.0f - fx) * (1.0f - fy) * hdrData[idx00] +
+                                          fx * (1.0f - fy) * hdrData[idx10] +
+                                          (1.0f - fx) * fy * hdrData[idx01] +
+                                          fx * fy * hdrData[idx11];
+                                
+                                float g = (1.0f - fx) * (1.0f - fy) * hdrData[idx00 + 1] +
+                                          fx * (1.0f - fy) * hdrData[idx10 + 1] +
+                                          (1.0f - fx) * fy * hdrData[idx01 + 1] +
+                                          fx * fy * hdrData[idx11 + 1];
+                                
+                                float b = (1.0f - fx) * (1.0f - fy) * hdrData[idx00 + 2] +
+                                          fx * (1.0f - fy) * hdrData[idx10 + 2] +
+                                          (1.0f - fx) * fy * hdrData[idx01 + 2] +
+                                          fx * fy * hdrData[idx11 + 2];
+                                
+                                UINT index = (y * cubeSize + x) * 4;
+                                faceData[face][index] = r;      // R
+                                faceData[face][index + 1] = g;  // G
+                                faceData[face][index + 2] = b;  // B
+                                faceData[face][index + 3] = 1.0f;  // A
+                            }
+                        }
+                        
+                        subresourceData[face].pSysMem = faceData[face].data();
+                        subresourceData[face].SysMemPitch = cubeSize * 4 * sizeof(float);
+                        subresourceData[face].SysMemSlicePitch = 0;
+                    }
+                    
+                    stbi_image_free(hdrData);
+                    
+                    Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+                    HRESULT hr = m_device->CreateTexture2D(&texDesc, subresourceData.data(), texture.GetAddressOf());
+                    if (SUCCEEDED(hr))
+                    {
+                        // 创建立方体贴图的着色器资源视图
+                        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+                        srvDesc.Format = texDesc.Format;
+                        srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE;
+                        srvDesc.TextureCube.MipLevels = 1;
+                        srvDesc.TextureCube.MostDetailedMip = 0;
+                        
+                        hr = m_device->CreateShaderResourceView(texture.Get(), &srvDesc, m_environmentMapSRV.GetAddressOf());
+                        if (SUCCEEDED(hr))
+                        {
+                            OutputDebugStringW(L"Successfully loaded environment map: ");
+                            OutputDebugStringW(filename.c_str());
+                            OutputDebugStringW(L"\n");
+                            return true;
+                        }
+                    }
+                }
+                else
+                {
+                    if (ext == L"exr")
+                    {
+                        OutputDebugStringW(L"Warning: EXR format is not supported by stb_image. Please convert to HDR format or use a library that supports EXR (such as tinyexr).\n");
+                        OutputDebugStringW(L"Failed to load EXR file: ");
+                    }
+                    else
+                    {
+                        OutputDebugStringW(L"Failed to load HDR file: ");
+                    }
+                    OutputDebugStringW(filename.c_str());
+                    OutputDebugStringW(L"\n");
+                }
+            }
+        }
+    }
+    
+    // 如果加载失败或没有提供文件名，创建默认环境贴图（天空蓝色渐变）
+    OutputDebugStringW(L"Creating default environment map (sky blue gradient)...\n");
+    const UINT cubeSize = 512;  // 立方体贴图每面大小
+    
+    // 创建立方体贴图
+    D3D11_TEXTURE2D_DESC texDesc = {};
+    texDesc.Width = cubeSize;
+    texDesc.Height = cubeSize;
+    texDesc.MipLevels = 1;
+    texDesc.ArraySize = 6;  // 立方体贴图有6个面
+    texDesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;  // HDR格式
+    texDesc.SampleDesc.Count = 1;
+    texDesc.SampleDesc.Quality = 0;
+    texDesc.Usage = D3D11_USAGE_DEFAULT;
+    texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    texDesc.CPUAccessFlags = 0;
+    texDesc.MiscFlags = D3D11_RESOURCE_MISC_TEXTURECUBE;  // 标记为立方体贴图
+    
+    // 为每个面生成默认颜色（天空蓝色渐变）
+    std::vector<D3D11_SUBRESOURCE_DATA> subresourceData(6);
+    std::vector<std::vector<float>> faceData(6);
+    
+    for (UINT face = 0; face < 6; ++face)
+    {
+        faceData[face].resize(cubeSize * cubeSize * 4);  // RGBA，每个float
+        
+        for (UINT y = 0; y < cubeSize; ++y)
+        {
+            for (UINT x = 0; x < cubeSize; ++x)
+            {
+                // 简单的天空蓝色渐变
+                float normalizedY = float(y) / float(cubeSize);
+                float t = normalizedY;
+                float r = 0.5f * (1.0f - t) + 0.1f * t;
+                float g = 0.7f * (1.0f - t) + 0.1f * t;
+                float b = 1.0f * (1.0f - t) + 0.2f * t;
+                
+                UINT index = (y * cubeSize + x) * 4;
+                faceData[face][index] = r;      // R
+                faceData[face][index + 1] = g;  // G
+                faceData[face][index + 2] = b;  // B
+                faceData[face][index + 3] = 1.0f;     // A
+            }
+        }
+        
+        subresourceData[face].pSysMem = faceData[face].data();
+        subresourceData[face].SysMemPitch = cubeSize * 4 * sizeof(float);
+        subresourceData[face].SysMemSlicePitch = 0;
+    }
+    
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+    HRESULT hr = m_device->CreateTexture2D(&texDesc, subresourceData.data(), texture.GetAddressOf());
+    if (FAILED(hr))
+        return false;
+    
+    // 创建立方体贴图的着色器资源视图
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Format = texDesc.Format;
+    srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE;
+    srvDesc.TextureCube.MipLevels = 1;
+    srvDesc.TextureCube.MostDetailedMip = 0;
+    
+    hr = m_device->CreateShaderResourceView(texture.Get(), &srvDesc, m_environmentMapSRV.GetAddressOf());
+    return SUCCEEDED(hr);
+}
+
+// ============================================================================
+// 创建天空盒Shader
+// ============================================================================
+bool Renderer::CreateSkyboxShaders()
+{
+    // 编译天空盒顶点着色器
+    Microsoft::WRL::ComPtr<ID3DBlob> vsBlob;
+    if (!CompileShaderFromFile(L"Shaders/SkyboxShader.hlsl", "VS", "vs_5_0", vsBlob.GetAddressOf()))
+    {
+        m_lastError = L"Failed to compile SkyboxShader.hlsl (VS).";
+        return false;
+    }
+    
+    HRESULT hr = m_device->CreateVertexShader(
+        vsBlob->GetBufferPointer(),
+        vsBlob->GetBufferSize(),
+        nullptr,
+        m_skyboxVS.GetAddressOf()
+    );
+    if (FAILED(hr))
+    {
+        m_lastError = L"Failed to create skybox vertex shader.";
+        return false;
+    }
+    
+    // 编译天空盒像素着色器
+    Microsoft::WRL::ComPtr<ID3DBlob> psBlob;
+    if (!CompileShaderFromFile(L"Shaders/SkyboxShader.hlsl", "PS", "ps_5_0", psBlob.GetAddressOf()))
+    {
+        m_lastError = L"Failed to compile SkyboxShader.hlsl (PS).";
+        return false;
+    }
+    
+    hr = m_device->CreatePixelShader(
+        psBlob->GetBufferPointer(),
+        psBlob->GetBufferSize(),
+        nullptr,
+        m_skyboxPS.GetAddressOf()
+    );
+    if (FAILED(hr))
+    {
+        m_lastError = L"Failed to create skybox pixel shader.";
+        return false;
+    }
+    
+    // 创建天空盒输入布局（只需要位置，不需要其他属性）
+    D3D11_INPUT_ELEMENT_DESC skyboxLayout[] = {
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 }
+    };
+    
+    hr = m_device->CreateInputLayout(
+        skyboxLayout,
+        ARRAYSIZE(skyboxLayout),
+        vsBlob->GetBufferPointer(),
+        vsBlob->GetBufferSize(),
+        m_skyboxInputLayout.GetAddressOf()
+    );
+    if (FAILED(hr))
+    {
+        m_lastError = L"Failed to create skybox input layout.";
+        return false;
+    }
+    
+    return true;
+}
+
+// ============================================================================
+// 创建天空盒几何体（立方体）
+// ============================================================================
+bool Renderer::CreateSkyboxGeometry()
+{
+    // 创建立方体的8个顶点（局部空间，中心在原点，大小为2x2x2）
+    // 注意：立方体的面是向内的（因为从内部看）
+    struct SkyboxVertex
+    {
+        float x, y, z;
+    };
+    
+    SkyboxVertex vertices[] = {
+        // 前面（+Z）
+        { -1.0f, -1.0f,  1.0f },
+        {  1.0f, -1.0f,  1.0f },
+        {  1.0f,  1.0f,  1.0f },
+        { -1.0f,  1.0f,  1.0f },
+        // 后面（-Z）
+        {  1.0f, -1.0f, -1.0f },
+        { -1.0f, -1.0f, -1.0f },
+        { -1.0f,  1.0f, -1.0f },
+        {  1.0f,  1.0f, -1.0f },
+        // 右面（+X）
+        {  1.0f, -1.0f,  1.0f },
+        {  1.0f, -1.0f, -1.0f },
+        {  1.0f,  1.0f, -1.0f },
+        {  1.0f,  1.0f,  1.0f },
+        // 左面（-X）
+        { -1.0f, -1.0f, -1.0f },
+        { -1.0f, -1.0f,  1.0f },
+        { -1.0f,  1.0f,  1.0f },
+        { -1.0f,  1.0f, -1.0f },
+        // 上面（+Y）
+        { -1.0f,  1.0f,  1.0f },
+        {  1.0f,  1.0f,  1.0f },
+        {  1.0f,  1.0f, -1.0f },
+        { -1.0f,  1.0f, -1.0f },
+        // 下面（-Y）
+        { -1.0f, -1.0f, -1.0f },
+        {  1.0f, -1.0f, -1.0f },
+        {  1.0f, -1.0f,  1.0f },
+        { -1.0f, -1.0f,  1.0f }
+    };
+    
+    // 创建索引（每个面2个三角形）
+    uint32_t indices[] = {
+        // 前面
+        0, 1, 2,  0, 2, 3,
+        // 后面
+        4, 5, 6,  4, 6, 7,
+        // 右面
+        8, 9, 10,  8, 10, 11,
+        // 左面
+        12, 13, 14,  12, 14, 15,
+        // 上面
+        16, 17, 18,  16, 18, 19,
+        // 下面
+        20, 21, 22,  20, 22, 23
+    };
+    
+    // 创建顶点缓冲区
+    D3D11_BUFFER_DESC vbd = {};
+    vbd.Usage = D3D11_USAGE_DEFAULT;
+    vbd.ByteWidth = sizeof(vertices);
+    vbd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    vbd.CPUAccessFlags = 0;
+    
+    D3D11_SUBRESOURCE_DATA vinitData = {};
+    vinitData.pSysMem = vertices;
+    
+    HRESULT hr = m_device->CreateBuffer(&vbd, &vinitData, m_skyboxVertexBuffer.GetAddressOf());
+    if (FAILED(hr))
+        return false;
+    
+    // 创建索引缓冲区
+    D3D11_BUFFER_DESC ibd = {};
+    ibd.Usage = D3D11_USAGE_DEFAULT;
+    ibd.ByteWidth = sizeof(indices);
+    ibd.BindFlags = D3D11_BIND_INDEX_BUFFER;
+    ibd.CPUAccessFlags = 0;
+    
+    D3D11_SUBRESOURCE_DATA iinitData = {};
+    iinitData.pSysMem = indices;
+    
+    hr = m_device->CreateBuffer(&ibd, &iinitData, m_skyboxIndexBuffer.GetAddressOf());
+    return SUCCEEDED(hr);
+}
+
+// ============================================================================
+// 创建天空盒深度状态（使用LESS_EQUAL，确保天空盒在最后绘制）
+// ============================================================================
+bool Renderer::CreateSkyboxDepthState()
+{
+    D3D11_DEPTH_STENCIL_DESC depthStencilDesc = {};
+    depthStencilDesc.DepthEnable = true;  // 启用深度测试
+    depthStencilDesc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;  // 不写入深度
+    depthStencilDesc.DepthFunc = D3D11_COMPARISON_LESS_EQUAL;  // 使用LESS_EQUAL（深度值1.0应该通过测试）
+    depthStencilDesc.StencilEnable = false;
+    
+    HRESULT hr = m_device->CreateDepthStencilState(&depthStencilDesc, m_skyboxDepthStencilState.GetAddressOf());
+    if (FAILED(hr))
+    {
+        OutputDebugStringW(L"Failed to create skybox depth state. HRESULT: ");
+        wchar_t hrStr[16];
+        swprintf_s(hrStr, L"%08X\n", hr);
+        OutputDebugStringW(hrStr);
+        return false;
+    }
+    
+    // 创建天空盒光栅化状态（禁用背面剔除，因为从内部看立方体）
+    D3D11_RASTERIZER_DESC rasterizerDesc = {};
+    rasterizerDesc.FillMode = D3D11_FILL_SOLID;
+    rasterizerDesc.CullMode = D3D11_CULL_NONE;  // 禁用背面剔除（从内部看立方体）
+    rasterizerDesc.FrontCounterClockwise = false;
+    rasterizerDesc.DepthBias = 0;
+    rasterizerDesc.DepthBiasClamp = 0.0f;
+    rasterizerDesc.SlopeScaledDepthBias = 0.0f;
+    rasterizerDesc.DepthClipEnable = true;
+    rasterizerDesc.ScissorEnable = false;
+    rasterizerDesc.MultisampleEnable = false;
+    rasterizerDesc.AntialiasedLineEnable = false;
+    
+    hr = m_device->CreateRasterizerState(&rasterizerDesc, m_skyboxRasterizerState.GetAddressOf());
+    if (FAILED(hr))
+    {
+        OutputDebugStringW(L"Failed to create skybox rasterizer state.\n");
+        return false;
+    }
+    
+    return true;
+}
+
+// ============================================================================
+// 渲染天空盒
+// ============================================================================
+void Renderer::RenderSkybox()
+{
+    if (!m_skyboxVS || !m_skyboxPS || !m_skyboxVertexBuffer || !m_skyboxIndexBuffer || !m_environmentMapSRV)
+    {
+        // 调试：输出哪个资源缺失
+        if (!m_skyboxVS) OutputDebugStringW(L"Skybox VS missing\n");
+        if (!m_skyboxPS) OutputDebugStringW(L"Skybox PS missing\n");
+        if (!m_skyboxVertexBuffer) OutputDebugStringW(L"Skybox VB missing\n");
+        if (!m_skyboxIndexBuffer) OutputDebugStringW(L"Skybox IB missing\n");
+        if (!m_environmentMapSRV) OutputDebugStringW(L"Environment map SRV missing\n");
+        return;
+    }
+    
+    // 保存当前状态
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilState> oldDepthStencilState;
+    UINT oldStencilRef;
+    m_context->OMGetDepthStencilState(oldDepthStencilState.GetAddressOf(), &oldStencilRef);
+    
+    Microsoft::WRL::ComPtr<ID3D11RasterizerState> oldRasterizerState;
+    m_context->RSGetState(oldRasterizerState.GetAddressOf());
+    
+    // 设置天空盒深度状态
+    m_context->OMSetDepthStencilState(m_skyboxDepthStencilState.Get(), 0);
+    
+    // 设置天空盒光栅化状态（禁用背面剔除）
+    if (m_skyboxRasterizerState)
+        m_context->RSSetState(m_skyboxRasterizerState.Get());
+    
+    // 设置天空盒shader和输入布局
+    m_context->VSSetShader(m_skyboxVS.Get(), nullptr, 0);
+    m_context->PSSetShader(m_skyboxPS.Get(), nullptr, 0);
+    m_context->IASetInputLayout(m_skyboxInputLayout.Get());
+    
+    // 绑定常量缓冲区（使用相同的常量缓冲区，但只使用view和projection）
+    m_context->VSSetConstantBuffers(0, 1, m_constantBuffer.GetAddressOf());
+    
+    // 绑定环境贴图和采样器
+    m_context->PSSetShaderResources(3, 1, m_environmentMapSRV.GetAddressOf());
+    m_context->PSSetSamplers(1, 1, m_iblSamplerState.GetAddressOf());
+    
+    // 设置图元类型
+    m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    
+    // 绑定顶点缓冲区和索引缓冲区
+    UINT stride = sizeof(float) * 3;
+    UINT offset = 0;
+    m_context->IASetVertexBuffers(0, 1, m_skyboxVertexBuffer.GetAddressOf(), &stride, &offset);
+    m_context->IASetIndexBuffer(m_skyboxIndexBuffer.Get(), DXGI_FORMAT_R32_UINT, 0);
+    
+    // 绘制天空盒（36个索引，6个面 * 2个三角形 * 3个顶点）
+    m_context->DrawIndexed(36, 0, 0);
+    
+    // 调试：检查DrawIndexed是否成功（实际上无法直接检查，但至少确保调用了）
+    // OutputDebugStringW(L"Skybox DrawIndexed called\n");
+    
+    // 恢复之前的状态
+    m_context->OMSetDepthStencilState(oldDepthStencilState.Get(), oldStencilRef);
+    if (oldRasterizerState)
+        m_context->RSSetState(oldRasterizerState.Get());
+}
+
+// ============================================================================
+// 初始化地形
+// ============================================================================
+bool Renderer::InitializeTerrain()
+{
+    // 创建地形对象
+    m_terrain = new Terrain();
+    
+    // 设置地形参数
+    TerrainParams params;
+    params.width = 256;          // 高度图宽度（顶点数）
+    params.height = 256;         // 高度图高度（顶点数）
+    params.sizeX = 200.0f;       // 世界空间X方向大小（单位：米）
+    params.sizeZ = 200.0f;       // 世界空间Z方向大小（单位：米）
+    params.heightScale = 30.0f;  // 高度缩放因子
+    params.heightOffset = 0.0f;  // 高度偏移量
+    
+    // 尝试加载高度图，如果失败则使用程序化生成
+    wchar_t exePath[MAX_PATH] = { 0 };
+    if (GetModuleFileNameW(nullptr, exePath, MAX_PATH) > 0)
+    {
+        std::wstring exeDir = exePath;
+        size_t lastSlash = exeDir.find_last_of(L"\\/");
+        if (lastSlash != std::wstring::npos)
+        {
+            exeDir = exeDir.substr(0, lastSlash + 1);
+            
+            std::wstring projectRoot = exeDir;
+            for (int i = 0; i < 2; ++i)
+            {
+                size_t slash = projectRoot.find_last_of(L"\\/", projectRoot.length() - 2);
+                if (slash != std::wstring::npos)
+                    projectRoot = projectRoot.substr(0, slash + 1);
+            }
+            
+            // 尝试加载高度图文件
+            std::vector<std::wstring> heightmapPaths = {
+                projectRoot + L"Res/heightmap.png",
+                projectRoot + L"Res/heightmap.jpg",
+                projectRoot + L"Res/heightmap.bmp",
+                exeDir + L"Res/heightmap.png",
+                exeDir + L"Res/heightmap.jpg"
+            };
+            
+            for (const auto& path : heightmapPaths)
+            {
+                if (m_terrain->CreateFromHeightmap(m_device.Get(), path, params))
+                {
+                    OutputDebugStringW(L"Terrain loaded from heightmap: ");
+                    OutputDebugStringW(path.c_str());
+                    OutputDebugStringW(L"\n");
+                    return true;
+                }
+            }
+        }
+    }
+    
+    // 如果加载高度图失败，使用程序化生成（用于测试）
+    OutputDebugStringW(L"Heightmap not found, using procedural terrain generation.\n");
+    if (m_terrain->CreateProcedural(m_device.Get(), params))
+    {
+        OutputDebugStringW(L"Procedural terrain created successfully.\n");
+        return true;
+    }
+    
+    // 如果都失败，清理并返回false
+    delete m_terrain;
+    m_terrain = nullptr;
+    return false;
+}
+
+// ============================================================================
+// 渲染地形
+// ============================================================================
+void Renderer::RenderTerrain()
+{
+    if (!m_terrain)
+        return;
+    
+    // 地形使用与场景相同的shader和输入布局
+    // 确保shader和输入布局已经设置（应该在RenderFrame的步骤6中设置）
+    
+    // 注意：地形的顶点已经在世界空间中定义，所以需要使用单位world矩阵
+    // 这里我们临时更新常量缓冲区中的world矩阵为单位矩阵
+    // 由于地形顶点已经在世界空间，world矩阵应该是单位矩阵
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    HRESULT hr = m_context->Map(m_constantBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (SUCCEEDED(hr))
+    {
+        ConstantBuffer* cb = (ConstantBuffer*)mapped.pData;
+        
+        // 获取当前的view和projection矩阵（保存下来）
+        XMFLOAT4X4 savedView = cb->view;
+        XMFLOAT4X4 savedProjection = cb->projection;
+        
+        // 设置单位world矩阵（因为地形顶点已经在世界空间）
+        XMMATRIX identity = XMMatrixIdentity();
+        XMStoreFloat4x4(&cb->world, XMMatrixTranspose(identity));
+        
+        // 更新worldViewProj矩阵
+        XMMATRIX viewMatrix = XMLoadFloat4x4(&savedView);
+        XMMATRIX projMatrix = XMLoadFloat4x4(&savedProjection);
+        XMMATRIX worldViewProj = identity * viewMatrix * projMatrix;
+        XMStoreFloat4x4(&cb->worldViewProj, XMMatrixTranspose(worldViewProj));
+        
+        m_context->Unmap(m_constantBuffer.Get(), 0);
+    }
+    
+    // 绑定地形纹理（暂时使用默认纹理）
+    ID3D11ShaderResourceView* srvs[3] = {
+        m_textureSRV.Get(),  // BaseColor
+        m_textureSRV.Get(),  // Normal（暂时使用默认）
+        m_textureSRV.Get()   // MRA（暂时使用默认）
+    };
+    m_context->PSSetShaderResources(0, 3, srvs);
+    
+    // 绑定IBL纹理
+    ID3D11ShaderResourceView* iblSRVs[2] = {
+        m_environmentMapSRV.Get(),
+        m_brdfLutSRV.Get()
+    };
+    m_context->PSSetShaderResources(3, 2, iblSRVs);
+    m_context->PSSetSamplers(1, 1, m_iblSamplerState.GetAddressOf());
+    
+    // 绘制地形（地形会使用自己的顶点和索引缓冲区）
+    m_terrain->Render(m_context.Get());
+    
+    // 注意：这里我们没有恢复原来的world矩阵，因为UpdateConstantBuffers会在下一帧重新设置
+    // 如果模型渲染在地形之后，可能需要在这里恢复world矩阵
 }

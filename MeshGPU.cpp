@@ -68,6 +68,10 @@ bool MeshGPU::UploadToGPU(ID3D11Device* device, ID3D11DeviceContext* context, co
 
     // 保存顶点数量
     vertexCount = (UINT)mesh.GetVertices().size();
+    
+    // 保存子网格信息
+    submeshes = mesh.GetSubmeshes();
+    
     return true;
 }
 
@@ -131,6 +135,28 @@ void MeshGPU::Draw(ID3D11DeviceContext* context)
         // 参数说明：
         // - vertexCount: 要绘制的顶点数量
         // - 0: 起始顶点位置
+        context->Draw(vertexCount, 0);
+    }
+}
+
+// ============================================================================
+// 按子网格绘制（用于多材质支持）
+// ============================================================================
+void MeshGPU::DrawSubmesh(ID3D11DeviceContext* context, uint32_t submeshIndex)
+{
+    if (submeshIndex >= submeshes.size())
+        return;
+    
+    const Submesh& submesh = submeshes[submeshIndex];
+    
+    if (hasIndices && submesh.indexCount > 0)
+    {
+        // 使用索引绘制指定的子网格
+        context->DrawIndexed(submesh.indexCount, submesh.indexStart, 0);
+    }
+    else if (!hasIndices)
+    {
+        // 如果没有索引，绘制所有顶点（不支持子网格）
         context->Draw(vertexCount, 0);
     }
 }

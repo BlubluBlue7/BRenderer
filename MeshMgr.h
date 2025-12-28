@@ -16,6 +16,12 @@ public:
     std::shared_ptr<Mesh> CreateMesh(const std::string& name,
         const std::vector<Vertex>& verts,
         const std::vector<uint32_t>& indices = {});
+    
+    // 创建 Mesh（带子网格信息）
+    std::shared_ptr<Mesh> CreateMesh(const std::string& name,
+        const std::vector<Vertex>& verts,
+        const std::vector<uint32_t>& indices,
+        const std::vector<Submesh>& submeshes);
 
     // 获取 GPU 资源
     std::shared_ptr<MeshGPU> GetMeshGPU(const std::string& name);

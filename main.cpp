@@ -1,3 +1,15 @@
+#if !defined(_MSC_VER)
+#error "NOT USING MSVC"
+#endif
+
+#if !defined(_M_X64)
+#error "NOT X64 BUILD"
+#endif
+
+#if defined(__clang__) || defined(__GNUC__)
+#error "CLANG / GCC IS USED"
+#endif
+
 #include "Platform/Window.h"
 #include "Renderer.h"
 #include "Camera.h"
@@ -149,8 +161,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
         camera.OnMouseWheel(delta);
     });
 
-    // 键盘回调：WASD 移动相机
-    window.SetKeyCallback([&camera](int key, bool pressed) {
+    // 键盘回调：WASD 移动相机，P键暂停/继续光源旋转
+    window.SetKeyCallback([&camera, &renderer](int key, bool pressed) {
         switch (key)
         {
         case 'W':
@@ -176,6 +188,14 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
         case VK_LCONTROL:
         case VK_RCONTROL:
             camera.SetMoveDown(pressed);
+            break;
+        case 'P':
+        case 'p':
+            // P键：切换光源旋转暂停/继续（只在按下时切换一次，避免重复触发）
+            if (pressed)
+            {
+                renderer.ToggleLightRotationPaused();
+            }
             break;
         }
     });
