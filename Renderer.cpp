@@ -240,6 +240,14 @@ bool Renderer::Initialize(HWND hwnd, int width, int height)
     }
     
     // ========================================================================
+    // 步骤 12.5: 创建地形光栅化状态
+    // ========================================================================
+    if (!CreateTerrainRasterizerStates())
+    {
+        OutputDebugStringW(L"Warning: Failed to create terrain rasterizer states.\n");
+    }
+    
+    // ========================================================================
     // 步骤 13: 初始化地形
     // ========================================================================
     if (!InitializeTerrain())
@@ -2542,6 +2550,35 @@ bool Renderer::CreateTerrainShaders()
 }
 
 // ============================================================================
+// 创建地形光栅化状态（填充和线框）
+// ============================================================================
+bool Renderer::CreateTerrainRasterizerStates()
+{
+    // 创建线框光栅化状态
+    D3D11_RASTERIZER_DESC wireframeDesc = {};
+    wireframeDesc.FillMode = D3D11_FILL_WIREFRAME;  // 线框模式
+    wireframeDesc.CullMode = D3D11_CULL_BACK;       // 背面剔除
+    wireframeDesc.FrontCounterClockwise = false;    // 逆时针为正面
+    wireframeDesc.DepthBias = 0;
+    wireframeDesc.DepthBiasClamp = 0.0f;
+    wireframeDesc.SlopeScaledDepthBias = 0.0f;
+    wireframeDesc.DepthClipEnable = true;
+    wireframeDesc.ScissorEnable = false;
+    wireframeDesc.MultisampleEnable = false;
+    wireframeDesc.AntialiasedLineEnable = false;
+    
+    HRESULT hr = m_device->CreateRasterizerState(&wireframeDesc, m_terrainWireframeRasterizerState.GetAddressOf());
+    if (FAILED(hr))
+    {
+        OutputDebugStringW(L"[TERRAIN DEBUG] Failed to create terrain wireframe rasterizer state.\n");
+        return false;
+    }
+    
+    OutputDebugStringW(L"[TERRAIN DEBUG] Terrain rasterizer states created successfully.\n");
+    return true;
+}
+
+// ============================================================================
 // 创建天空盒几何体（立方体）
 // ============================================================================
 bool Renderer::CreateSkyboxGeometry()
@@ -2879,6 +2916,22 @@ void Renderer::RenderTerrain()
         return;
     }
     
+    // 保存当前光栅化状态
+    Microsoft::WRL::ComPtr<ID3D11RasterizerState> oldRasterizerState;
+    m_context->RSGetState(oldRasterizerState.GetAddressOf());
+    
+    // 根据线框模式设置光栅化状态
+    if (m_terrainWireframe && m_terrainWireframeRasterizerState)
+    {
+        m_context->RSSetState(m_terrainWireframeRasterizerState.Get());
+    }
+    else
+    {
+        // 使用默认填充模式（不设置状态，使用默认的填充模式）
+        // 或者可以创建一个填充模式的状态
+        m_context->RSSetState(nullptr);  // 使用默认状态
+    }
+    
     // 设置地形shader和输入布局
     m_context->IASetInputLayout(m_terrainInputLayout.Get());
     m_context->VSSetShader(m_terrainVS.Get(), nullptr, 0);
@@ -3068,6 +3121,16 @@ void Renderer::RenderTerrain()
         }
         
         m_terrain->Render(m_context.Get());
+        
+        // 恢复原来的光栅化状态
+        if (oldRasterizerState)
+        {
+            m_context->RSSetState(oldRasterizerState.Get());
+        }
+        else
+        {
+            m_context->RSSetState(nullptr);
+        }
         
         // 恢复原来的world矩阵（用于模型渲染）
         // 注意：由于UpdateConstantBuffers会在模型渲染前再次调用，这里不需要恢复

@@ -177,6 +177,13 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
         case VK_RCONTROL:
             camera.SetMoveDown(pressed);
             break;
+        case 'T':
+        case 't':
+            if (pressed)
+            {
+                renderer.ToggleTerrainWireframe();
+            }
+            break;
         case 'P':
         case 'p':
             // P键：切换光源旋转暂停/继续（只在按下时切换一次，避免重复触发）

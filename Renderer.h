@@ -38,6 +38,12 @@ public:
     
     // 切换光源旋转暂停状态
     void ToggleLightRotationPaused() { m_lightRotationPaused = !m_lightRotationPaused; }
+    
+    // 切换地形线框渲染模式
+    void ToggleTerrainWireframe() { m_terrainWireframe = !m_terrainWireframe; }
+    
+    // 设置地形线框渲染模式
+    void SetTerrainWireframe(bool wireframe) { m_terrainWireframe = wireframe; }
 
 private:
     // 从文件编译 Shader
@@ -78,6 +84,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Buffer>          m_skyboxIndexBuffer;
     Microsoft::WRL::ComPtr<ID3D11DepthStencilState> m_skyboxDepthStencilState;  // 天空盒深度状态（LESS_EQUAL）
     Microsoft::WRL::ComPtr<ID3D11RasterizerState> m_skyboxRasterizerState;  // 天空盒光栅化状态（禁用背面剔除）
+    Microsoft::WRL::ComPtr<ID3D11RasterizerState> m_terrainWireframeRasterizerState;  // 地形线框光栅化状态
     Microsoft::WRL::ComPtr<ID3D11Buffer>          m_constantBuffer;  // 常量缓冲区（用于传递变换矩阵）
     Microsoft::WRL::ComPtr<ID3D11Buffer>          m_lightBuffer;      // 光照常量缓冲区（用于传递光照参数）
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_textureSRV;    // 纹理资源视图（单纹理，向后兼容）
@@ -109,6 +116,7 @@ private:
     std::wstring m_lastError;  // 最后的错误信息
     float m_lightRotationTime = 0.0f;  // 光源旋转累积时间
     bool m_lightRotationPaused = false;  // 光源旋转是否暂停
+    bool m_terrainWireframe = false;  // 地形是否使用线框模式
     
     // 加载纹理
     bool LoadTexture(const std::wstring& filename);
@@ -137,6 +145,7 @@ private:
     
     // 地形相关函数
     bool CreateTerrainShaders();  // 创建地形shader
+    bool CreateTerrainRasterizerStates();  // 创建地形光栅化状态（填充和线框）
     bool InitializeTerrain();  // 初始化地形
     void RenderTerrain();  // 渲染地形
 };

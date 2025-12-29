@@ -65,8 +65,45 @@ float4 PS(PSInput input) : SV_TARGET
     // 从纹理采样BaseColor
     float4 baseColorSample = baseColorTexture.Sample(textureSampler, flippedTexCoord);
     
-    // 使用纹理颜色作为基础颜色
-    float3 finalAlbedo = baseColorSample.rgb * albedo.xyz;
+    // 基于高度的颜色混合（让地形颜色更有意义）
+    // 使用世界空间Y坐标（高度）来混合不同的颜色
+    float height = input.worldPos.y;
+    float normalizedHeight = saturate(height / 30.0f);  // 假设最大高度为30
+    
+    // 定义不同高度的颜色（从低到高）
+    float3 lowColor = float3(0.2f, 0.4f, 0.2f);    // 深绿色（低地）
+    float3 midColor = float3(0.5f, 0.6f, 0.3f);    // 浅绿色（中地）
+    float3 highColor = float3(0.7f, 0.7f, 0.6f);   // 浅棕色（高地）
+    float3 snowColor = float3(0.9f, 0.9f, 0.95f);   // 白色（雪地）
+    
+    // 根据高度混合颜色
+    float3 heightColor;
+    if (normalizedHeight < 0.3f)
+    {
+        // 低地：深绿色
+        heightColor = lowColor;
+    }
+    else if (normalizedHeight < 0.6f)
+    {
+        // 中地：深绿到浅绿的过渡
+        float t = (normalizedHeight - 0.3f) / 0.3f;
+        heightColor = lerp(lowColor, midColor, t);
+    }
+    else if (normalizedHeight < 0.85f)
+    {
+        // 高地：浅绿到浅棕的过渡
+        float t = (normalizedHeight - 0.6f) / 0.25f;
+        heightColor = lerp(midColor, highColor, t);
+    }
+    else
+    {
+        // 雪地：浅棕到白色的过渡
+        float t = (normalizedHeight - 0.85f) / 0.15f;
+        heightColor = lerp(highColor, snowColor, t);
+    }
+    
+    // 混合纹理颜色和高度颜色（70%高度颜色，30%纹理颜色）
+    float3 finalAlbedo = lerp(heightColor, baseColorSample.rgb, 0.3f) * albedo.xyz;
     
     // 简单的Lambertian漫反射光照
     float3 N = normalize(input.normal);
@@ -76,8 +113,8 @@ float4 PS(PSInput input) : SV_TARGET
     // 计算光照颜色
     float3 diffuse = finalAlbedo * lightColor.xyz * lightIntensity * NdotL;
     
-    // 添加环境光
-    float3 ambient = finalAlbedo * ambientColor.xyz * 0.3f;
+    // 添加环境光（增加环境光强度，让地形更亮）
+    float3 ambient = finalAlbedo * ambientColor.xyz * 0.5f;
     
     // 最终颜色
     float3 finalColor = diffuse + ambient;

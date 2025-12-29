@@ -65,8 +65,44 @@ bool Terrain::CreateProcedural(ID3D11Device* device, const TerrainParams& params
     
     m_params = params;
     
-    // 生成程序化高度数据（简单的噪声）
+    // 生成程序化高度数据（使用多层噪声生成更自然的地形）
     std::vector<float> heightData(m_params.width * m_params.height);
+    
+    // 简单的伪随机函数（用于生成噪声）
+    auto hash = [](int x, int z) -> float {
+        // 简单的哈希函数，生成伪随机值
+        x = ((x << 13) ^ x) * 1274126177;
+        z = ((z << 13) ^ z) * 1274126177;
+        return ((x * z) & 0x7FFFFFFF) / 2147483647.0f;
+    };
+    
+    // 平滑插值函数
+    auto smooth = [](float t) -> float {
+        return t * t * (3.0f - 2.0f * t);
+    };
+    
+    // 简单的噪声函数（基于网格的噪声）
+    auto noise = [&hash, &smooth](float x, float z) -> float {
+        int ix = (int)floorf(x);
+        int iz = (int)floorf(z);
+        float fx = x - ix;
+        float fz = z - iz;
+        
+        // 双线性插值
+        float n00 = hash(ix, iz);
+        float n10 = hash(ix + 1, iz);
+        float n01 = hash(ix, iz + 1);
+        float n11 = hash(ix + 1, iz + 1);
+        
+        float sx = smooth(fx);
+        float sz = smooth(fz);
+        
+        float nx0 = n00 * (1.0f - sx) + n10 * sx;
+        float nx1 = n01 * (1.0f - sx) + n11 * sx;
+        
+        return nx0 * (1.0f - sz) + nx1 * sz;
+    };
+    
     for (int z = 0; z < m_params.height; ++z)
     {
         for (int x = 0; x < m_params.width; ++x)
@@ -74,8 +110,20 @@ bool Terrain::CreateProcedural(ID3D11Device* device, const TerrainParams& params
             float fx = (float)x / (float)(m_params.width - 1);
             float fz = (float)z / (float)(m_params.height - 1);
             
-            // 简单的正弦波生成地形
-            float height = sinf(fx * XM_PI * 4.0f) * sinf(fz * XM_PI * 4.0f) * 0.5f + 0.5f;
+            // 使用多层噪声（fractal noise）生成更自然的地形
+            // 第一层：大尺度地形（低频）
+            float height = noise(fx * 8.0f, fz * 8.0f) * 0.5f;
+            
+            // 第二层：中等尺度细节（中频）
+            height += noise(fx * 16.0f, fz * 16.0f) * 0.25f;
+            
+            // 第三层：小尺度细节（高频）
+            height += noise(fx * 32.0f, fz * 32.0f) * 0.125f;
+            
+            // 归一化到0-1范围
+            height = height * 0.8f + 0.1f;  // 稍微调整范围，避免完全平坦
+            height = fmaxf(0.0f, fminf(1.0f, height));  // 限制在0-1范围
+            
             heightData[z * m_params.width + x] = height;
         }
     }
@@ -171,7 +219,8 @@ void Terrain::GenerateTerrainMesh(const std::vector<float>& heightData)
             vertex.color[2] = 1.0f;
             
             // 纹理坐标（根据地形大小和纹理平铺次数计算）
-            float texScale = 1.0f;  // 可以做成参数
+            // 增加纹理重复次数，让纹理在地形上重复多次，看起来更自然
+            float texScale = 16.0f;  // 纹理重复16次（可以根据地形大小调整）
             vertex.texCoord[0] = (float)x / (float)(m_params.width - 1) * texScale;
             vertex.texCoord[1] = (float)z / (float)(m_params.height - 1) * texScale;
             
