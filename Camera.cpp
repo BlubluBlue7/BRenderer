@@ -98,7 +98,7 @@ XMMATRIX Camera::GetProjectionMatrix(float aspectRatio) const
 {
     float fov = XM_PI / 4.0f;  // 45 度视野
     float nearPlane = 0.1f;
-    float farPlane = 500.0f;   // 增加远平面距离以看到更大的地形（200x200）
+    float farPlane = 2000.0f;   // 增加远平面距离以看到更大的地形（400x400）
     
     return XMMatrixPerspectiveFovLH(fov, aspectRatio, nearPlane, farPlane);
 }

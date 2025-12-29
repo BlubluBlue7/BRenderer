@@ -184,6 +184,37 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
                 renderer.ToggleTerrainWireframe();
             }
             break;
+        case 'L':
+        case 'l':
+            if (pressed)
+            {
+                renderer.ToggleTerrainLODLock();
+            }
+            break;
+        case '1':
+            if (pressed)
+            {
+                renderer.SetTerrainLODLockLevel(0);
+            }
+            break;
+        case '2':
+            if (pressed)
+            {
+                renderer.SetTerrainLODLockLevel(1);
+            }
+            break;
+        case '3':
+            if (pressed)
+            {
+                renderer.SetTerrainLODLockLevel(2);
+            }
+            break;
+        case '4':
+            if (pressed)
+            {
+                renderer.SetTerrainLODLockLevel(3);
+            }
+            break;
         case 'P':
         case 'p':
             // P键：切换光源旋转暂停/继续（只在按下时切换一次，避免重复触发）

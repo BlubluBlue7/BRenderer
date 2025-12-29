@@ -105,19 +105,12 @@ float4 PS(PSInput input) : SV_TARGET
     // 混合纹理颜色和高度颜色（70%高度颜色，30%纹理颜色）
     float3 finalAlbedo = lerp(heightColor, baseColorSample.rgb, 0.3f) * albedo.xyz;
     
-    // 简单的Lambertian漫反射光照
-    float3 N = normalize(input.normal);
-    float3 L = normalize(-lightDirection.xyz);  // 光源方向（取反，因为lightDirection指向光源）
-    float NdotL = max(dot(N, L), 0.0f);
+    // 简化光照：直接使用颜色，不依赖环境光（避免纯黑问题）
+    // 如果需要光照效果，可以添加简单的环境光
+    float3 ambient = finalAlbedo * max(ambientColor.xyz, float3(0.5f, 0.5f, 0.5f));  // 确保至少有一定亮度
     
-    // 计算光照颜色
-    float3 diffuse = finalAlbedo * lightColor.xyz * lightIntensity * NdotL;
-    
-    // 添加环境光（增加环境光强度，让地形更亮）
-    float3 ambient = finalAlbedo * ambientColor.xyz * 0.5f;
-    
-    // 最终颜色
-    float3 finalColor = diffuse + ambient;
+    // 最终颜色（直接使用颜色，确保可见）
+    float3 finalColor = finalAlbedo;  // 直接使用颜色，不依赖光照
     
     // 限制颜色范围
     finalColor = saturate(finalColor);

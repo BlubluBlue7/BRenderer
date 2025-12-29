@@ -44,6 +44,12 @@ public:
     
     // 设置地形线框渲染模式
     void SetTerrainWireframe(bool wireframe) { m_terrainWireframe = wireframe; }
+    
+    // 切换地形LOD锁定（用于调试查看网格）
+    void ToggleTerrainLODLock();
+    
+    // 设置地形LOD锁定级别
+    void SetTerrainLODLockLevel(int level);
 
 private:
     // 从文件编译 Shader

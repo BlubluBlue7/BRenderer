@@ -548,7 +548,7 @@ void Renderer::RenderFrame(float deltaTime)
     // ========================================================================
     // 步骤 5: 渲染天空盒（在场景之前渲染）
     // ========================================================================
-    // RenderSkybox();
+    RenderSkybox();
 
     // ========================================================================
     // 步骤 6: 设置深度状态
@@ -3120,7 +3120,17 @@ void Renderer::RenderTerrain()
             OutputDebugStringW(msg);
         }
         
-        m_terrain->Render(m_context.Get());
+        // 使用CDLOD渲染（如果相机可用）
+        if (m_camera)
+        {
+            XMFLOAT3 camPos = m_camera->GetPosition();
+            m_terrain->Render(m_context.Get(), camPos);
+        }
+        else
+        {
+            // 回退到旧版本渲染
+            m_terrain->Render(m_context.Get());
+        }
         
         // 恢复原来的光栅化状态
         if (oldRasterizerState)
@@ -3183,5 +3193,42 @@ void Renderer::RenderTerrain()
             OutputDebugStringW(msg);
             mapFailedLogged = true;
         }
+    }
+}
+
+// ============================================================================
+// 切换地形LOD锁定
+// ============================================================================
+void Renderer::ToggleTerrainLODLock()
+{
+    if (m_terrain)
+    {
+        bool currentLocked = m_terrain->IsLODLocked();
+        m_terrain->SetLODLocked(!currentLocked);
+        
+        wchar_t msg[256];
+        if (!currentLocked)
+        {
+            swprintf_s(msg, L"[TERRAIN] LOD locked at current level\n");
+        }
+        else
+        {
+            swprintf_s(msg, L"[TERRAIN] LOD unlocked, using distance-based selection\n");
+        }
+        OutputDebugStringW(msg);
+    }
+}
+
+// ============================================================================
+// 设置地形LOD锁定级别
+// ============================================================================
+void Renderer::SetTerrainLODLockLevel(int level)
+{
+    if (m_terrain && level >= 0 && level < 4)
+    {
+        m_terrain->SetLockedLODLevel(level);
+        wchar_t msg[256];
+        swprintf_s(msg, L"[TERRAIN] LOD locked to level %d\n", level);
+        OutputDebugStringW(msg);
     }
 }

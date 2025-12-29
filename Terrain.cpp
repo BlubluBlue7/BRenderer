@@ -18,13 +18,23 @@ using namespace DirectX;
 
 Terrain::Terrain()
     : m_indexCount(0)
+    , m_useCDLOD(false)
+    , m_lodLocked(false)
+    , m_lockedLODLevel(0)
+    , m_patchSize(33)  // 33x33的块（32x32的四边形）
 {
     m_params.width = 256;
     m_params.height = 256;
-    m_params.sizeX = 100.0f;
-    m_params.sizeZ = 100.0f;
-    m_params.heightScale = 20.0f;
+    m_params.sizeX = 400.0f;  // 扩大地形区域：从100增加到400
+    m_params.sizeZ = 400.0f;  // 扩大地形区域：从100增加到400
+    m_params.heightScale = 30.0f;  // 相应增加高度缩放
     m_params.heightOffset = 0.0f;
+    
+    // 初始化LOD距离阈值（根据地形大小调整）
+    m_lodDistances[0] = 100.0f;   // LOD 0: 最近，最高细节
+    m_lodDistances[1] = 200.0f;   // LOD 1
+    m_lodDistances[2] = 400.0f;   // LOD 2
+    m_lodDistances[3] = 1000.0f;  // LOD 3: 最远，最低细节
 }
 
 Terrain::~Terrain()
@@ -137,6 +147,9 @@ bool Terrain::CreateProcedural(ID3D11Device* device, const TerrainParams& params
     
     // 保存高度数据用于查询
     m_heightData = std::move(heightData);
+    
+    // 初始化CDLOD系统
+    InitializeCDLOD(device);
     
     return true;
 }
@@ -434,5 +447,399 @@ float Terrain::GetHeightAt(float worldX, float worldZ) const
     
     // 应用缩放和偏移
     return height * m_params.heightScale + m_params.heightOffset;
+}
+
+// ============================================================================
+// CDLOD系统实现
+// ============================================================================
+
+// 初始化CDLOD系统
+void Terrain::InitializeCDLOD(ID3D11Device* device)
+{
+    if (!device)
+        return;
+    
+    m_useCDLOD = true;
+    
+    // 生成地形块（必须先生成块，才能为每个块生成索引）
+    GeneratePatches();
+    
+    // 为每个块生成多级LOD索引
+    GeneratePatchIndices(device);
+    
+    OutputDebugStringW(L"[TERRAIN DEBUG] CDLOD system initialized.\n");
+}
+
+// 为每个块生成多级LOD索引
+void Terrain::GeneratePatchIndices(ID3D11Device* device)
+{
+    if (!device || m_vertices.empty() || m_patches.empty())
+        return;
+    
+    // 为所有块的所有LOD级别生成一个大的索引缓冲区
+    std::vector<std::vector<uint32_t>> allLODIndices(MAX_LOD_LEVELS);
+    
+    // 为每个块生成每个LOD级别的索引
+    for (auto& patch : m_patches)
+    {
+        for (int lod = 0; lod < MAX_LOD_LEVELS; ++lod)
+        {
+            int step = 1 << lod;  // LOD 0: step=1, LOD 1: step=2, LOD 2: step=4, LOD 3: step=8
+            
+            // 记录当前LOD级别的起始索引位置
+            patch.lodRanges[lod].indexStart = (UINT)allLODIndices[lod].size();
+            
+            // 为这个块生成索引（只在块内部，不跨越边界）
+            int blockStartX = patch.startX;
+            int blockEndX = patch.endX;
+            int blockStartZ = patch.startZ;
+            int blockEndZ = patch.endZ;
+            
+            // 生成块内的索引（确保不跨越块边界）
+            // 修复LOD缝隙：对于非最高LOD，边界区域使用细步长（step=1），内部区域使用粗步长
+            if (lod == 0)
+            {
+                // LOD 0：使用完整步长，生成所有三角形
+                for (int z = blockStartZ; z < blockEndZ; z += step)
+                {
+                    if (z + step > blockEndZ)
+                        break;
+                        
+                    for (int x = blockStartX; x < blockEndX; x += step)
+                    {
+                        if (x + step > blockEndX)
+                            break;
+                        
+                        uint32_t topLeft = z * m_params.width + x;
+                        uint32_t topRight = z * m_params.width + (x + step);
+                        uint32_t bottomLeft = (z + step) * m_params.width + x;
+                        uint32_t bottomRight = (z + step) * m_params.width + (x + step);
+                        
+                        if (topRight >= m_vertices.size() || 
+                            bottomLeft >= m_vertices.size() || 
+                            bottomRight >= m_vertices.size())
+                            continue;
+                        
+                        allLODIndices[lod].push_back(topLeft);
+                        allLODIndices[lod].push_back(bottomLeft);
+                        allLODIndices[lod].push_back(topRight);
+                        
+                        allLODIndices[lod].push_back(topRight);
+                        allLODIndices[lod].push_back(bottomLeft);
+                        allLODIndices[lod].push_back(bottomRight);
+                    }
+                }
+            }
+            else
+            {
+                // LOD > 0：边界区域使用step=1，内部区域使用粗步长
+                // 首先处理边界区域（使用step=1确保无缝）
+                int boundaryStep = 1;
+                
+                // 顶部和底部边界行
+                for (int z = blockStartZ; z <= blockEndZ - boundaryStep; z += boundaryStep)
+                {
+                    if (z + boundaryStep > blockEndZ)
+                        break;
+                    
+                    bool isBoundaryRow = (z == blockStartZ || z + boundaryStep == blockEndZ);
+                    
+                    for (int x = blockStartX; x < blockEndX; x += boundaryStep)
+                    {
+                        if (x + boundaryStep > blockEndX)
+                            break;
+                        
+                        bool isBoundaryCol = (x == blockStartX || x + boundaryStep == blockEndX);
+                        
+                        // 只在边界行或边界列生成三角形
+                        if (isBoundaryRow || isBoundaryCol)
+                        {
+                            uint32_t topLeft = z * m_params.width + x;
+                            uint32_t topRight = z * m_params.width + (x + boundaryStep);
+                            uint32_t bottomLeft = (z + boundaryStep) * m_params.width + x;
+                            uint32_t bottomRight = (z + boundaryStep) * m_params.width + (x + boundaryStep);
+                            
+                            if (topRight >= m_vertices.size() || 
+                                bottomLeft >= m_vertices.size() || 
+                                bottomRight >= m_vertices.size())
+                                continue;
+                            
+                            allLODIndices[lod].push_back(topLeft);
+                            allLODIndices[lod].push_back(bottomLeft);
+                            allLODIndices[lod].push_back(topRight);
+                            
+                            allLODIndices[lod].push_back(topRight);
+                            allLODIndices[lod].push_back(bottomLeft);
+                            allLODIndices[lod].push_back(bottomRight);
+                        }
+                    }
+                }
+                
+                // 然后处理内部区域（使用粗步长）
+                int innerStartZ = blockStartZ + step;
+                int innerEndZ = blockEndZ - step;
+                int innerStartX = blockStartX + step;
+                int innerEndX = blockEndX - step;
+                
+                if (innerStartZ < innerEndZ && innerStartX < innerEndX)
+                {
+                    for (int z = innerStartZ; z < innerEndZ; z += step)
+                    {
+                        if (z + step > innerEndZ)
+                            break;
+                            
+                        for (int x = innerStartX; x < innerEndX; x += step)
+                        {
+                            if (x + step > innerEndX)
+                                break;
+                            
+                            uint32_t topLeft = z * m_params.width + x;
+                            uint32_t topRight = z * m_params.width + (x + step);
+                            uint32_t bottomLeft = (z + step) * m_params.width + x;
+                            uint32_t bottomRight = (z + step) * m_params.width + (x + step);
+                            
+                            if (topRight >= m_vertices.size() || 
+                                bottomLeft >= m_vertices.size() || 
+                                bottomRight >= m_vertices.size())
+                                continue;
+                            
+                            allLODIndices[lod].push_back(topLeft);
+                            allLODIndices[lod].push_back(bottomLeft);
+                            allLODIndices[lod].push_back(topRight);
+                            
+                            allLODIndices[lod].push_back(topRight);
+                            allLODIndices[lod].push_back(bottomLeft);
+                            allLODIndices[lod].push_back(bottomRight);
+                        }
+                    }
+                }
+            }
+            
+            // 记录索引数量
+            patch.lodRanges[lod].indexCount = (UINT)allLODIndices[lod].size() - patch.lodRanges[lod].indexStart;
+        }
+    }
+    
+    // 为每个LOD级别创建索引缓冲区
+    m_lodMeshes.clear();
+    m_lodMeshes.resize(MAX_LOD_LEVELS);
+    
+    for (int lod = 0; lod < MAX_LOD_LEVELS; ++lod)
+    {
+        if (allLODIndices[lod].empty())
+            continue;
+        
+        D3D11_BUFFER_DESC ibd = {};
+        ibd.Usage = D3D11_USAGE_DEFAULT;
+        ibd.ByteWidth = (UINT)(sizeof(uint32_t) * allLODIndices[lod].size());
+        ibd.BindFlags = D3D11_BIND_INDEX_BUFFER;
+        ibd.CPUAccessFlags = 0;
+        
+        D3D11_SUBRESOURCE_DATA iinitData = {};
+        iinitData.pSysMem = allLODIndices[lod].data();
+        
+        HRESULT hr = device->CreateBuffer(&ibd, &iinitData, m_lodMeshes[lod].indexBuffer.GetAddressOf());
+        if (SUCCEEDED(hr))
+        {
+            m_lodMeshes[lod].indices = std::move(allLODIndices[lod]);
+            m_lodMeshes[lod].indexCount = (UINT)m_lodMeshes[lod].indices.size();
+            
+            wchar_t msg[256];
+            swprintf_s(msg, L"[TERRAIN DEBUG] LOD %d index buffer created: %d indices\n", lod, m_lodMeshes[lod].indexCount);
+            OutputDebugStringW(msg);
+        }
+    }
+}
+
+// 生成地形块
+void Terrain::GeneratePatches()
+{
+    m_patches.clear();
+    
+    // 计算每个块的大小（世界空间）
+    float patchWorldSizeX = m_params.sizeX / ((float)(m_params.width - 1) / (float)(m_patchSize - 1));
+    float patchWorldSizeZ = m_params.sizeZ / ((float)(m_params.height - 1) / (float)(m_patchSize - 1));
+    
+    // 计算块的数量
+    int numPatchesX = (m_params.width - 1) / (m_patchSize - 1);
+    int numPatchesZ = (m_params.height - 1) / (m_patchSize - 1);
+    
+    // 生成每个块
+    for (int pz = 0; pz < numPatchesZ; ++pz)
+    {
+        for (int px = 0; px < numPatchesX; ++px)
+        {
+            TerrainPatch patch;
+            
+            // 计算世界空间边界
+            patch.minX = -m_params.sizeX * 0.5f + px * patchWorldSizeX;
+            patch.maxX = patch.minX + patchWorldSizeX;
+            patch.minZ = -m_params.sizeZ * 0.5f + pz * patchWorldSizeZ;
+            patch.maxZ = patch.minZ + patchWorldSizeZ;
+            
+            // 计算中心点
+            patch.centerX = (patch.minX + patch.maxX) * 0.5f;
+            patch.centerZ = (patch.minZ + patch.maxZ) * 0.5f;
+            
+            // 记录块在地形网格中的位置
+            patch.patchX = px;
+            patch.patchZ = pz;
+            patch.startX = px * (m_patchSize - 1);
+            patch.startZ = pz * (m_patchSize - 1);
+            patch.endX = patch.startX + (m_patchSize - 1);
+            patch.endZ = patch.startZ + (m_patchSize - 1);
+            
+            // 确保不越界
+            if (patch.endX >= m_params.width) patch.endX = m_params.width - 1;
+            if (patch.endZ >= m_params.height) patch.endZ = m_params.height - 1;
+            
+            // 初始LOD级别（会在渲染时更新）
+            patch.lodLevel = 0;
+            
+            // 初始化LOD范围
+            for (int i = 0; i < MAX_LOD_LEVELS; ++i)
+            {
+                patch.lodRanges[i].indexStart = 0;
+                patch.lodRanges[i].indexCount = 0;
+            }
+            
+            m_patches.push_back(patch);
+        }
+    }
+    
+    wchar_t msg[256];
+    swprintf_s(msg, L"[TERRAIN DEBUG] Generated %d terrain patches\n", (int)m_patches.size());
+    OutputDebugStringW(msg);
+}
+
+// 选择可见的LOD块
+void Terrain::SelectLODPatches(const DirectX::XMFLOAT3& cameraPosition, std::vector<TerrainPatch>& visiblePatches)
+{
+    visiblePatches.clear();
+    
+    for (auto& patch : m_patches)
+    {
+        int lod;
+        
+        // 如果LOD被锁定，使用锁定的LOD级别
+        if (m_lodLocked)
+        {
+            lod = m_lockedLODLevel;
+        }
+        else
+        {
+            // 计算相机到块中心的距离
+            float dx = patch.centerX - cameraPosition.x;
+            float dz = patch.centerZ - cameraPosition.z;
+            float distance = sqrtf(dx * dx + dz * dz);
+            
+            // 根据距离选择LOD级别
+            lod = 0;
+            for (int i = 0; i < MAX_LOD_LEVELS - 1; ++i)
+            {
+                if (distance > m_lodDistances[i])
+                {
+                    lod = i + 1;
+                }
+                else
+                {
+                    break;
+                }
+            }
+            
+            // 限制LOD级别
+            if (lod >= MAX_LOD_LEVELS)
+                lod = MAX_LOD_LEVELS - 1;
+        }
+        
+        patch.lodLevel = lod;
+        
+        // 检查这个LOD级别是否有有效的索引范围
+        if (lod < MAX_LOD_LEVELS && patch.lodRanges[lod].indexCount > 0)
+        {
+            visiblePatches.push_back(patch);
+        }
+    }
+}
+
+// 检查块是否在视锥内（简化版本）
+bool Terrain::IsPatchVisible(const TerrainPatch& patch, const DirectX::XMFLOAT4X4& viewProjMatrix)
+{
+    // 简化实现：总是返回true（可以后续实现完整的视锥剔除）
+    // TODO: 实现完整的视锥剔除
+    return true;
+}
+
+// 使用CDLOD渲染地形
+void Terrain::Render(ID3D11DeviceContext* context, const DirectX::XMFLOAT3& cameraPosition)
+{
+    if (!m_useCDLOD)
+    {
+        // 回退到旧版本渲染
+        Render(context);
+        return;
+    }
+    
+    if (!context || !m_vertexBuffer)
+        return;
+    
+    // 设置顶点缓冲区
+    UINT stride = sizeof(Vertex);
+    UINT offset = 0;
+    context->IASetVertexBuffers(0, 1, m_vertexBuffer.GetAddressOf(), &stride, &offset);
+    
+    // 设置图元类型
+    context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    
+    // 选择可见的LOD块
+    std::vector<TerrainPatch> visiblePatches;
+    SelectLODPatches(cameraPosition, visiblePatches);
+    
+    // 统计信息
+    static int frameCount = 0;
+    frameCount++;
+    if (frameCount % 60 == 0)
+    {
+        wchar_t msg[256];
+        swprintf_s(msg, L"[TERRAIN CDLOD] Rendering %d patches\n", (int)visiblePatches.size());
+        OutputDebugStringW(msg);
+    }
+    
+    // 按LOD级别分组渲染（减少状态切换）
+    int totalIndices = 0;
+    int totalPatches = 0;
+    
+    for (int lod = 0; lod < MAX_LOD_LEVELS; ++lod)
+    {
+        if (lod >= (int)m_lodMeshes.size() || !m_lodMeshes[lod].indexBuffer)
+            continue;
+        
+        // 设置当前LOD的索引缓冲区
+        context->IASetIndexBuffer(m_lodMeshes[lod].indexBuffer.Get(), DXGI_FORMAT_R32_UINT, 0);
+        
+        // 渲染所有使用此LOD的块（每个块单独绘制）
+        for (const auto& patch : visiblePatches)
+        {
+            if (patch.lodLevel == lod && patch.lodRanges[lod].indexCount > 0)
+            {
+                // 绘制这个块的索引范围
+                // DrawIndexed(IndexCount, StartIndexLocation, BaseVertexLocation)
+                UINT indexCount = patch.lodRanges[lod].indexCount;
+                UINT startIndex = patch.lodRanges[lod].indexStart;
+                INT baseVertex = 0;
+                context->DrawIndexed(indexCount, startIndex, baseVertex);
+                totalIndices += patch.lodRanges[lod].indexCount;
+                totalPatches++;
+            }
+        }
+    }
+    
+    // 调试输出
+    if (frameCount % 60 == 0)
+    {
+        wchar_t msg[256];
+        swprintf_s(msg, L"[TERRAIN CDLOD] Rendered %d patches, %d total indices\n", totalPatches, totalIndices);
+        OutputDebugStringW(msg);
+    }
 }
 
