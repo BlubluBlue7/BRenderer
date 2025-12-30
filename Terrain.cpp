@@ -495,180 +495,142 @@ void Terrain::GeneratePatchIndices(ID3D11Device* device)
             int blockStartZ = patch.startZ;
             int blockEndZ = patch.endZ;
             
-            // 生成块内的索引（确保不跨越块边界）
             // CDLOD标准做法：边界区域总是使用最细步长（step=1），内部区域使用当前LOD的步长
             // 这样可以确保与任何相邻LOD级别都能无缝连接
-            
-            // 边界步长：总是使用最细步长，确保与任何LOD级别都能无缝连接
             const int boundaryStep = 1;
             
-            // 1. 生成边界区域的三角形（使用step=1）
-            // 顶部边界行
-            if (blockStartZ < blockEndZ)
+            // 计算边界区域的宽度（用于确定内部区域的起始位置）
+            // 边界区域应该足够宽，以确保与相邻的更高LOD级别无缝连接
+            // 在CDLOD中，边界宽度通常只需要1-2个顶点宽度即可
+            // 使用固定的小值（比如1）可以确保内部区域有足够的空间
+            // 对于LOD N，理论上边界宽度应该是2^N，但这会导致内部区域太小
+            // 实际上，由于边界区域使用step=1，只需要很小的宽度就能确保无缝连接
+            int boundaryWidth = 1;  // 使用固定的小值，确保内部区域有足够空间
+            
+            // 计算内部区域的边界
+            int innerStartX = blockStartX + boundaryWidth;
+            int innerEndX = blockEndX - boundaryWidth;
+            int innerStartZ = blockStartZ + boundaryWidth;
+            int innerEndZ = blockEndZ - boundaryWidth;
+            
+            // 辅助函数：添加一个四边形（两个三角形）
+            auto AddQuad = [&](int x0, int z0, int x1, int z1) {
+                // 确保坐标在有效范围内
+                if (x0 < blockStartX || x0 > blockEndX || x1 < blockStartX || x1 > blockEndX ||
+                    z0 < blockStartZ || z0 > blockEndZ || z1 < blockStartZ || z1 > blockEndZ)
+                    return;
+                
+                // 计算顶点索引
+                uint32_t topLeft = z0 * m_params.width + x0;
+                uint32_t topRight = z0 * m_params.width + x1;
+                uint32_t bottomLeft = z1 * m_params.width + x0;
+                uint32_t bottomRight = z1 * m_params.width + x1;
+                
+                // 验证索引有效性
+                if (topLeft >= m_vertices.size() || topRight >= m_vertices.size() ||
+                    bottomLeft >= m_vertices.size() || bottomRight >= m_vertices.size())
+                    return;
+                
+                // 添加两个三角形（逆时针顺序）
+                allLODIndices[lod].push_back(topLeft);
+                allLODIndices[lod].push_back(bottomLeft);
+                allLODIndices[lod].push_back(topRight);
+                
+                allLODIndices[lod].push_back(topRight);
+                allLODIndices[lod].push_back(bottomLeft);
+                allLODIndices[lod].push_back(bottomRight);
+            };
+            
+            // 1. 生成边界区域（使用step=1，确保与任何LOD级别都能无缝连接）
+            // 边界区域应该覆盖从边界到boundaryWidth的区域
+            
+            // 顶部边界区域（从blockStartZ到blockStartZ+boundaryWidth）
+            int topBoundaryEndZ = blockStartZ + boundaryWidth;
+            if (topBoundaryEndZ > blockEndZ)
+                topBoundaryEndZ = blockEndZ;
+            for (int z = blockStartZ; z < topBoundaryEndZ; z += boundaryStep)
             {
+                if (z + boundaryStep > topBoundaryEndZ)
+                    break;
                 for (int x = blockStartX; x < blockEndX; x += boundaryStep)
                 {
-                    if (x + boundaryStep > blockEndX)
-                        break;
-                    
-                    int z = blockStartZ;
-                    if (z + boundaryStep > blockEndZ)
-                        break;
-                    
-                    uint32_t topLeft = z * m_params.width + x;
-                    uint32_t topRight = z * m_params.width + (x + boundaryStep);
-                    uint32_t bottomLeft = (z + boundaryStep) * m_params.width + x;
-                    uint32_t bottomRight = (z + boundaryStep) * m_params.width + (x + boundaryStep);
-                    
-                    if (topRight < m_vertices.size() && 
-                        bottomLeft < m_vertices.size() && 
-                        bottomRight < m_vertices.size())
+                    if (x + boundaryStep <= blockEndX)
                     {
-                        allLODIndices[lod].push_back(topLeft);
-                        allLODIndices[lod].push_back(bottomLeft);
-                        allLODIndices[lod].push_back(topRight);
-                        
-                        allLODIndices[lod].push_back(topRight);
-                        allLODIndices[lod].push_back(bottomLeft);
-                        allLODIndices[lod].push_back(bottomRight);
+                        AddQuad(x, z, x + boundaryStep, z + boundaryStep);
                     }
                 }
             }
             
-            // 底部边界行（最后一行，从blockEndZ-1开始向上）
-            // blockEndZ是结束顶点坐标（包含），所以最后一个顶点的索引是blockEndZ
-            // 底部边界行应该覆盖从blockEndZ-1到blockEndZ的区域
-            if (blockEndZ > blockStartZ + boundaryStep)
+            // 底部边界区域（从blockEndZ-boundaryWidth到blockEndZ）
+            int bottomBoundaryStartZ = blockEndZ - boundaryWidth;
+            if (bottomBoundaryStartZ < blockStartZ)
+                bottomBoundaryStartZ = blockStartZ;
+            for (int z = bottomBoundaryStartZ; z < blockEndZ; z += boundaryStep)
             {
+                if (z + boundaryStep > blockEndZ)
+                    break;
                 for (int x = blockStartX; x < blockEndX; x += boundaryStep)
                 {
-                    if (x + boundaryStep > blockEndX)
-                        break;
-                    
-                    // 底部边界：从blockEndZ-1向上，确保不超出范围
-                    int z = blockEndZ - boundaryStep;
-                    if (z < blockStartZ || z + boundaryStep > blockEndZ)
-                        continue;  // 跳过无效的边界
-                    
-                    uint32_t topLeft = z * m_params.width + x;
-                    uint32_t topRight = z * m_params.width + (x + boundaryStep);
-                    uint32_t bottomLeft = (z + boundaryStep) * m_params.width + x;
-                    uint32_t bottomRight = (z + boundaryStep) * m_params.width + (x + boundaryStep);
-                    
-                    if (topRight < m_vertices.size() && 
-                        bottomLeft < m_vertices.size() && 
-                        bottomRight < m_vertices.size())
+                    if (x + boundaryStep <= blockEndX)
                     {
-                        allLODIndices[lod].push_back(topLeft);
-                        allLODIndices[lod].push_back(bottomLeft);
-                        allLODIndices[lod].push_back(topRight);
-                        
-                        allLODIndices[lod].push_back(topRight);
-                        allLODIndices[lod].push_back(bottomLeft);
-                        allLODIndices[lod].push_back(bottomRight);
+                        AddQuad(x, z, x + boundaryStep, z + boundaryStep);
                     }
                 }
             }
             
-            // 左侧边界列（不包括已处理的顶部和底部顶点）
-            if (blockStartX < blockEndX)
+            // 左侧边界区域（从blockStartX到blockStartX+boundaryWidth，不包括已处理的顶部和底部区域）
+            int leftBoundaryEndX = blockStartX + boundaryWidth;
+            if (leftBoundaryEndX > blockEndX)
+                leftBoundaryEndX = blockEndX;
+            for (int x = blockStartX; x < leftBoundaryEndX; x += boundaryStep)
             {
-                for (int z = blockStartZ + boundaryStep; z < blockEndZ - boundaryStep; z += boundaryStep)
+                if (x + boundaryStep > leftBoundaryEndX)
+                    break;
+                // 跳过顶部和底部边界区域（已经处理过）
+                for (int z = topBoundaryEndZ; z < bottomBoundaryStartZ; z += boundaryStep)
                 {
-                    if (z + boundaryStep > blockEndZ - boundaryStep)
+                    if (z + boundaryStep > bottomBoundaryStartZ)
                         break;
-                    
-                    int x = blockStartX;
-                    
-                    uint32_t topLeft = z * m_params.width + x;
-                    uint32_t topRight = z * m_params.width + (x + boundaryStep);
-                    uint32_t bottomLeft = (z + boundaryStep) * m_params.width + x;
-                    uint32_t bottomRight = (z + boundaryStep) * m_params.width + (x + boundaryStep);
-                    
-                    if (topRight < m_vertices.size() && 
-                        bottomLeft < m_vertices.size() && 
-                        bottomRight < m_vertices.size())
-                    {
-                        allLODIndices[lod].push_back(topLeft);
-                        allLODIndices[lod].push_back(bottomLeft);
-                        allLODIndices[lod].push_back(topRight);
-                        
-                        allLODIndices[lod].push_back(topRight);
-                        allLODIndices[lod].push_back(bottomLeft);
-                        allLODIndices[lod].push_back(bottomRight);
-                    }
+                    AddQuad(x, z, x + boundaryStep, z + boundaryStep);
                 }
             }
             
-            // 右侧边界列（不包括已处理的顶部和底部顶点）
-            if (blockEndX > blockStartX + boundaryStep)
+            // 右侧边界区域（从blockEndX-boundaryWidth到blockEndX，不包括已处理的顶部和底部区域）
+            int rightBoundaryStartX = blockEndX - boundaryWidth;
+            if (rightBoundaryStartX < blockStartX)
+                rightBoundaryStartX = blockStartX;
+            for (int x = rightBoundaryStartX; x < blockEndX; x += boundaryStep)
             {
-                for (int z = blockStartZ + boundaryStep; z < blockEndZ - boundaryStep; z += boundaryStep)
+                if (x + boundaryStep > blockEndX)
+                    break;
+                // 跳过顶部和底部边界区域（已经处理过）
+                for (int z = topBoundaryEndZ; z < bottomBoundaryStartZ; z += boundaryStep)
                 {
-                    if (z + boundaryStep > blockEndZ - boundaryStep)
+                    if (z + boundaryStep > bottomBoundaryStartZ)
                         break;
-                    
-                    // 右侧边界：从blockEndX-1向左，确保不超出范围
-                    int x = blockEndX - boundaryStep;
-                    if (x < blockStartX || x + boundaryStep > blockEndX)
-                        continue;  // 跳过无效的边界
-                    
-                    uint32_t topLeft = z * m_params.width + x;
-                    uint32_t topRight = z * m_params.width + (x + boundaryStep);
-                    uint32_t bottomLeft = (z + boundaryStep) * m_params.width + x;
-                    uint32_t bottomRight = (z + boundaryStep) * m_params.width + (x + boundaryStep);
-                    
-                    if (topRight < m_vertices.size() && 
-                        bottomLeft < m_vertices.size() && 
-                        bottomRight < m_vertices.size())
-                    {
-                        allLODIndices[lod].push_back(topLeft);
-                        allLODIndices[lod].push_back(bottomLeft);
-                        allLODIndices[lod].push_back(topRight);
-                        
-                        allLODIndices[lod].push_back(topRight);
-                        allLODIndices[lod].push_back(bottomLeft);
-                        allLODIndices[lod].push_back(bottomRight);
-                    }
+                    AddQuad(x, z, x + boundaryStep, z + boundaryStep);
                 }
             }
             
             // 2. 生成内部区域的三角形（使用当前LOD的步长）
-            int innerStartZ = blockStartZ + boundaryStep;
-            int innerEndZ = blockEndZ - boundaryStep;
-            int innerStartX = blockStartX + boundaryStep;
-            int innerEndX = blockEndX - boundaryStep;
-            
             // 只有当内部区域足够大时才生成
             if (innerStartZ < innerEndZ && innerStartX < innerEndX)
             {
+                // 使用当前LOD的步长生成内部区域
+                // 即使内部区域较小，也尝试使用当前LOD的步长，以保持LOD级别的一致性
                 for (int z = innerStartZ; z < innerEndZ; z += step)
                 {
+                    // 如果当前行无法容纳一个完整的step，跳过
                     if (z + step > innerEndZ)
                         break;
                         
                     for (int x = innerStartX; x < innerEndX; x += step)
                     {
+                        // 如果当前列无法容纳一个完整的step，跳过
                         if (x + step > innerEndX)
                             break;
                         
-                        uint32_t topLeft = z * m_params.width + x;
-                        uint32_t topRight = z * m_params.width + (x + step);
-                        uint32_t bottomLeft = (z + step) * m_params.width + x;
-                        uint32_t bottomRight = (z + step) * m_params.width + (x + step);
-                        
-                        if (topRight >= m_vertices.size() || 
-                            bottomLeft >= m_vertices.size() || 
-                            bottomRight >= m_vertices.size())
-                            continue;
-                        
-                        allLODIndices[lod].push_back(topLeft);
-                        allLODIndices[lod].push_back(bottomLeft);
-                        allLODIndices[lod].push_back(topRight);
-                        
-                        allLODIndices[lod].push_back(topRight);
-                        allLODIndices[lod].push_back(bottomLeft);
-                        allLODIndices[lod].push_back(bottomRight);
+                        AddQuad(x, z, x + step, z + step);
                     }
                 }
             }
@@ -775,6 +737,7 @@ void Terrain::SelectLODPatches(const DirectX::XMFLOAT3& cameraPosition, std::vec
 {
     visiblePatches.clear();
     
+    // 第一遍：根据距离计算每个块的理想LOD级别
     for (auto& patch : m_patches)
     {
         int lod;
@@ -811,9 +774,97 @@ void Terrain::SelectLODPatches(const DirectX::XMFLOAT3& cameraPosition, std::vec
         }
         
         patch.lodLevel = lod;
+    }
+    
+    // 第二遍：确保相邻块的LOD级别差异不超过1（CDLOD的重要特性）
+    // 这样可以避免视觉上的突变
+    bool changed = true;
+    int iterations = 0;
+    const int maxIterations = 10;  // 防止无限循环
+    
+    while (changed && iterations < maxIterations)
+    {
+        changed = false;
+        iterations++;
+        
+        for (auto& patch : m_patches)
+        {
+            int currentLod = patch.lodLevel;
+            bool hasNeighbors = false;
+            int minNeighborLod = MAX_LOD_LEVELS;
+            int maxNeighborLod = -1;
+            
+            // 检查相邻块（上下左右）
+            for (auto& otherPatch : m_patches)
+            {
+                if (&otherPatch == &patch)
+                    continue;
+                
+                // 检查是否是相邻块
+                bool isNeighbor = false;
+                if (otherPatch.patchX == patch.patchX)
+                {
+                    // 同一列
+                    if (otherPatch.patchZ == patch.patchZ - 1 || otherPatch.patchZ == patch.patchZ + 1)
+                        isNeighbor = true;
+                }
+                else if (otherPatch.patchZ == patch.patchZ)
+                {
+                    // 同一行
+                    if (otherPatch.patchX == patch.patchX - 1 || otherPatch.patchX == patch.patchX + 1)
+                        isNeighbor = true;
+                }
+                
+                if (isNeighbor)
+                {
+                    hasNeighbors = true;
+                    if (otherPatch.lodLevel < minNeighborLod)
+                        minNeighborLod = otherPatch.lodLevel;
+                    if (otherPatch.lodLevel > maxNeighborLod)
+                        maxNeighborLod = otherPatch.lodLevel;
+                }
+            }
+            
+            // 如果没有相邻块，跳过调整（边界块）
+            if (!hasNeighbors)
+                continue;
+            
+            // CDLOD约束：相邻块的LOD级别差异不能超过1
+            // 如果当前块的LOD级别与相邻块差异超过1，需要调整当前块
+            int newLod = currentLod;
+            
+            // 如果当前块的LOD级别比相邻块的最大LOD级别高2或更多，需要降低
+            if (currentLod > maxNeighborLod + 1)
+            {
+                newLod = maxNeighborLod + 1;
+            }
+            // 如果当前块的LOD级别比相邻块的最小LOD级别低2或更多，需要提高
+            else if (currentLod < minNeighborLod - 1)
+            {
+                newLod = minNeighborLod - 1;
+            }
+            
+            // 确保LOD级别在有效范围内
+            if (newLod < 0)
+                newLod = 0;
+            if (newLod >= MAX_LOD_LEVELS)
+                newLod = MAX_LOD_LEVELS - 1;
+            
+            if (newLod != currentLod)
+            {
+                patch.lodLevel = newLod;
+                changed = true;
+            }
+        }
+    }
+    
+    // 第三遍：收集所有有效的可见块
+    for (const auto& patch : m_patches)
+    {
+        int lod = patch.lodLevel;
         
         // 检查这个LOD级别是否有有效的索引范围
-        if (lod < MAX_LOD_LEVELS && patch.lodRanges[lod].indexCount > 0)
+        if (lod < MAX_LOD_LEVELS && lod >= 0 && patch.lodRanges[lod].indexCount > 0)
         {
             visiblePatches.push_back(patch);
         }
