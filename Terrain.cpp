@@ -496,18 +496,160 @@ void Terrain::GeneratePatchIndices(ID3D11Device* device)
             int blockEndZ = patch.endZ;
             
             // 生成块内的索引（确保不跨越块边界）
-            // 修复LOD缝隙：对于非最高LOD，边界区域使用细步长（step=1），内部区域使用粗步长
-            if (lod == 0)
+            // CDLOD标准做法：边界区域总是使用最细步长（step=1），内部区域使用当前LOD的步长
+            // 这样可以确保与任何相邻LOD级别都能无缝连接
+            
+            // 边界步长：总是使用最细步长，确保与任何LOD级别都能无缝连接
+            const int boundaryStep = 1;
+            
+            // 1. 生成边界区域的三角形（使用step=1）
+            // 顶部边界行
+            if (blockStartZ < blockEndZ)
             {
-                // LOD 0：使用完整步长，生成所有三角形
-                for (int z = blockStartZ; z < blockEndZ; z += step)
+                for (int x = blockStartX; x < blockEndX; x += boundaryStep)
                 {
-                    if (z + step > blockEndZ)
+                    if (x + boundaryStep > blockEndX)
+                        break;
+                    
+                    int z = blockStartZ;
+                    if (z + boundaryStep > blockEndZ)
+                        break;
+                    
+                    uint32_t topLeft = z * m_params.width + x;
+                    uint32_t topRight = z * m_params.width + (x + boundaryStep);
+                    uint32_t bottomLeft = (z + boundaryStep) * m_params.width + x;
+                    uint32_t bottomRight = (z + boundaryStep) * m_params.width + (x + boundaryStep);
+                    
+                    if (topRight < m_vertices.size() && 
+                        bottomLeft < m_vertices.size() && 
+                        bottomRight < m_vertices.size())
+                    {
+                        allLODIndices[lod].push_back(topLeft);
+                        allLODIndices[lod].push_back(bottomLeft);
+                        allLODIndices[lod].push_back(topRight);
+                        
+                        allLODIndices[lod].push_back(topRight);
+                        allLODIndices[lod].push_back(bottomLeft);
+                        allLODIndices[lod].push_back(bottomRight);
+                    }
+                }
+            }
+            
+            // 底部边界行（最后一行，从blockEndZ-1开始向上）
+            // blockEndZ是结束顶点坐标（包含），所以最后一个顶点的索引是blockEndZ
+            // 底部边界行应该覆盖从blockEndZ-1到blockEndZ的区域
+            if (blockEndZ > blockStartZ + boundaryStep)
+            {
+                for (int x = blockStartX; x < blockEndX; x += boundaryStep)
+                {
+                    if (x + boundaryStep > blockEndX)
+                        break;
+                    
+                    // 底部边界：从blockEndZ-1向上，确保不超出范围
+                    int z = blockEndZ - boundaryStep;
+                    if (z < blockStartZ || z + boundaryStep > blockEndZ)
+                        continue;  // 跳过无效的边界
+                    
+                    uint32_t topLeft = z * m_params.width + x;
+                    uint32_t topRight = z * m_params.width + (x + boundaryStep);
+                    uint32_t bottomLeft = (z + boundaryStep) * m_params.width + x;
+                    uint32_t bottomRight = (z + boundaryStep) * m_params.width + (x + boundaryStep);
+                    
+                    if (topRight < m_vertices.size() && 
+                        bottomLeft < m_vertices.size() && 
+                        bottomRight < m_vertices.size())
+                    {
+                        allLODIndices[lod].push_back(topLeft);
+                        allLODIndices[lod].push_back(bottomLeft);
+                        allLODIndices[lod].push_back(topRight);
+                        
+                        allLODIndices[lod].push_back(topRight);
+                        allLODIndices[lod].push_back(bottomLeft);
+                        allLODIndices[lod].push_back(bottomRight);
+                    }
+                }
+            }
+            
+            // 左侧边界列（不包括已处理的顶部和底部顶点）
+            if (blockStartX < blockEndX)
+            {
+                for (int z = blockStartZ + boundaryStep; z < blockEndZ - boundaryStep; z += boundaryStep)
+                {
+                    if (z + boundaryStep > blockEndZ - boundaryStep)
+                        break;
+                    
+                    int x = blockStartX;
+                    
+                    uint32_t topLeft = z * m_params.width + x;
+                    uint32_t topRight = z * m_params.width + (x + boundaryStep);
+                    uint32_t bottomLeft = (z + boundaryStep) * m_params.width + x;
+                    uint32_t bottomRight = (z + boundaryStep) * m_params.width + (x + boundaryStep);
+                    
+                    if (topRight < m_vertices.size() && 
+                        bottomLeft < m_vertices.size() && 
+                        bottomRight < m_vertices.size())
+                    {
+                        allLODIndices[lod].push_back(topLeft);
+                        allLODIndices[lod].push_back(bottomLeft);
+                        allLODIndices[lod].push_back(topRight);
+                        
+                        allLODIndices[lod].push_back(topRight);
+                        allLODIndices[lod].push_back(bottomLeft);
+                        allLODIndices[lod].push_back(bottomRight);
+                    }
+                }
+            }
+            
+            // 右侧边界列（不包括已处理的顶部和底部顶点）
+            if (blockEndX > blockStartX + boundaryStep)
+            {
+                for (int z = blockStartZ + boundaryStep; z < blockEndZ - boundaryStep; z += boundaryStep)
+                {
+                    if (z + boundaryStep > blockEndZ - boundaryStep)
+                        break;
+                    
+                    // 右侧边界：从blockEndX-1向左，确保不超出范围
+                    int x = blockEndX - boundaryStep;
+                    if (x < blockStartX || x + boundaryStep > blockEndX)
+                        continue;  // 跳过无效的边界
+                    
+                    uint32_t topLeft = z * m_params.width + x;
+                    uint32_t topRight = z * m_params.width + (x + boundaryStep);
+                    uint32_t bottomLeft = (z + boundaryStep) * m_params.width + x;
+                    uint32_t bottomRight = (z + boundaryStep) * m_params.width + (x + boundaryStep);
+                    
+                    if (topRight < m_vertices.size() && 
+                        bottomLeft < m_vertices.size() && 
+                        bottomRight < m_vertices.size())
+                    {
+                        allLODIndices[lod].push_back(topLeft);
+                        allLODIndices[lod].push_back(bottomLeft);
+                        allLODIndices[lod].push_back(topRight);
+                        
+                        allLODIndices[lod].push_back(topRight);
+                        allLODIndices[lod].push_back(bottomLeft);
+                        allLODIndices[lod].push_back(bottomRight);
+                    }
+                }
+            }
+            
+            // 2. 生成内部区域的三角形（使用当前LOD的步长）
+            int innerStartZ = blockStartZ + boundaryStep;
+            int innerEndZ = blockEndZ - boundaryStep;
+            int innerStartX = blockStartX + boundaryStep;
+            int innerEndX = blockEndX - boundaryStep;
+            
+            // 只有当内部区域足够大时才生成
+            if (innerStartZ < innerEndZ && innerStartX < innerEndX)
+            {
+                for (int z = innerStartZ; z < innerEndZ; z += step)
+                {
+                    if (z + step > innerEndZ)
                         break;
                         
-                    for (int x = blockStartX; x < blockEndX; x += step)
+                    for (int x = innerStartX; x < innerEndX; x += step)
                     {
-                        if (x + step > blockEndX)
+                        if (x + step > innerEndX)
                             break;
                         
                         uint32_t topLeft = z * m_params.width + x;
@@ -527,90 +669,6 @@ void Terrain::GeneratePatchIndices(ID3D11Device* device)
                         allLODIndices[lod].push_back(topRight);
                         allLODIndices[lod].push_back(bottomLeft);
                         allLODIndices[lod].push_back(bottomRight);
-                    }
-                }
-            }
-            else
-            {
-                // LOD > 0：边界区域使用step=1，内部区域使用粗步长
-                // 首先处理边界区域（使用step=1确保无缝）
-                int boundaryStep = 1;
-                
-                // 顶部和底部边界行
-                for (int z = blockStartZ; z <= blockEndZ - boundaryStep; z += boundaryStep)
-                {
-                    if (z + boundaryStep > blockEndZ)
-                        break;
-                    
-                    bool isBoundaryRow = (z == blockStartZ || z + boundaryStep == blockEndZ);
-                    
-                    for (int x = blockStartX; x < blockEndX; x += boundaryStep)
-                    {
-                        if (x + boundaryStep > blockEndX)
-                            break;
-                        
-                        bool isBoundaryCol = (x == blockStartX || x + boundaryStep == blockEndX);
-                        
-                        // 只在边界行或边界列生成三角形
-                        if (isBoundaryRow || isBoundaryCol)
-                        {
-                            uint32_t topLeft = z * m_params.width + x;
-                            uint32_t topRight = z * m_params.width + (x + boundaryStep);
-                            uint32_t bottomLeft = (z + boundaryStep) * m_params.width + x;
-                            uint32_t bottomRight = (z + boundaryStep) * m_params.width + (x + boundaryStep);
-                            
-                            if (topRight >= m_vertices.size() || 
-                                bottomLeft >= m_vertices.size() || 
-                                bottomRight >= m_vertices.size())
-                                continue;
-                            
-                            allLODIndices[lod].push_back(topLeft);
-                            allLODIndices[lod].push_back(bottomLeft);
-                            allLODIndices[lod].push_back(topRight);
-                            
-                            allLODIndices[lod].push_back(topRight);
-                            allLODIndices[lod].push_back(bottomLeft);
-                            allLODIndices[lod].push_back(bottomRight);
-                        }
-                    }
-                }
-                
-                // 然后处理内部区域（使用粗步长）
-                int innerStartZ = blockStartZ + step;
-                int innerEndZ = blockEndZ - step;
-                int innerStartX = blockStartX + step;
-                int innerEndX = blockEndX - step;
-                
-                if (innerStartZ < innerEndZ && innerStartX < innerEndX)
-                {
-                    for (int z = innerStartZ; z < innerEndZ; z += step)
-                    {
-                        if (z + step > innerEndZ)
-                            break;
-                            
-                        for (int x = innerStartX; x < innerEndX; x += step)
-                        {
-                            if (x + step > innerEndX)
-                                break;
-                            
-                            uint32_t topLeft = z * m_params.width + x;
-                            uint32_t topRight = z * m_params.width + (x + step);
-                            uint32_t bottomLeft = (z + step) * m_params.width + x;
-                            uint32_t bottomRight = (z + step) * m_params.width + (x + step);
-                            
-                            if (topRight >= m_vertices.size() || 
-                                bottomLeft >= m_vertices.size() || 
-                                bottomRight >= m_vertices.size())
-                                continue;
-                            
-                            allLODIndices[lod].push_back(topLeft);
-                            allLODIndices[lod].push_back(bottomLeft);
-                            allLODIndices[lod].push_back(topRight);
-                            
-                            allLODIndices[lod].push_back(topRight);
-                            allLODIndices[lod].push_back(bottomLeft);
-                            allLODIndices[lod].push_back(bottomRight);
-                        }
                     }
                 }
             }
