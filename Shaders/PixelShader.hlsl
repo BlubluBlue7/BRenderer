@@ -19,41 +19,29 @@ cbuffer LightBuffer : register(b1)
     // 为了与C++结构完全匹配，我们使用float4，只使用xyz分量
     
     float4 lightDirection;  // 光源方向（归一化的方向向量，指向光源）- 只使用xyz
-    float lightIntensity;   // 光源强度 (4 bytes) - 在下一个16字节位置
+    float lightIntensity;   // 光源强度 (4 bytes)
     float padding1a;        // 对齐填充 (4 bytes)
     float padding1b;        // 对齐填充 (4 bytes)
-    float padding1c;        // 对齐填充 (4 bytes) -> 总共32字节
+    float padding1c;        // 对齐填充 (4 bytes) -> 总共32字节（float需要对齐到16字节边界）
     
-    float4 lightColor;      // 光源颜色和强度（RGB）- 只使用xyz
-    float padding1;         // 对齐填充 (4 bytes)
-    float padding1d;        // 对齐填充 (4 bytes)
-    float padding1e;        // 对齐填充 (4 bytes)
-    float padding1f;        // 对齐填充 (4 bytes) -> 总共32字节
+    float4 lightColor;      // 光源颜色和强度（RGB）- 只使用xyz，float4本身已对齐，无需额外padding
     
-    float4 cameraPosition;  // 相机位置（世界空间）- 只使用xyz
-    float padding2;         // 对齐填充 (4 bytes)
-    float padding2a;        // 对齐填充 (4 bytes)
-    float padding2b;        // 对齐填充 (4 bytes)
-    float padding2c;        // 对齐填充 (4 bytes) -> 总共32字节
+    float4 cameraPosition;  // 相机位置（世界空间）- 只使用xyz，float4本身已对齐，无需额外padding
     
     // PBR 材质参数
-    float4 albedo;          // 反照率（基础颜色）- 只使用xyz
+    float4 albedo;          // 反照率（基础颜色）- 只使用xyz，float4本身已对齐，无需额外padding
     float metallic;         // 金属度（0.0 = 非金属，1.0 = 金属）(4 bytes)
     float padding2d;        // 对齐填充 (4 bytes)
     float padding2e;        // 对齐填充 (4 bytes)
-    float padding2f;        // 对齐填充 (4 bytes) -> 总共32字节
+    float padding2f;        // 对齐填充 (4 bytes) -> 总共32字节（float需要对齐到16字节边界）
     
     float roughness;        // 粗糙度（0.0 = 完全光滑，1.0 = 完全粗糙）(4 bytes)
     float padding3a;        // 对齐填充 (4 bytes)
     float padding3b;        // 对齐填充 (4 bytes)
-    float padding3c;        // 对齐填充 (4 bytes) -> 16 bytes total
+    float padding3c;        // 对齐填充 (4 bytes) -> 16 bytes total（float需要对齐到16字节边界）
     
     // 环境光参数
-    float4 ambientColor;    // 环境光颜色 - 只使用xyz
-    float padding4;          // 对齐填充 (4 bytes)
-    float padding4a;        // 对齐填充 (4 bytes)
-    float padding4b;        // 对齐填充 (4 bytes)
-    float padding4c;        // 对齐填充 (4 bytes) -> 总共32字节
+    float4 ambientColor;    // 环境光颜色 - 只使用xyz，float4本身已对齐，无需额外padding
 };
 
 // 像素着色器输入结构体（从顶点着色器传递过来）

@@ -47,41 +47,29 @@ struct alignas(16) LightBuffer
     // 为了完全匹配，我们在C++和HLSL中都使用float4/XMFLOAT4
     
     XMFLOAT4 lightDirection;  // 光源方向 (16 bytes) - 只使用xyz分量
-    float lightIntensity;      // 光源强度 (4 bytes) -> 20 bytes，但会被对齐到下一个16字节边界
+    float lightIntensity;      // 光源强度 (4 bytes)
     float padding1a;           // 对齐填充 (4 bytes)
     float padding1b;           // 对齐填充 (4 bytes)
-    float padding1c;           // 对齐填充 (4 bytes) -> 总共32字节（匹配HLSL的float3对齐）
+    float padding1c;           // 对齐填充 (4 bytes) -> 总共32字节（float需要对齐到16字节边界）
     
-    XMFLOAT4 lightColor;       // 光源颜色 (16 bytes) - 只使用xyz分量
-    float padding1;            // 对齐填充 (4 bytes)
-    float padding1d;           // 对齐填充 (4 bytes)
-    float padding1e;           // 对齐填充 (4 bytes)
-    float padding1f;           // 对齐填充 (4 bytes) -> 总共32字节
+    XMFLOAT4 lightColor;       // 光源颜色 (16 bytes) - 只使用xyz分量，float4本身已对齐，无需额外padding
     
-    XMFLOAT4 cameraPosition;   // 相机位置 (16 bytes) - 只使用xyz分量
-    float padding2;            // 对齐填充 (4 bytes)
-    float padding2a;           // 对齐填充 (4 bytes)
-    float padding2b;           // 对齐填充 (4 bytes)
-    float padding2c;           // 对齐填充 (4 bytes) -> 总共32字节
+    XMFLOAT4 cameraPosition;   // 相机位置 (16 bytes) - 只使用xyz分量，float4本身已对齐，无需额外padding
     
     // PBR 材质参数
-    XMFLOAT4 albedo;           // 反照率（基础颜色）(16 bytes) - 只使用xyz分量
+    XMFLOAT4 albedo;           // 反照率（基础颜色）(16 bytes) - 只使用xyz分量，float4本身已对齐，无需额外padding
     float metallic;            // 金属度 (4 bytes)
     float padding2d;           // 对齐填充 (4 bytes)
     float padding2e;           // 对齐填充 (4 bytes)
-    float padding2f;           // 对齐填充 (4 bytes) -> 总共32字节
+    float padding2f;           // 对齐填充 (4 bytes) -> 总共32字节（float需要对齐到16字节边界）
     
     float roughness;           // 粗糙度 (4 bytes)
     float padding3a;           // 对齐填充 (4 bytes)
     float padding3b;           // 对齐填充 (4 bytes)
-    float padding3c;           // 对齐填充 (4 bytes) -> 16 bytes total
+    float padding3c;           // 对齐填充 (4 bytes) -> 16 bytes total（float需要对齐到16字节边界）
     
-    XMFLOAT4 ambientColor;     // 环境光颜色 (16 bytes) - 只使用xyz分量
-    float padding4;            // 对齐填充 (4 bytes)
-    float padding4a;           // 对齐填充 (4 bytes)
-    float padding4b;           // 对齐填充 (4 bytes)
-    float padding4c;           // 对齐填充 (4 bytes) -> 总共32字节
-    // 总共: 16 * 6 = 96 bytes (16字节的倍数)
+    XMFLOAT4 ambientColor;     // 环境光颜色 (16 bytes) - 只使用xyz分量，float4本身已对齐，无需额外padding
+    // 总共: 32 + 16 + 16 + 32 + 16 + 16 = 128 bytes (16字节的倍数)
 };
 
 // ============================================================================
@@ -1936,7 +1924,6 @@ void Renderer::UpdateConstantBuffers(float deltaTime)
         lb->padding3a = 0.0f;
         lb->padding3b = 0.0f;
         lb->padding3c = 0.0f;
-        lb->padding4 = 0.0f;
         
         // ========================================================================
         // 相机位置
