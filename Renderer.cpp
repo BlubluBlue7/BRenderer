@@ -2763,21 +2763,51 @@ void Renderer::RenderSkybox()
 }
 
 // ============================================================================
-// 初始化地形
+// 初始化地形 (CDLOD系统)
 // ============================================================================
 bool Renderer::InitializeTerrain()
 {
     // 创建地形对象
     m_terrain = new Terrain();
     
-    // 设置地形参数
+    // ========================================================================
+    // 设置超大规模CDLOD地形参数
+    // ========================================================================
     TerrainParams params;
-    params.width = 256;          // 高度图宽度（顶点数）
-    params.height = 256;         // 高度图高度（顶点数）
-    params.sizeX = 200.0f;       // 世界空间X方向大小（单位：米）
-    params.sizeZ = 200.0f;       // 世界空间Z方向大小（单位：米）
-    params.heightScale = 30.0f;  // 高度缩放因子
-    params.heightOffset = 0.0f;  // 高度偏移量
+    params.heightmapWidth = 1025;        // 高度图宽度（像素），2^n+1 格式最优
+    params.heightmapHeight = 1025;       // 高度图高度（像素）
+    params.worldSizeX = 4096.0f;         // 世界空间X方向大小（4公里）
+    params.worldSizeZ = 4096.0f;         // 世界空间Z方向大小（4公里）
+    params.heightScale = 400.0f;         // 高度缩放因子（400米高差）
+    params.heightOffset = 0.0f;          // 高度偏移量
+    
+    // ========================================================================
+    // 配置CDLOD设置 - 10级LOD支持超远视距
+    // ========================================================================
+    CDLODSettings& settings = m_terrain->GetSettings();
+    settings.maxLODLevels = 10;              // 10级LOD，支持2^10=1024倍缩放
+    settings.gridMeshDimension = 32;         // 每个节点32x32网格
+    settings.LOD0Range = 50.0f;              // LOD 0 可见距离50米
+    settings.LODDistanceRatio = 2.0f;        // 每级别距离翻倍
+    // LOD距离配置:
+    // LOD 0: 50m   (最高细节)
+    // LOD 1: 100m
+    // LOD 2: 200m
+    // LOD 3: 400m
+    // LOD 4: 800m
+    // LOD 5: 1600m
+    // LOD 6: 3200m
+    // LOD 7: 6400m
+    // LOD 8: 12800m
+    // LOD 9: 25600m (最远视距约25公里)
+    settings.morphStartRatio = 0.66f;        // morphing开始比例
+    settings.enableMorphing = true;          // 启用morphing
+    settings.enableFrustumCulling = true;    // 启用视锥剔除
+    settings.debugVisualization = false;     // 调试可视化
+    settings.enableLODColorDebug = false;    // LOD颜色调试
+    
+    // 打印LOD距离配置
+    settings.PrintLODRanges();
     
     // 尝试加载高度图，如果失败则使用程序化生成
     wchar_t exePath[MAX_PATH] = { 0 };
@@ -2810,7 +2840,7 @@ bool Renderer::InitializeTerrain()
             {
                 if (m_terrain->CreateFromHeightmap(m_device.Get(), path, params))
                 {
-                    OutputDebugStringW(L"Terrain loaded from heightmap: ");
+                    OutputDebugStringW(L"[CDLOD] Terrain loaded from heightmap: ");
                     OutputDebugStringW(path.c_str());
                     OutputDebugStringW(L"\n");
                     return true;
@@ -2819,37 +2849,17 @@ bool Renderer::InitializeTerrain()
         }
     }
     
-    // 如果加载高度图失败，使用程序化生成（用于测试）
-    OutputDebugStringW(L"[TERRAIN DEBUG] Heightmap not found, using procedural terrain generation.\n");
+    // 如果加载高度图失败，使用程序化生成
+    OutputDebugStringW(L"[CDLOD] Heightmap not found, using procedural terrain generation.\n");
     if (m_terrain->CreateProcedural(m_device.Get(), params))
     {
-        OutputDebugStringW(L"[TERRAIN DEBUG] Procedural terrain created successfully.\n");
+        OutputDebugStringW(L"[CDLOD] Procedural terrain created successfully.\n");
+        
+        const CDLODStats& stats = m_terrain->GetStats();
         wchar_t msg[512];
-        UINT indexCount = m_terrain->GetIndexCount();
-        swprintf_s(msg, L"[TERRAIN DEBUG] Terrain created: %d vertices, %u indices\n", 
-                   params.width * params.height, 
-                   indexCount);
+        swprintf_s(msg, L"[CDLOD] Terrain initialized: worldSize=%.0fx%.0f, heightScale=%.0f\n", 
+                   params.worldSizeX, params.worldSizeZ, params.heightScale);
         OutputDebugStringW(msg);
-        
-        // 额外验证
-        if (indexCount == 0)
-        {
-            OutputDebugStringW(L"[TERRAIN DEBUG] WARNING: Index count is 0!\n");
-        }
-        else if (indexCount > 1000000)
-        {
-            OutputDebugStringW(L"[TERRAIN DEBUG] WARNING: Index count seems too large!\n");
-        }
-        
-        // 验证缓冲区
-        if (m_terrain->GetVertexBuffer() && m_terrain->GetIndexBuffer())
-        {
-            OutputDebugStringW(L"[TERRAIN DEBUG] Terrain buffers created successfully.\n");
-        }
-        else
-        {
-            OutputDebugStringW(L"[TERRAIN DEBUG] ERROR: Terrain buffers failed to create!\n");
-        }
         
         return true;
     }
@@ -2861,43 +2871,40 @@ bool Renderer::InitializeTerrain()
 }
 
 // ============================================================================
-// 渲染地形
+// 渲染地形 (CDLOD系统)
 // ============================================================================
 void Renderer::RenderTerrain()
 {
     if (!m_terrain)
     {
-        // 调试：输出地形未创建
         static bool warned = false;
         if (!warned)
         {
-            OutputDebugStringW(L"[TERRAIN DEBUG] RenderTerrain: Terrain is null!\n");
+            OutputDebugStringW(L"[CDLOD] RenderTerrain: Terrain is null!\n");
             warned = true;
         }
         return;
     }
     
-    // 调试：检查地形资源
-    if (!m_terrain->GetVertexBuffer() || !m_terrain->GetIndexBuffer())
+    // 检查地形资源
+    if (!m_terrain->GetVertexBuffer())
     {
         static bool warned = false;
         if (!warned)
         {
-            OutputDebugStringW(L"[TERRAIN DEBUG] Terrain buffers are null!\n");
-            if (!m_terrain->GetVertexBuffer()) OutputDebugStringW(L"  - Vertex buffer is null\n");
-            if (!m_terrain->GetIndexBuffer()) OutputDebugStringW(L"  - Index buffer is null\n");
+            OutputDebugStringW(L"[CDLOD] Terrain mesh template not created!\n");
             warned = true;
         }
         return;
     }
     
-    // 使用地形专用的shader和输入布局
+    // 检查shader资源
     if (!m_terrainVS || !m_terrainPS || !m_terrainInputLayout)
     {
         static bool warned = false;
         if (!warned)
         {
-            OutputDebugStringW(L"[TERRAIN DEBUG] Terrain shaders not created!\n");
+            OutputDebugStringW(L"[CDLOD] Terrain shaders not created!\n");
             warned = true;
         }
         return;
@@ -2907,16 +2914,14 @@ void Renderer::RenderTerrain()
     Microsoft::WRL::ComPtr<ID3D11RasterizerState> oldRasterizerState;
     m_context->RSGetState(oldRasterizerState.GetAddressOf());
     
-    // 根据线框模式设置光栅化状态
+    // 设置光栅化状态
     if (m_terrainWireframe && m_terrainWireframeRasterizerState)
     {
         m_context->RSSetState(m_terrainWireframeRasterizerState.Get());
     }
     else
     {
-        // 使用默认填充模式（不设置状态，使用默认的填充模式）
-        // 或者可以创建一个填充模式的状态
-        m_context->RSSetState(nullptr);  // 使用默认状态
+        m_context->RSSetState(nullptr);
     }
     
     // 设置地形shader和输入布局
@@ -2924,263 +2929,91 @@ void Renderer::RenderTerrain()
     m_context->VSSetShader(m_terrainVS.Get(), nullptr, 0);
     m_context->PSSetShader(m_terrainPS.Get(), nullptr, 0);
     
-    // 绑定常量缓冲区到顶点着色器（register b0）
+    // 绑定常量缓冲区
     m_context->VSSetConstantBuffers(0, 1, m_constantBuffer.GetAddressOf());
-    // 绑定光照常量缓冲区到像素着色器（register b1）
     m_context->PSSetConstantBuffers(1, 1, m_lightBuffer.GetAddressOf());
     
-    // 注意：地形的顶点已经在世界空间中定义，所以需要使用单位world矩阵
-    // 这里我们临时更新常量缓冲区中的world矩阵为单位矩阵
-    // 由于地形顶点已经在世界空间，world矩阵应该是单位矩阵
+    // 获取相机矩阵
+    XMMATRIX viewMatrix;
+    XMMATRIX projMatrix;
+    XMFLOAT3 camPos(0, 100, 0);
+    
+    if (m_camera)
+    {
+        viewMatrix = m_camera->GetViewMatrix();
+        float aspect = (float)m_width / (float)m_height;
+        projMatrix = m_camera->GetProjectionMatrix(aspect);
+        camPos = m_camera->GetPosition();
+    }
+    else
+    {
+        XMVECTOR eye = XMVectorSet(0.0f, 100.0f, 100.0f, 0.0f);
+        XMVECTOR at = XMVectorSet(0.0f, 0.0f, 0.0f, 0.0f);
+        XMVECTOR up = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+        viewMatrix = XMMatrixLookAtLH(eye, at, up);
+        float aspect = (float)m_width / (float)m_height;
+        projMatrix = XMMatrixPerspectiveFovLH(XM_PI / 4.0f, aspect, 0.1f, 1000.0f);
+    }
+    
+    // 更新变换常量缓冲区（使用单位world矩阵）
     D3D11_MAPPED_SUBRESOURCE mapped;
     HRESULT hr = m_context->Map(m_constantBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
     if (SUCCEEDED(hr))
     {
         ConstantBuffer* cb = (ConstantBuffer*)mapped.pData;
         
-        // 保存当前的world矩阵（用于模型渲染）
-        XMFLOAT4X4 savedWorld = cb->world;
-        
-        // 直接从相机获取view和projection矩阵（确保使用最新的、正确的矩阵）
-        XMMATRIX viewMatrix;
-        XMMATRIX projMatrix;
-        if (m_camera)
-        {
-            viewMatrix = m_camera->GetViewMatrix();
-            float aspect = (float)m_width / (float)m_height;
-            projMatrix = m_camera->GetProjectionMatrix(aspect);
-        }
-        else
-        {
-            // 如果没有相机，使用默认值
-            XMVECTOR eye = XMVectorSet(0.0f, 0.0f, -2.0f, 0.0f);
-            XMVECTOR at = XMVectorSet(0.0f, 0.0f, 0.0f, 0.0f);
-            XMVECTOR up = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
-            viewMatrix = XMMatrixLookAtLH(eye, at, up);
-            float aspect = (float)m_width / (float)m_height;
-            projMatrix = XMMatrixPerspectiveFovLH(XM_PI / 4.0f, aspect, 0.1f, 500.0f);
-        }
-        
-        // 设置单位world矩阵（因为地形顶点已经在世界空间）
         XMMATRIX identity = XMMatrixIdentity();
         XMStoreFloat4x4(&cb->world, XMMatrixTranspose(identity));
-        
-        // 存储view和projection矩阵（转置后存储，因为HLSL使用列主序）
         XMStoreFloat4x4(&cb->view, XMMatrixTranspose(viewMatrix));
         XMStoreFloat4x4(&cb->projection, XMMatrixTranspose(projMatrix));
         
-        // 更新worldViewProj矩阵
         XMMATRIX worldViewProj = identity * viewMatrix * projMatrix;
         XMStoreFloat4x4(&cb->worldViewProj, XMMatrixTranspose(worldViewProj));
         
         m_context->Unmap(m_constantBuffer.Get(), 0);
-        
-        // 调试：检查常量缓冲区和矩阵
-        static bool cbLogged = false;
-        if (!cbLogged)
-        {
-            OutputDebugStringW(L"[TERRAIN DEBUG] Constant buffer mapped and updated successfully.\n");
-            
-            // 输出矩阵信息用于调试（直接从相机获取的矩阵）
-            wchar_t msg[512];
-            XMFLOAT4X4 viewFloat, projFloat;
-            XMStoreFloat4x4(&viewFloat, viewMatrix);  // 直接从相机获取的矩阵
-            XMStoreFloat4x4(&projFloat, projMatrix);  // 直接从相机获取的矩阵
-            
-            // 检查view矩阵的平移部分（相机位置）
-            // 对于未转置的view矩阵，平移在_41, _42, _43位置
-            swprintf_s(msg, L"[TERRAIN DEBUG] View matrix translation: (%.2f, %.2f, %.2f)\n",
-                      viewFloat._41, viewFloat._42, viewFloat._43);
-            OutputDebugStringW(msg);
-            
-            // 检查投影矩阵的near/far平面
-            // 对于DirectX透视投影矩阵：near = _43 / _33, far = _43 / (_33 - 1.0f)
-            // 注意：如果_33为0，说明投影矩阵可能有问题
-            if (projFloat._33 != 0.0f)
-            {
-                float nearPlane = projFloat._43 / projFloat._33;
-                float farPlane = projFloat._43 / (projFloat._33 - 1.0f);
-                swprintf_s(msg, L"[TERRAIN DEBUG] Projection near=%.2f, far=%.2f (from _33=%.4f, _43=%.4f)\n",
-                          nearPlane, farPlane, projFloat._33, projFloat._43);
-                OutputDebugStringW(msg);
-            }
-            else
-            {
-                swprintf_s(msg, L"[TERRAIN DEBUG] ERROR: Projection matrix _33 is zero! (_33=%.4f, _43=%.4f)\n",
-                          projFloat._33, projFloat._43);
-                OutputDebugStringW(msg);
-            }
-            
-            // 检查矩阵是否有效
-            if (isnan(projFloat._33) || isnan(projFloat._43))
-            {
-                OutputDebugStringW(L"[TERRAIN DEBUG] ERROR: Projection matrix contains NaN values!\n");
-            }
-            
-            cbLogged = true;
-        }
-        
-        // 绑定地形纹理（地形shader只需要BaseColor纹理）
-        if (m_textureSRV)
-        {
-            m_context->PSSetShaderResources(0, 1, m_textureSRV.GetAddressOf());
-        }
-        else
-        {
-            // 如果没有纹理，清除纹理绑定
-            ID3D11ShaderResourceView* nullSRV = nullptr;
-            m_context->PSSetShaderResources(0, 1, &nullSRV);
-        }
-        
-        // 绑定采样器（地形shader只需要s0）
-        if (m_samplerState)
-        {
-            m_context->PSSetSamplers(0, 1, m_samplerState.GetAddressOf());
-        }
-        
-        // 确保深度测试启用（地形渲染前）
-        m_context->OMSetDepthStencilState(m_depthStencilState.Get(), 0);
-        
-        // 绘制地形（地形会使用自己的顶点和索引缓冲区）
-        // 调试输出
-        static bool terrainDrawLogged = false;
-        if (!terrainDrawLogged)
-        {
-            wchar_t msg[512];
-            swprintf_s(msg, L"[TERRAIN DEBUG] Drawing terrain: %d indices\n", 
-                      m_terrain->GetIndexCount());
-            OutputDebugStringW(msg);
-            
-            // 检查深度状态
-            Microsoft::WRL::ComPtr<ID3D11DepthStencilState> currentDepthState;
-            UINT stencilRef;
-            m_context->OMGetDepthStencilState(currentDepthState.GetAddressOf(), &stencilRef);
-            if (currentDepthState.Get() == m_depthStencilState.Get())
-            {
-                OutputDebugStringW(L"[TERRAIN DEBUG] Depth stencil state is set correctly.\n");
-            }
-            else
-            {
-                OutputDebugStringW(L"[TERRAIN DEBUG] WARNING: Depth stencil state may not be set!\n");
-            }
-            
-            // 输出地形参数
-            const TerrainParams& params = m_terrain->GetParams();
-            swprintf_s(msg, L"[TERRAIN DEBUG] Terrain params: sizeX=%.1f, sizeZ=%.1f, heightScale=%.1f, heightOffset=%.1f\n", 
-                      params.sizeX, params.sizeZ, params.heightScale, params.heightOffset);
-            OutputDebugStringW(msg);
-            
-            // 输出地形范围
-            swprintf_s(msg, L"[TERRAIN DEBUG] Terrain range: X=[%.1f, %.1f], Z=[%.1f, %.1f], Y=[%.1f, %.1f]\n",
-                      -params.sizeX * 0.5f, params.sizeX * 0.5f,
-                      -params.sizeZ * 0.5f, params.sizeZ * 0.5f,
-                      params.heightOffset, params.heightOffset + params.heightScale);
-            OutputDebugStringW(msg);
-            
-            // 输出相机信息
-            if (m_camera)
-            {
-                XMFLOAT3 camPos = m_camera->GetPosition();
-                swprintf_s(msg, L"[TERRAIN DEBUG] Camera position: (%.1f, %.1f, %.1f)\n",
-                          camPos.x, camPos.y, camPos.z);
-                OutputDebugStringW(msg);
-                
-                // 检查地形是否在相机视野内
-                // 地形中心在(0, 15, 0)，范围是X=[-100,100], Z=[-100,100], Y=[0,30]
-                // 相机在(0, 100, 100)，应该能看到地形
-                float terrainCenterY = params.heightOffset + params.heightScale * 0.5f;
-                swprintf_s(msg, L"[TERRAIN DEBUG] Terrain center Y: %.1f, Camera Y: %.1f (should see terrain if camera is above)\n",
-                          terrainCenterY, camPos.y);
-                OutputDebugStringW(msg);
-            }
-            
-            terrainDrawLogged = true;
-        }
-        
-        // 每帧输出（用于确认是否在绘制）
-        static int frameCount = 0;
-        frameCount++;
-        if (frameCount % 60 == 0)  // 每60帧输出一次
-        {
-            wchar_t msg[256];
-            swprintf_s(msg, L"[TERRAIN DEBUG] Frame %d: Calling Terrain::Render()\n", frameCount);
-            OutputDebugStringW(msg);
-        }
-        
-        // 使用CDLOD渲染（如果相机可用）
-        if (m_camera)
-        {
-            XMFLOAT3 camPos = m_camera->GetPosition();
-            m_terrain->Render(m_context.Get(), camPos);
-        }
-        else
-        {
-            // 回退到旧版本渲染
-            m_terrain->Render(m_context.Get());
-        }
-        
-        // 恢复原来的光栅化状态
-        if (oldRasterizerState)
-        {
-            m_context->RSSetState(oldRasterizerState.Get());
-        }
-        else
-        {
-            m_context->RSSetState(nullptr);
-        }
-        
-        // 恢复原来的world矩阵（用于模型渲染）
-        // 注意：由于UpdateConstantBuffers会在模型渲染前再次调用，这里不需要恢复
-        // 但为了保持一致性，我们仍然恢复world矩阵
-        hr = m_context->Map(m_constantBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-        if (SUCCEEDED(hr))
-        {
-            cb = (ConstantBuffer*)mapped.pData;
-            cb->world = savedWorld;
-            
-            // 重新计算worldViewProj矩阵（使用模型的world矩阵）
-            // 从相机重新获取view和projection矩阵
-            XMMATRIX worldMatrix = XMMatrixTranspose(XMLoadFloat4x4(&savedWorld));  // 转置回来
-            XMMATRIX viewMat;
-            XMMATRIX projMat;
-            if (m_camera)
-            {
-                viewMat = m_camera->GetViewMatrix();
-                float aspect = (float)m_width / (float)m_height;
-                projMat = m_camera->GetProjectionMatrix(aspect);
-            }
-            else
-            {
-                XMVECTOR eye = XMVectorSet(0.0f, 0.0f, -2.0f, 0.0f);
-                XMVECTOR at = XMVectorSet(0.0f, 0.0f, 0.0f, 0.0f);
-                XMVECTOR up = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
-                viewMat = XMMatrixLookAtLH(eye, at, up);
-                float aspect = (float)m_width / (float)m_height;
-                projMat = XMMatrixPerspectiveFovLH(XM_PI / 4.0f, aspect, 0.1f, 500.0f);
-            }
-            
-            XMMATRIX wvp = worldMatrix * viewMat * projMat;
-            XMStoreFloat4x4(&cb->worldViewProj, XMMatrixTranspose(wvp));
-            
-            // 同时更新view和projection矩阵（确保它们是最新的）
-            XMStoreFloat4x4(&cb->view, XMMatrixTranspose(viewMat));
-            XMStoreFloat4x4(&cb->projection, XMMatrixTranspose(projMat));
-            
-            m_context->Unmap(m_constantBuffer.Get(), 0);
-        }
     }
-    else
+    
+    // 绑定高度图采样器到顶点着色器
+    if (m_samplerState)
     {
-        // 调试：常量缓冲区映射失败
-        static bool mapFailedLogged = false;
-        if (!mapFailedLogged)
-        {
-            wchar_t msg[256];
-            swprintf_s(msg, L"[TERRAIN DEBUG] ERROR: Failed to map constant buffer! HRESULT: 0x%08X\n", hr);
-            OutputDebugStringW(msg);
-            mapFailedLogged = true;
-        }
+        m_context->VSSetSamplers(0, 1, m_samplerState.GetAddressOf());
+        m_context->PSSetSamplers(0, 1, m_samplerState.GetAddressOf());
     }
+    
+    // 确保深度测试启用
+    m_context->OMSetDepthStencilState(m_depthStencilState.Get(), 0);
+    
+    // 调试输出（首次和每60帧）
+    static int frameCount = 0;
+    static bool firstRender = true;
+    frameCount++;
+    
+    if (firstRender)
+    {
+        const TerrainParams& params = m_terrain->GetParams();
+        wchar_t msg[512];
+        swprintf_s(msg, L"[CDLOD] First render - Terrain: %.0fx%.0f, Height: %.0f, Camera: (%.1f, %.1f, %.1f)\n",
+                  params.worldSizeX, params.worldSizeZ, params.heightScale,
+                  camPos.x, camPos.y, camPos.z);
+        OutputDebugStringW(msg);
+        firstRender = false;
+    }
+    
+    // 使用CDLOD渲染
+    m_terrain->Render(m_context.Get(), camPos, viewMatrix, projMatrix);
+    
+    // 周期性统计输出
+    if (frameCount % 300 == 0)
+    {
+        const Terrain::RenderStats& stats = m_terrain->GetRenderStats();
+        wchar_t msg[256];
+        swprintf_s(msg, L"[CDLOD] Stats: %d nodes, %d draws, %d tris\n",
+                  stats.visiblePatches, stats.drawCalls, stats.totalTriangles);
+        OutputDebugStringW(msg);
+    }
+    
+    // 恢复光栅化状态
+    m_context->RSSetState(oldRasterizerState.Get());
 }
 
 // ============================================================================
@@ -3211,11 +3044,15 @@ void Renderer::ToggleTerrainLODLock()
 // ============================================================================
 void Renderer::SetTerrainLODLockLevel(int level)
 {
-    if (m_terrain && level >= 0 && level < 4)
+    if (m_terrain)
     {
-        m_terrain->SetLockedLODLevel(level);
-        wchar_t msg[256];
-        swprintf_s(msg, L"[TERRAIN] LOD locked to level %d\n", level);
-        OutputDebugStringW(msg);
+        const CDLODSettings& settings = m_terrain->GetSettings();
+        if (level >= 0 && level < settings.maxLODLevels)
+        {
+            m_terrain->SetLockedLODLevel(level);
+            wchar_t msg[256];
+            swprintf_s(msg, L"[CDLOD] LOD locked to level %d\n", level);
+            OutputDebugStringW(msg);
+        }
     }
 }

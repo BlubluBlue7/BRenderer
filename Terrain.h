@@ -7,6 +7,7 @@
 #include <vector>
 #include <string>
 #include <array>
+#include <memory>
 
 #include <windows.h>
 #include <d3d11.h>
@@ -16,232 +17,410 @@
 #include "Mesh.h"
 
 // ============================================================================
-// CDLOD配置参数
+// CDLOD配置参数 (Continuous Distance-Dependent Level of Detail)
+// 基于 Filip Strugar 的论文实现，扩展支持超大规模地形
 // ============================================================================
-struct CDLODConfig
+struct CDLODSettings
 {
-    int maxLODLevels = 4;
-    int patchSize = 33;
-    float lodDistanceMultiplier = 2.0f;
-    float baseLODDistance = 50.0f;
-    bool enableMorphing = true;
-    float morphStartRatio = 0.7f;
-    bool enableFrustumCulling = true;
-    bool debugMode = false;
-};
-
-// 地形参数结构
-struct TerrainParams
-{
-    int width = 256;
-    int height = 256;
-    float sizeX = 400.0f;
-    float sizeZ = 400.0f;
-    float heightScale = 30.0f;
-    float heightOffset = 0.0f;
-};
-
-constexpr int MAX_LOD_LEVELS = 4;
-
-// 边界方向枚举
-enum class BorderSide : int
-{
-    Top = 0,     // -Z方向
-    Bottom = 1,  // +Z方向
-    Left = 2,    // -X方向
-    Right = 3    // +X方向
-};
-
-// ============================================================================
-// 边界缝合配置（用于确定每条边界使用哪种缝合模式）
-// ============================================================================
-struct StitchConfig
-{
-    // 每条边界是否需要缝合（true = 邻居LOD更粗，需要缝合）
-    bool stitchTop = false;
-    bool stitchBottom = false;
-    bool stitchLeft = false;
-    bool stitchRight = false;
+    // 四叉树配置
+    int maxLODLevels = 10;                    // 最大LOD级别数 (0 = 最高细节)，支持2^10 = 1024倍缩放
+    int gridMeshDimension = 32;               // 网格模板的边长（顶点数-1），必须是2的幂
     
-    // 生成一个唯一的配置ID（0-15）
-    int GetConfigId() const
+    // 距离配置
+    float LOD0Range = 50.0f;                  // LOD 0 的可见距离范围（米）
+    float LODDistanceRatio = 2.0f;            // 相邻LOD距离范围的比率（每级别距离翻倍）
+    
+    // Morphing配置
+    float morphStartRatio = 0.66f;            // 开始morphing的距离比例 (0.66 = 在66%处开始)
+    bool enableMorphing = true;               // 是否启用morphing
+    
+    // 渲染配置
+    bool enableFrustumCulling = true;         // 是否启用视锥剔除
+    bool debugVisualization = false;          // 调试可视化
+    bool enableLODColorDebug = false;         // 启用LOD颜色调试（不同LOD显示不同颜色）
+    
+    // 计算指定LOD级别的范围距离
+    float GetLODRange(int lodLevel) const
     {
-        return (stitchTop ? 1 : 0) | 
-               (stitchBottom ? 2 : 0) | 
-               (stitchLeft ? 4 : 0) | 
-               (stitchRight ? 8 : 0);
+        return LOD0Range * powf(LODDistanceRatio, static_cast<float>(lodLevel));
+    }
+    
+    // 计算开始morphing的距离
+    float GetMorphStart(int lodLevel) const
+    {
+        float range = GetLODRange(lodLevel);
+        return range * morphStartRatio;
+    }
+    
+    // 计算结束morphing的距离（即当前LOD级别的范围）
+    float GetMorphEnd(int lodLevel) const
+    {
+        return GetLODRange(lodLevel);
+    }
+    
+    // 计算最大可见距离（最粗糙LOD的范围）
+    float GetMaxVisibleDistance() const
+    {
+        return GetLODRange(maxLODLevels - 1);
+    }
+    
+    // 打印LOD距离配置（调试用）
+    void PrintLODRanges() const
+    {
+        wchar_t msg[512];
+        swprintf_s(msg, L"[CDLOD] LOD Ranges (max distance: %.0fm):\n", GetMaxVisibleDistance());
+        OutputDebugStringW(msg);
+        
+        for (int i = 0; i < maxLODLevels; ++i)
+        {
+            float range = GetLODRange(i);
+            float morphStart = GetMorphStart(i);
+            swprintf_s(msg, L"  LOD %d: range=%.0fm, morph starts at %.0fm\n", i, range, morphStart);
+            OutputDebugStringW(msg);
+        }
     }
 };
 
 // ============================================================================
-// 地形块结构
+// 地形参数
 // ============================================================================
-struct TerrainPatch
+struct TerrainParams
 {
-    DirectX::BoundingBox boundingBox;
-    
-    float centerX, centerZ;
-    float minY, maxY;
-    
-    int patchX, patchZ;
-    int startX, startZ;
-    int endX, endZ;
-    
-    int lodLevel = 0;
-    float morphFactor = 0.0f;
-    float distanceToCamera = 0.0f;
-    
-    bool isVisible = true;
-    
-    // 邻居LOD级别（-1表示没有邻居，即边界）
-    int neighborLOD[4] = {-1, -1, -1, -1};  // Top, Bottom, Left, Right
-    
-    // 当前的缝合配置
-    StitchConfig stitchConfig;
+    int heightmapWidth = 1025;                // 高度图宽度（像素）
+    int heightmapHeight = 1025;               // 高度图高度（像素）
+    float worldSizeX = 1024.0f;               // 世界空间X大小
+    float worldSizeZ = 1024.0f;               // 世界空间Z大小
+    float heightScale = 100.0f;               // 高度缩放因子
+    float heightOffset = 0.0f;                // 高度偏移
 };
 
 // ============================================================================
-// LOD网格模板
+// CDLOD四叉树节点
+// 表示地形的一个区域，可以有4个子节点
 // ============================================================================
-struct LODMeshTemplate
+struct CDLODNode
 {
-    std::vector<uint32_t> indices;
-    Microsoft::WRL::ComPtr<ID3D11Buffer> indexBuffer;
-    UINT indexCount = 0;
-    UINT triangleCount = 0;
+    // 节点边界（世界空间）
+    float minX, minZ;                         // 节点最小坐标
+    float maxX, maxZ;                         // 节点最大坐标
+    float minY, maxY;                         // 高度范围（用于剔除）
+    
+    // 节点信息
+    int lodLevel;                             // LOD级别 (0 = 最细节)
+    int x, z;                                 // 在该LOD级别的网格坐标
+    
+    // 渲染时计算的数据
+    bool isSelected;                          // 是否被选择用于渲染
+    float morphFactor;                        // Morphing因子 (0-1)
+    float distanceToCamera;                   // 到相机的距离
+    
+    // 子节点索引（-1表示没有子节点）
+    int childIndices[4];                      // [TopLeft, TopRight, BottomLeft, BottomRight]
+    
+    // 获取节点中心
+    float GetCenterX() const { return (minX + maxX) * 0.5f; }
+    float GetCenterZ() const { return (minZ + maxZ) * 0.5f; }
+    float GetCenterY() const { return (minY + maxY) * 0.5f; }
+    
+    // 获取节点大小
+    float GetSizeX() const { return maxX - minX; }
+    float GetSizeZ() const { return maxZ - minZ; }
+    
+    // 计算到相机的距离（使用节点中心）
+    float ComputeDistance(float camX, float camY, float camZ) const
+    {
+        float dx = GetCenterX() - camX;
+        float dy = GetCenterY() - camY;
+        float dz = GetCenterZ() - camZ;
+        return sqrtf(dx * dx + dy * dy + dz * dz);
+    }
+    
+    // 获取AABB用于剔除
+    DirectX::BoundingBox GetBoundingBox() const
+    {
+        DirectX::XMFLOAT3 center(GetCenterX(), GetCenterY(), GetCenterZ());
+        DirectX::XMFLOAT3 extents(GetSizeX() * 0.5f, (maxY - minY) * 0.5f, GetSizeZ() * 0.5f);
+        return DirectX::BoundingBox(center, extents);
+    }
+    
+    CDLODNode()
+        : minX(0), minZ(0), maxX(0), maxZ(0)
+        , minY(0), maxY(0)
+        , lodLevel(0), x(0), z(0)
+        , isSelected(false), morphFactor(0), distanceToCamera(0)
+    {
+        childIndices[0] = childIndices[1] = childIndices[2] = childIndices[3] = -1;
+    }
 };
 
 // ============================================================================
-// 批次渲染数据
+// 渲染节点 - 被选择用于渲染的节点
 // ============================================================================
-struct TerrainBatch
+struct CDLODRenderNode
 {
-    int lodLevel = 0;
-    std::vector<const TerrainPatch*> patches;
-    UINT totalTriangles = 0;
+    const CDLODNode* node;                    // 指向四叉树节点
+    float morphFactor;                        // Morphing因子
+    
+    // 相邻节点的LOD级别（用于缝合）
+    // -1 = 边界（无邻居）, 其他值 = 邻居的LOD级别
+    int neighborLOD[4];                       // [Top, Bottom, Left, Right]
+    
+    CDLODRenderNode() : node(nullptr), morphFactor(0)
+    {
+        neighborLOD[0] = neighborLOD[1] = neighborLOD[2] = neighborLOD[3] = -1;
+    }
 };
 
 // ============================================================================
-// 视锥体结构
+// 视锥体
 // ============================================================================
-struct Frustum
+struct CDLODFrustum
 {
     DirectX::XMFLOAT4 planes[6];
     
     void ExtractFromMatrix(const DirectX::XMMATRIX& viewProj);
-    bool ContainsAABB(const DirectX::BoundingBox& box) const;
+    bool Intersects(const DirectX::BoundingBox& box) const;
 };
 
 // ============================================================================
-// 地形类
+// 渲染常量缓冲区 - 传递给GPU的地形渲染参数
+// ============================================================================
+struct alignas(16) TerrainCBuffer
+{
+    DirectX::XMFLOAT4 terrainScale;           // xyz: worldSize, w: heightScale
+    DirectX::XMFLOAT4 terrainOffset;          // xyz: worldOffset, w: heightOffset
+    DirectX::XMFLOAT4 morphParams;            // x: morphFactor, y: gridDim, z: lodLevel, w: unused
+    DirectX::XMFLOAT4 nodeParams;             // xy: nodeOffset, zw: nodeScale
+    DirectX::XMFLOAT4 heightmapSize;          // xy: heightmapSize, zw: 1/heightmapSize
+};
+
+// ============================================================================
+// 渲染统计
+// ============================================================================
+struct CDLODStats
+{
+    int totalNodes = 0;                       // 四叉树总节点数
+    int selectedNodes = 0;                    // 选择用于渲染的节点数
+    int culledNodes = 0;                      // 被剔除的节点数
+    int drawCalls = 0;                        // 绘制调用数
+    int triangleCount = 0;                    // 三角形数量
+    int lodDistribution[8] = {0};             // 每个LOD级别的节点数
+};
+
+// ============================================================================
+// CDLOD四叉树 - 管理地形的四叉树结构
+// ============================================================================
+class CDLODQuadTree
+{
+public:
+    CDLODQuadTree();
+    ~CDLODQuadTree();
+    
+    // 初始化四叉树
+    bool Initialize(const TerrainParams& params, const CDLODSettings& settings,
+                   const std::vector<float>& heightData);
+    
+    // 选择用于渲染的节点（主要的LOD选择算法）
+    void SelectNodes(const DirectX::XMFLOAT3& cameraPos,
+                    const CDLODFrustum* frustum,
+                    std::vector<CDLODRenderNode>& outRenderNodes);
+    
+    // 获取节点
+    const CDLODNode& GetNode(int index) const { return m_nodes[index]; }
+    int GetNodeCount() const { return static_cast<int>(m_nodes.size()); }
+    
+    // 获取根节点数量
+    int GetRootNodeCountX() const { return m_rootNodesX; }
+    int GetRootNodeCountZ() const { return m_rootNodesZ; }
+    
+private:
+    // 构建四叉树
+    void BuildQuadTree(const std::vector<float>& heightData);
+    int CreateNode(int lodLevel, int x, int z, float minX, float minZ, float maxX, float maxZ);
+    void ComputeNodeHeightRange(CDLODNode& node, const std::vector<float>& heightData);
+    
+    // 递归选择节点
+    void SelectNode(int nodeIndex, 
+                   const DirectX::XMFLOAT3& cameraPos,
+                   const CDLODFrustum* frustum,
+                   std::vector<CDLODRenderNode>& outRenderNodes);
+    
+    // 判断节点是否应该细分
+    bool ShouldRefine(const CDLODNode& node, float distance) const;
+    
+    // 计算morphing因子
+    float ComputeMorphFactor(float distance, int lodLevel) const;
+    
+    // 更新邻居LOD信息
+    void UpdateNeighborLODs(std::vector<CDLODRenderNode>& renderNodes);
+    
+private:
+    TerrainParams m_terrainParams;
+    CDLODSettings m_settings;
+    
+    std::vector<CDLODNode> m_nodes;           // 所有四叉树节点
+    std::vector<int> m_rootNodeIndices;       // 根节点索引列表
+    
+    int m_rootNodesX;                         // X方向的根节点数量
+    int m_rootNodesZ;                         // Z方向的根节点数量
+    int m_maxLODLevel;                        // 实际使用的最大LOD级别
+};
+
+// ============================================================================
+// CDLOD网格模板 - 预生成的网格索引数据
+// ============================================================================
+class CDLODMeshTemplate
+{
+public:
+    CDLODMeshTemplate();
+    ~CDLODMeshTemplate();
+    
+    // 初始化网格模板
+    bool Initialize(ID3D11Device* device, int gridDimension);
+    
+    // 获取索引缓冲区
+    // stitchMask: bit0=Top, bit1=Bottom, bit2=Left, bit3=Right
+    // 如果对应位为1，则该边界需要降低分辨率以匹配较粗糙的邻居
+    ID3D11Buffer* GetIndexBuffer(int stitchMask) const;
+    UINT GetIndexCount(int stitchMask) const;
+    
+    // 获取顶点缓冲区
+    ID3D11Buffer* GetVertexBuffer() const { return m_vertexBuffer.Get(); }
+    UINT GetVertexCount() const { return m_vertexCount; }
+    
+    int GetGridDimension() const { return m_gridDimension; }
+    
+private:
+    // 生成网格顶点（局部坐标0-1范围）
+    void GenerateVertices(std::vector<Vertex>& vertices);
+    
+    // 生成网格索引
+    void GenerateIndices(std::vector<uint32_t>& indices, int stitchMask);
+    
+    // 创建索引缓冲区
+    bool CreateIndexBuffer(ID3D11Device* device, int stitchMask);
+    
+private:
+    int m_gridDimension;                      // 网格维度（边长的单元格数）
+    
+    Microsoft::WRL::ComPtr<ID3D11Buffer> m_vertexBuffer;
+    UINT m_vertexCount;
+    
+    // 16种缝合配置的索引缓冲区
+    std::array<Microsoft::WRL::ComPtr<ID3D11Buffer>, 16> m_indexBuffers;
+    std::array<UINT, 16> m_indexCounts;
+};
+
+// ============================================================================
+// CDLOD地形主类
 // ============================================================================
 class Terrain
 {
 public:
     Terrain();
     ~Terrain();
-
-    bool CreateFromHeightmap(ID3D11Device* device, const std::wstring& heightmapPath, const TerrainParams& params);
+    
+    // 从高度图创建地形
+    bool CreateFromHeightmap(ID3D11Device* device, const std::wstring& heightmapPath, 
+                            const TerrainParams& params);
+    
+    // 程序化生成地形
     bool CreateProcedural(ID3D11Device* device, const TerrainParams& params);
     
-    void Render(ID3D11DeviceContext* context, const DirectX::XMFLOAT3& cameraPosition);
-    void Render(ID3D11DeviceContext* context, const DirectX::XMFLOAT3& cameraPosition, 
-                const DirectX::XMMATRIX& viewMatrix, const DirectX::XMMATRIX& projMatrix);
+    // 渲染地形
+    void Render(ID3D11DeviceContext* context, const DirectX::XMFLOAT3& cameraPosition,
+               const DirectX::XMMATRIX& viewMatrix, const DirectX::XMMATRIX& projMatrix);
+    
+    // 简单渲染（不使用LOD）
     void Render(ID3D11DeviceContext* context);
     
+    // 查询指定世界坐标的高度
     float GetHeightAt(float worldX, float worldZ) const;
     
+    // 访问器
     const TerrainParams& GetParams() const { return m_params; }
-    CDLODConfig& GetCDLODConfig() { return m_cdlodConfig; }
-    const CDLODConfig& GetCDLODConfig() const { return m_cdlodConfig; }
+    CDLODSettings& GetSettings() { return m_settings; }
+    const CDLODSettings& GetSettings() const { return m_settings; }
+    const CDLODStats& GetStats() const { return m_stats; }
     
-    ID3D11Buffer* GetVertexBuffer() const { return m_vertexBuffer.Get(); }
-    ID3D11Buffer* GetIndexBuffer() const { return m_indexBuffer.Get(); }
-    UINT GetIndexCount() const { return m_indexCount; }
+    // 获取高度图纹理（供着色器采样）
+    ID3D11ShaderResourceView* GetHeightmapSRV() const { return m_heightmapSRV.Get(); }
     
+    // LOD锁定（调试用）
     void SetLODLocked(bool locked) { m_lodLocked = locked; }
     bool IsLODLocked() const { return m_lodLocked; }
     void SetLockedLODLevel(int level);
     int GetLockedLODLevel() const { return m_lockedLODLevel; }
     
+    // 获取缓冲区（兼容旧接口）
+    ID3D11Buffer* GetVertexBuffer() const;
+    ID3D11Buffer* GetIndexBuffer() const;
+    UINT GetIndexCount() const;
+    
+    // 渲染统计
     struct RenderStats
     {
         int visiblePatches = 0;
         int culledPatches = 0;
         int drawCalls = 0;
         int totalTriangles = 0;
-        int lodDistribution[MAX_LOD_LEVELS] = {0};
+        int lodDistribution[8] = {0};
     };
     const RenderStats& GetRenderStats() const { return m_renderStats; }
-
+    
 private:
-    bool LoadHeightmap(const std::wstring& path, std::vector<float>& heightData);
-    void GenerateTerrainMesh(const std::vector<float>& heightData);
-    void CalculateNormals();
-    bool CreateBuffers(ID3D11Device* device);
+    // 加载高度图
+    bool LoadHeightmap(const std::wstring& path);
     
-    void InitializeCDLOD(ID3D11Device* device);
-    void GeneratePatches();
-    void CalculatePatchBounds();
+    // 生成程序化高度数据
+    void GenerateProceduralHeight();
     
-    // 索引生成
-    void GenerateLODTemplates(ID3D11Device* device);
-    void GeneratePatchIndicesWithStitching(ID3D11Device* device);
+    // 初始化CDLOD系统
+    bool InitializeCDLOD(ID3D11Device* device);
     
-    // LOD选择
-    void UpdateLODSelection(const DirectX::XMFLOAT3& cameraPosition);
-    int CalculateLODLevel(float distance) const;
-    float CalculateMorphFactor(float distance, int lodLevel) const;
-    void EnforceLODConstraints();
-    void UpdateNeighborInfo();  // 更新邻居LOD信息和缝合配置
+    // 创建高度图纹理
+    bool CreateHeightmapTexture(ID3D11Device* device);
     
-    // 视锥剔除
-    void UpdateFrustum(const DirectX::XMMATRIX& viewProj);
-    void PerformFrustumCulling();
+    // 创建地形常量缓冲区
+    bool CreateConstantBuffer(ID3D11Device* device);
     
-    // 渲染
-    void PrepareRenderBatches();
-    void RenderBatches(ID3D11DeviceContext* context);
-    void RenderPatchWithStitching(ID3D11DeviceContext* context, const TerrainPatch& patch);
-
+    // 渲染选中的节点
+    void RenderSelectedNodes(ID3D11DeviceContext* context,
+                            const std::vector<CDLODRenderNode>& renderNodes);
+    
+    // 更新常量缓冲区
+    void UpdateConstantBuffer(ID3D11DeviceContext* context,
+                             const CDLODRenderNode& node);
+    
 private:
     TerrainParams m_params;
-    CDLODConfig m_cdlodConfig;
+    CDLODSettings m_settings;
     
-    std::vector<Vertex> m_vertices;
-    std::vector<uint32_t> m_indices;
+    // 高度数据
     std::vector<float> m_heightData;
     
-    Microsoft::WRL::ComPtr<ID3D11Buffer> m_vertexBuffer;
-    Microsoft::WRL::ComPtr<ID3D11Buffer> m_indexBuffer;
-    UINT m_indexCount = 0;
+    // CDLOD组件
+    std::unique_ptr<CDLODQuadTree> m_quadTree;
+    std::unique_ptr<CDLODMeshTemplate> m_meshTemplate;
     
-    bool m_useCDLOD = false;
-    bool m_lodLocked = false;
-    int m_lockedLODLevel = 0;
+    // GPU资源
+    Microsoft::WRL::ComPtr<ID3D11Buffer> m_terrainCBuffer;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_heightmapTexture;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_heightmapSRV;
     
-    // LOD模板
-    std::array<LODMeshTemplate, MAX_LOD_LEVELS> m_lodTemplates;
+    // 渲染节点缓存
+    std::vector<CDLODRenderNode> m_renderNodes;
     
-    // 地形块
-    std::vector<TerrainPatch> m_patches;
-    int m_numPatchesX = 0;
-    int m_numPatchesZ = 0;
-    
-    // 每个块在每个LOD级别中的索引范围 [patchIndex][lodLevel] = (startIndex, indexCount)
-    std::vector<std::array<std::pair<UINT, UINT>, MAX_LOD_LEVELS>> m_patchIndexRanges;
-    
-    // 每个块的每种缝合配置的索引范围 [patchIndex][lodLevel][stitchConfigId] = (startIndex, indexCount)
-    // stitchConfigId: 0-15，表示4条边界的缝合组合
-    std::vector<std::array<std::array<std::pair<UINT, UINT>, 16>, MAX_LOD_LEVELS>> m_patchStitchRanges;
-    
-    std::array<float, MAX_LOD_LEVELS> m_lodDistances;
-    
-    Frustum m_frustum;
+    // 视锥体
+    CDLODFrustum m_frustum;
     bool m_frustumValid = false;
     
-    std::array<TerrainBatch, MAX_LOD_LEVELS> m_renderBatches;
-    
+    // 统计信息
+    CDLODStats m_stats;
     RenderStats m_renderStats;
+    
+    // 调试
+    bool m_lodLocked = false;
+    int m_lockedLODLevel = 0;
     int m_frameCount = 0;
 };
