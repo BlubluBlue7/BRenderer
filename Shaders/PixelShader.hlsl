@@ -8,8 +8,10 @@ Texture2D normalTexture : register(t1);     // 法线贴图
 Texture2D mraTexture : register(t2);        // MRA贴图（Metallic-Roughness-AO）
 TextureCube environmentMap : register(t3);  // 环境贴图（HDR环境贴图，用于IBL）
 Texture2D brdfLut : register(t4);          // BRDF查找表（用于镜面反射IBL）
+Texture2D shadowMap : register(t5);        // Shadow Map
 SamplerState textureSampler : register(s0);  // 纹理采样器
 SamplerState iblSampler : register(s1);     // IBL采样器（支持mipmap和clamp）
+SamplerComparisonState shadowSampler : register(s2);  // Shadow Map采样器（PCF）
 
 // 常量缓冲区：光照参数
 // 注意：HLSL中的结构必须与C++中的结构完全匹配（16字节对齐）
@@ -42,6 +44,11 @@ cbuffer LightBuffer : register(b1)
     
     // 环境光参数
     float4 ambientColor;    // 环境光颜色 - 只使用xyz，float4本身已对齐，无需额外padding
+    
+    // Shadow Map相关矩阵
+    float4x4 lightView;       // 光源视图矩阵
+    float4x4 lightProjection; // 光源投影矩阵
+    float4x4 lightWorldViewProj; // 光源世界-视图-投影矩阵
 };
 
 // 像素着色器输入结构体（从顶点着色器传递过来）
@@ -341,12 +348,70 @@ float4 PS(PSInput input) : SV_TARGET
     // ========================================================================
     // 组合光照
     // ========================================================================
-    // 直接光照 = (漫反射 + 镜面反射) * 光源颜色 * 光源强度 * NdotL
+    // ========================================================================
+    // Shadow Map采样和阴影计算
+    // ========================================================================
+    float shadowFactor = 1.0;  // 1.0 = 不在阴影中，0.0 = 在阴影中
+    
+    // 将世界坐标转换到光源空间
+    float4 lightSpacePos = mul(float4(input.worldPos, 1.0), lightWorldViewProj);
+    
+    // 透视除法
+    lightSpacePos.xyz /= lightSpacePos.w;
+    
+    // 转换到纹理坐标（0-1范围）
+    float2 shadowUV = lightSpacePos.xy * 0.5 + 0.5;
+    shadowUV.y = 1.0 - shadowUV.y;  // 翻转Y轴
+    
+    // 检查是否在shadow map范围内（使用更宽松的范围检查）
+    if (shadowUV.x >= -0.1 && shadowUV.x <= 1.1 && shadowUV.y >= -0.1 && shadowUV.y <= 1.1)
+    {
+        // 深度值（在光源空间中的深度，需要归一化到0-1范围）
+        // 对于正交投影，深度值已经在0-1范围内
+        float lightDepth = lightSpacePos.z;
+        
+        // 确保深度值在有效范围内
+        if (lightDepth >= 0.0 && lightDepth <= 1.0)
+        {
+            // 添加深度偏移，减少阴影痤疮
+            lightDepth -= 0.0005;
+            
+            // 限制UV在有效范围内
+            shadowUV = saturate(shadowUV);
+            
+            // 使用PCF采样shadow map（3x3采样，9个样本）
+            float shadowSum = 0.0;
+            float texelSize = 1.0 / 2048.0;  // Shadow map分辨率
+            
+            for (int x = -1; x <= 1; ++x)
+            {
+                for (int y = -1; y <= 1; ++y)
+                {
+                    float2 offset = float2(x, y) * texelSize;
+                    float2 sampleUV = shadowUV + offset;
+                    // 确保采样UV在有效范围内
+                    if (sampleUV.x >= 0.0 && sampleUV.x <= 1.0 && sampleUV.y >= 0.0 && sampleUV.y <= 1.0)
+                    {
+                        shadowSum += shadowMap.SampleCmpLevelZero(shadowSampler, sampleUV, lightDepth);
+                    }
+                    else
+                    {
+                        // 边界外视为不在阴影中
+                        shadowSum += 1.0;
+                    }
+                }
+            }
+            
+            shadowFactor = shadowSum / 9.0;  // 9个样本的平均值
+        }
+    }
+    
+    // 直接光照 = (漫反射 + 镜面反射) * 光源颜色 * 光源强度 * NdotL * shadowFactor
     // 标准Cook-Torrance BRDF公式
     // 注意：对于金属材质，diffuse = 0（因为kD = 0），只有specular有贡献
     // specular的颜色来自baseColor（通过F0），所以金属材质通过镜面反射显示baseColor
     float3 radiance = lightColor.xyz * lightIntensity;
-    float3 Lo = (diffuse + specular) * radiance * NdotL;
+    float3 Lo = (diffuse + specular) * radiance * NdotL * shadowFactor;
     
     // 调试：可视化最终直接光照（取消注释以检查）
     

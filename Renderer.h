@@ -15,7 +15,11 @@
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
+#include <DirectXMath.h>
 #include "MeshMgr.h"
+
+// 注意：XMMATRIX在DirectXMath.h中定义，但由于某些编译器问题，这里使用void*作为占位符
+// 实际实现中使用XMMATRIX
 
 class Camera;
 class Terrain;
@@ -116,6 +120,18 @@ private:
     
     // 地形相关
     Terrain* m_terrain = nullptr;  // 地形对象
+    
+    // Shadow Map相关资源
+    static const int SHADOW_MAP_SIZE = 2048;  // Shadow map分辨率
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_shadowMapTexture;  // Shadow map纹理
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilView> m_shadowMapDSV;  // Shadow map深度视图
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_shadowMapSRV;  // Shadow map着色器资源视图
+    Microsoft::WRL::ComPtr<ID3D11SamplerState> m_shadowMapSampler;  // Shadow map采样器（PCF）
+    Microsoft::WRL::ComPtr<ID3D11RasterizerState> m_shadowMapRasterizerState;  // Shadow map光栅化状态（启用深度偏移）
+    Microsoft::WRL::ComPtr<ID3D11VertexShader> m_shadowVS;  // Shadow pass顶点着色器
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> m_shadowPS;  // Shadow pass像素着色器
+    Microsoft::WRL::ComPtr<ID3D11Buffer> m_shadowConstantBuffer;  // Shadow pass常量缓冲区
+    Microsoft::WRL::ComPtr<ID3D11InputLayout> m_shadowInputLayout;  // Shadow pass输入布局
 
     int m_width = 0;
     int m_height = 0;
@@ -154,4 +170,14 @@ private:
     bool CreateTerrainRasterizerStates();  // 创建地形光栅化状态（填充和线框）
     bool InitializeTerrain();  // 初始化地形
     void RenderTerrain();  // 渲染地形
+    
+    // Shadow Map相关函数
+    bool CreateShadowMap();  // 创建shadow map资源
+    bool CreateShadowShaders();  // 创建shadow pass shader
+    void RenderShadowMap();  // 渲染shadow map（从光源视角）
+private:
+    // 内部辅助函数（使用void*避免XMMATRIX类型在头文件中的问题）
+    void GetLightViewMatrixImpl(void* outMatrix) const;  // 获取光源视图矩阵（outMatrix是XMMATRIX*）
+    void GetLightProjectionMatrixImpl(void* outMatrix) const;  // 获取光源投影矩阵（outMatrix是XMMATRIX*）
+public:
 };

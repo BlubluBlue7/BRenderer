@@ -69,7 +69,12 @@ struct alignas(16) LightBuffer
     float padding3c;           // 对齐填充 (4 bytes) -> 16 bytes total（float需要对齐到16字节边界）
     
     XMFLOAT4 ambientColor;     // 环境光颜色 (16 bytes) - 只使用xyz分量，float4本身已对齐，无需额外padding
-    // 总共: 32 + 16 + 16 + 32 + 16 + 16 = 128 bytes (16字节的倍数)
+    
+    // Shadow Map相关矩阵
+    XMFLOAT4X4 lightView;       // 光源视图矩阵 (64 bytes)
+    XMFLOAT4X4 lightProjection; // 光源投影矩阵 (64 bytes)
+    XMFLOAT4X4 lightWorldViewProj; // 光源世界-视图-投影矩阵 (64 bytes)
+    // 总共: 128 + 64 + 64 + 64 = 320 bytes (16字节的倍数)
 };
 
 // ============================================================================
@@ -241,6 +246,22 @@ bool Renderer::Initialize(HWND hwnd, int width, int height)
     if (!InitializeTerrain())
     {
         OutputDebugStringW(L"Warning: Failed to initialize terrain.\n");
+    }
+    
+    // ========================================================================
+    // 步骤 14: 创建Shadow Map
+    // ========================================================================
+    if (!CreateShadowMap())
+    {
+        OutputDebugStringW(L"Warning: Failed to create shadow map.\n");
+    }
+    
+    // ========================================================================
+    // 步骤 15: 创建Shadow Shaders
+    // ========================================================================
+    if (!CreateShadowShaders())
+    {
+        OutputDebugStringW(L"Warning: Failed to create shadow shaders.\n");
     }
     
     // ========================================================================
@@ -485,6 +506,11 @@ void Renderer::RenderFrame(float deltaTime)
     if (!m_context || !m_rtv) return;
 
     // ========================================================================
+    // 步骤 0: 渲染Shadow Map（在渲染主场景之前）
+    // ========================================================================
+    RenderShadowMap();
+
+    // ========================================================================
     // 步骤 1: 设置渲染目标
     // 告诉 GPU 将渲染结果输出到哪个渲染目标（这里是后缓冲区）
     // ========================================================================
@@ -655,7 +681,13 @@ void Renderer::RenderFrame(float deltaTime)
                 };
                 m_context->PSSetShaderResources(3, 2, iblSRVs);
                 
-                // 绑定采样器（s0用于普通纹理，s1用于IBL纹理）
+                // 绑定Shadow Map（t5）
+                if (m_shadowMapSRV)
+                {
+                    m_context->PSSetShaderResources(5, 1, m_shadowMapSRV.GetAddressOf());
+                }
+                
+                // 绑定采样器（s0用于普通纹理，s1用于IBL纹理，s2用于Shadow Map）
                 if (m_samplerState)
                 {
                     m_context->PSSetSamplers(0, 1, m_samplerState.GetAddressOf());
@@ -663,6 +695,10 @@ void Renderer::RenderFrame(float deltaTime)
                 if (m_iblSamplerState)
                 {
                     m_context->PSSetSamplers(1, 1, m_iblSamplerState.GetAddressOf());
+                }
+                if (m_shadowMapSampler)
+                {
+                    m_context->PSSetSamplers(2, 1, m_shadowMapSampler.GetAddressOf());
                 }
                 
                 // 绘制该子网格
@@ -1818,8 +1854,9 @@ void Renderer::UpdateConstantBuffers(float deltaTime)
         // 旋转模型摆正：从头顶看向脚底 -> 正常视角
         // 绕X轴旋转-90度（顺时针90度），让模型从躺着的状态变成站着的状态
         XMMATRIX rotation = XMMatrixRotationX(-XM_PI / 2.0f);  // -90度 = -π/2弧度
-        // 将模型向上移动，确保在地形上方（地形高度范围大约是0-30，模型中心在y=0，所以需要向上移动）
-        XMMATRIX translation = XMMatrixTranslation(0.0f, 5.0f, 0.0f);  // 向上移动5个单位
+        // 将模型向上移动，确保在地形上方（地形高度范围是0-400米，模型中心在y=0，所以需要向上移动）
+        // 将角色放在地形上方约50米的位置，确保角色脚部在地形表面
+        XMMATRIX translation = XMMatrixTranslation(0.0f, 200.0f, 0.0f);  // 向上移动50个单位
         // 组合变换：先缩放，再旋转，最后平移
         XMMATRIX world = scale * rotation * translation;
         
@@ -1937,6 +1974,34 @@ void Renderer::UpdateConstantBuffers(float deltaTime)
         {
             lb->cameraPosition = XMFLOAT4(0.0f, 0.0f, -2.0f, 0.0f);
         }
+        
+        // ========================================================================
+        // Shadow Map: 光源视图和投影矩阵
+        // ========================================================================
+        // 重用上面计算的光源位置（lightX, lightY, lightZ已在上面定义）
+        // 注意：上面的lightPos是方向向量（w=0），这里需要位置向量（w=1）
+        XMVECTOR lightPosForView = XMVectorSet(lightX, lightY, lightZ, 1.0f);
+        XMVECTOR lightTarget = XMVectorSet(0.0f, 0.0f, 0.0f, 1.0f);  // 看向场景中心
+        XMVECTOR lightUp = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+        
+        // 创建光源视图矩阵（从光源看向场景中心）
+        XMMATRIX lightViewMatrix = XMMatrixLookAtLH(lightPosForView, lightTarget, lightUp);
+        
+        // 创建光源投影矩阵（正交投影，覆盖场景范围）
+        // 场景范围：地形大小约4096x4096，高度约400米
+        float shadowMapSize = 5000.0f;  // 覆盖范围
+        float shadowMapNear = 0.1f;
+        float shadowMapFar = 10000.0f;
+        XMMATRIX lightProjectionMatrix = XMMatrixOrthographicLH(shadowMapSize, shadowMapSize, shadowMapNear, shadowMapFar);
+        
+        // 存储光源矩阵（转置）
+        XMStoreFloat4x4(&lb->lightView, XMMatrixTranspose(lightViewMatrix));
+        XMStoreFloat4x4(&lb->lightProjection, XMMatrixTranspose(lightProjectionMatrix));
+        
+        // 计算光源世界-视图-投影矩阵（单位世界矩阵）
+        XMMATRIX identity = XMMatrixIdentity();
+        XMMATRIX lightWorldViewProj = identity * lightViewMatrix * lightProjectionMatrix;
+        XMStoreFloat4x4(&lb->lightWorldViewProj, XMMatrixTranspose(lightWorldViewProj));
         
         m_context->Unmap(m_lightBuffer.Get(), 0);
     }
@@ -2980,6 +3045,13 @@ void Renderer::RenderTerrain()
         m_context->PSSetSamplers(0, 1, m_samplerState.GetAddressOf());
     }
     
+    // 绑定Shadow Map到像素着色器（register t1）
+    if (m_shadowMapSRV && m_shadowMapSampler)
+    {
+        m_context->PSSetShaderResources(1, 1, m_shadowMapSRV.GetAddressOf());
+        m_context->PSSetSamplers(1, 1, m_shadowMapSampler.GetAddressOf());
+    }
+    
     // 确保深度测试启用
     m_context->OMSetDepthStencilState(m_depthStencilState.Get(), 0);
     
@@ -3055,4 +3127,332 @@ void Renderer::SetTerrainLODLockLevel(int level)
             OutputDebugStringW(msg);
         }
     }
+}
+
+// ============================================================================
+// 创建Shadow Map资源
+// ============================================================================
+bool Renderer::CreateShadowMap()
+{
+    // 创建Shadow Map纹理（深度纹理）
+    D3D11_TEXTURE2D_DESC shadowMapDesc = {};
+    shadowMapDesc.Width = SHADOW_MAP_SIZE;
+    shadowMapDesc.Height = SHADOW_MAP_SIZE;
+    shadowMapDesc.MipLevels = 1;
+    shadowMapDesc.ArraySize = 1;
+    shadowMapDesc.Format = DXGI_FORMAT_R24G8_TYPELESS;  // 24位深度 + 8位模板
+    shadowMapDesc.SampleDesc.Count = 1;
+    shadowMapDesc.SampleDesc.Quality = 0;
+    shadowMapDesc.Usage = D3D11_USAGE_DEFAULT;
+    shadowMapDesc.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
+    shadowMapDesc.CPUAccessFlags = 0;
+    shadowMapDesc.MiscFlags = 0;
+    
+    HRESULT hr = m_device->CreateTexture2D(&shadowMapDesc, nullptr, m_shadowMapTexture.GetAddressOf());
+    if (FAILED(hr))
+    {
+        OutputDebugStringW(L"Failed to create shadow map texture.\n");
+        return false;
+    }
+    
+    // 创建深度模板视图
+    D3D11_DEPTH_STENCIL_VIEW_DESC dsvDesc = {};
+    dsvDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    dsvDesc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+    dsvDesc.Texture2D.MipSlice = 0;
+    
+    hr = m_device->CreateDepthStencilView(m_shadowMapTexture.Get(), &dsvDesc, m_shadowMapDSV.GetAddressOf());
+    if (FAILED(hr))
+    {
+        OutputDebugStringW(L"Failed to create shadow map DSV.\n");
+        return false;
+    }
+    
+    // 创建着色器资源视图
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Texture2D.MipLevels = 1;
+    srvDesc.Texture2D.MostDetailedMip = 0;
+    
+    hr = m_device->CreateShaderResourceView(m_shadowMapTexture.Get(), &srvDesc, m_shadowMapSRV.GetAddressOf());
+    if (FAILED(hr))
+    {
+        OutputDebugStringW(L"Failed to create shadow map SRV.\n");
+        return false;
+    }
+    
+    // 创建Shadow Map采样器（PCF - Percentage Closer Filtering）
+    D3D11_SAMPLER_DESC samplerDesc = {};
+    samplerDesc.Filter = D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;  // PCF过滤
+    samplerDesc.AddressU = D3D11_TEXTURE_ADDRESS_BORDER;
+    samplerDesc.AddressV = D3D11_TEXTURE_ADDRESS_BORDER;
+    samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_BORDER;
+    samplerDesc.BorderColor[0] = 1.0f;  // 边界外的阴影值（1.0 = 不在阴影中）
+    samplerDesc.BorderColor[1] = 1.0f;
+    samplerDesc.BorderColor[2] = 1.0f;
+    samplerDesc.BorderColor[3] = 1.0f;
+    samplerDesc.ComparisonFunc = D3D11_COMPARISON_LESS_EQUAL;  // 深度比较函数
+    samplerDesc.MinLOD = 0;
+    samplerDesc.MaxLOD = D3D11_FLOAT32_MAX;
+    
+    hr = m_device->CreateSamplerState(&samplerDesc, m_shadowMapSampler.GetAddressOf());
+    if (FAILED(hr))
+    {
+        OutputDebugStringW(L"Failed to create shadow map sampler.\n");
+        return false;
+    }
+    
+    // 创建Shadow Map光栅化状态（启用深度偏移，减少阴影痤疮）
+    D3D11_RASTERIZER_DESC rasterizerDesc = {};
+    rasterizerDesc.FillMode = D3D11_FILL_SOLID;
+    rasterizerDesc.CullMode = D3D11_CULL_BACK;
+    rasterizerDesc.FrontCounterClockwise = false;
+    rasterizerDesc.DepthBias = 1000;  // 深度偏移（以最小可表示深度单位计算）
+    rasterizerDesc.DepthBiasClamp = 0.0f;
+    rasterizerDesc.SlopeScaledDepthBias = 2.0f;  // 斜率缩放深度偏移
+    rasterizerDesc.DepthClipEnable = true;
+    rasterizerDesc.ScissorEnable = false;
+    rasterizerDesc.MultisampleEnable = false;
+    rasterizerDesc.AntialiasedLineEnable = false;
+    
+    hr = m_device->CreateRasterizerState(&rasterizerDesc, m_shadowMapRasterizerState.GetAddressOf());
+    if (FAILED(hr))
+    {
+        OutputDebugStringW(L"Failed to create shadow map rasterizer state.\n");
+        return false;
+    }
+    
+    // 创建Shadow Pass常量缓冲区
+    D3D11_BUFFER_DESC cbDesc = {};
+    cbDesc.Usage = D3D11_USAGE_DYNAMIC;
+    cbDesc.ByteWidth = sizeof(XMFLOAT4X4) * 4;  // world, lightView, lightProjection, lightWorldViewProj
+    cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    
+    hr = m_device->CreateBuffer(&cbDesc, nullptr, m_shadowConstantBuffer.GetAddressOf());
+    if (FAILED(hr))
+    {
+        OutputDebugStringW(L"Failed to create shadow constant buffer.\n");
+        return false;
+    }
+    
+    OutputDebugStringW(L"Shadow map created successfully.\n");
+    return true;
+}
+
+// ============================================================================
+// 创建Shadow Shaders
+// ============================================================================
+bool Renderer::CreateShadowShaders()
+{
+    // 编译Shadow顶点着色器
+    Microsoft::WRL::ComPtr<ID3DBlob> vsBlob;
+    if (!CompileShaderFromFile(L"Shaders/ShadowVertexShader.hlsl", "VS", "vs_5_0", vsBlob.GetAddressOf()))
+    {
+        OutputDebugStringW(L"Failed to compile shadow vertex shader.\n");
+        return false;
+    }
+    
+    HRESULT hr = m_device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, m_shadowVS.GetAddressOf());
+    if (FAILED(hr))
+    {
+        OutputDebugStringW(L"Failed to create shadow vertex shader.\n");
+        return false;
+    }
+    
+    // 编译Shadow像素着色器
+    Microsoft::WRL::ComPtr<ID3DBlob> psBlob;
+    if (!CompileShaderFromFile(L"Shaders/ShadowPixelShader.hlsl", "PS", "ps_5_0", psBlob.GetAddressOf()))
+    {
+        OutputDebugStringW(L"Failed to compile shadow pixel shader.\n");
+        return false;
+    }
+    
+    hr = m_device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, m_shadowPS.GetAddressOf());
+    if (FAILED(hr))
+    {
+        OutputDebugStringW(L"Failed to create shadow pixel shader.\n");
+        return false;
+    }
+    
+    // 创建Shadow Pass输入布局（使用与普通模型相同的顶点格式）
+    D3D11_INPUT_ELEMENT_DESC layout[] = {
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "COLOR", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 24, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 36, D3D11_INPUT_PER_VERTEX_DATA, 0 }
+    };
+    
+    hr = m_device->CreateInputLayout(layout, ARRAYSIZE(layout), vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), m_shadowInputLayout.GetAddressOf());
+    if (FAILED(hr))
+    {
+        OutputDebugStringW(L"Failed to create shadow input layout.\n");
+        return false;
+    }
+    
+    OutputDebugStringW(L"Shadow shaders created successfully.\n");
+    return true;
+}
+
+// ============================================================================
+// 获取光源视图矩阵（内部实现）
+// ============================================================================
+void Renderer::GetLightViewMatrixImpl(void* outMatrix) const
+{
+    float rotationSpeed = 2.0f * XM_PI / 15.0f;
+    float angle = m_lightRotationTime * rotationSpeed;
+    float lightRadius = 1.0f;
+    float lightHeight = -0.5f;
+    float lightX = cosf(angle) * lightRadius;
+    float lightZ = sinf(angle) * lightRadius;
+    float lightY = lightHeight;
+    
+    XMVECTOR lightPos = XMVectorSet(lightX, lightY, lightZ, 1.0f);
+    XMVECTOR lightTarget = XMVectorSet(0.0f, 0.0f, 0.0f, 1.0f);
+    XMVECTOR lightUp = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+    
+    *static_cast<XMMATRIX*>(outMatrix) = XMMatrixLookAtLH(lightPos, lightTarget, lightUp);
+}
+
+// ============================================================================
+// 获取光源投影矩阵（内部实现）
+// ============================================================================
+void Renderer::GetLightProjectionMatrixImpl(void* outMatrix) const
+{
+    float shadowMapSize = 5000.0f;
+    float shadowMapNear = 0.1f;
+    float shadowMapFar = 10000.0f;
+    *static_cast<XMMATRIX*>(outMatrix) = XMMatrixOrthographicLH(shadowMapSize, shadowMapSize, shadowMapNear, shadowMapFar);
+}
+
+// ============================================================================
+// 渲染Shadow Map（从光源视角）
+// ============================================================================
+void Renderer::RenderShadowMap()
+{
+    if (!m_shadowMapDSV || !m_shadowVS || !m_shadowPS || !m_shadowInputLayout)
+        return;
+    
+    // 保存当前渲染目标
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> oldRTV;
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilView> oldDSV;
+    m_context->OMGetRenderTargets(1, oldRTV.GetAddressOf(), oldDSV.GetAddressOf());
+    
+    // 保存当前光栅化状态
+    Microsoft::WRL::ComPtr<ID3D11RasterizerState> oldRasterizerState;
+    m_context->RSGetState(oldRasterizerState.GetAddressOf());
+    
+    // 设置Shadow Map为渲染目标（只渲染深度）
+    m_context->OMSetRenderTargets(0, nullptr, m_shadowMapDSV.Get());
+    
+    // 清空Shadow Map
+    m_context->ClearDepthStencilView(m_shadowMapDSV.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+    
+    // 设置视口
+    D3D11_VIEWPORT viewport = {};
+    viewport.Width = (float)SHADOW_MAP_SIZE;
+    viewport.Height = (float)SHADOW_MAP_SIZE;
+    viewport.MinDepth = 0.0f;
+    viewport.MaxDepth = 1.0f;
+    m_context->RSSetViewports(1, &viewport);
+    
+    // 设置Shadow Pass shader
+    m_context->IASetInputLayout(m_shadowInputLayout.Get());
+    m_context->VSSetShader(m_shadowVS.Get(), nullptr, 0);
+    m_context->PSSetShader(m_shadowPS.Get(), nullptr, 0);
+    
+    // 设置Shadow Map光栅化状态（启用深度偏移）
+    m_context->RSSetState(m_shadowMapRasterizerState.Get());
+    
+    // 更新Shadow Pass常量缓冲区
+    XMMATRIX lightView, lightProjection;
+    GetLightViewMatrixImpl(&lightView);
+    GetLightProjectionMatrixImpl(&lightProjection);
+    
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    HRESULT hr = m_context->Map(m_shadowConstantBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (SUCCEEDED(hr))
+    {
+        XMFLOAT4X4* matrices = (XMFLOAT4X4*)mapped.pData;
+        
+        // 单位世界矩阵
+        XMMATRIX identity = XMMatrixIdentity();
+        XMStoreFloat4x4(&matrices[0], XMMatrixTranspose(identity));
+        XMStoreFloat4x4(&matrices[1], XMMatrixTranspose(lightView));
+        XMStoreFloat4x4(&matrices[2], XMMatrixTranspose(lightProjection));
+        
+        XMMATRIX lightWorldViewProj = identity * lightView * lightProjection;
+        XMStoreFloat4x4(&matrices[3], XMMatrixTranspose(lightWorldViewProj));
+        
+        m_context->Unmap(m_shadowConstantBuffer.Get(), 0);
+    }
+    
+    // 绑定Shadow Pass常量缓冲区
+    m_context->VSSetConstantBuffers(0, 1, m_shadowConstantBuffer.GetAddressOf());
+    
+    // 渲染地形到Shadow Map
+    // 注意：地形使用CDLOD系统，需要特殊的shadow pass处理
+    // 暂时跳过地形渲染到shadow map（地形本身不产生阴影，但会接收模型的阴影）
+    // 如果需要地形也产生阴影，需要为地形创建专门的shadow pass
+    // if (m_terrain && m_terrain->GetVertexBuffer())
+    // {
+    //     // 地形shadow pass需要特殊处理
+    // }
+    
+    // 渲染模型到Shadow Map
+    // 注意：模型需要使用与实际渲染相同的世界矩阵（缩放、旋转、平移）
+    if (m_meshMgr)
+    {
+        std::shared_ptr<MeshGPU> modelGPU = m_meshMgr->GetMeshGPU("Model");
+        if (!modelGPU)
+            modelGPU = m_meshMgr->GetMeshGPU("Triangle");
+        
+        if (modelGPU)
+        {
+            // 更新模型的世界矩阵（与实际渲染保持一致）
+            D3D11_MAPPED_SUBRESOURCE mapped;
+            HRESULT hr = m_context->Map(m_shadowConstantBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+            if (SUCCEEDED(hr))
+            {
+                XMFLOAT4X4* matrices = (XMFLOAT4X4*)mapped.pData;
+                
+                // 模型的世界矩阵：缩放0.2倍，旋转-90度，向上移动200单位
+                XMMATRIX scale = XMMatrixScaling(0.2f, 0.2f, 0.2f);
+                XMMATRIX rotation = XMMatrixRotationX(-XM_PI / 2.0f);
+                XMMATRIX translation = XMMatrixTranslation(0.0f, 200.0f, 0.0f);
+                XMMATRIX world = scale * rotation * translation;
+                
+                XMStoreFloat4x4(&matrices[0], XMMatrixTranspose(world));
+                
+                // 重新计算lightWorldViewProj
+                XMMATRIX lightWorldViewProj = world * lightView * lightProjection;
+                XMStoreFloat4x4(&matrices[3], XMMatrixTranspose(lightWorldViewProj));
+                
+                m_context->Unmap(m_shadowConstantBuffer.Get(), 0);
+            }
+            
+            modelGPU->Bind(m_context.Get());
+            
+            // 渲染所有子网格（使用MeshGPU的DrawSubmesh方法）
+            for (uint32_t i = 0; i < modelGPU->GetSubmeshCount(); ++i)
+            {
+                modelGPU->DrawSubmesh(m_context.Get(), i);
+            }
+        }
+    }
+    
+    // 恢复渲染目标和视口
+    m_context->OMSetRenderTargets(1, oldRTV.GetAddressOf(), oldDSV.Get());
+    
+    // 恢复视口
+    D3D11_VIEWPORT mainViewport = {};
+    mainViewport.Width = (float)m_width;
+    mainViewport.Height = (float)m_height;
+    mainViewport.MinDepth = 0.0f;
+    mainViewport.MaxDepth = 1.0f;
+    m_context->RSSetViewports(1, &mainViewport);
+    
+    // 恢复光栅化状态
+    m_context->RSSetState(oldRasterizerState.Get());
 }
