@@ -4,6 +4,7 @@
 #include "ModelLoader.h"
 #include "MeshGPU.h"
 #include "Terrain.h"
+#include "Terrain_new.h"
 
 // 在包含 Windows.h 之前定义 NOMINMAX，避免 min/max 宏冲突
 #define NOMINMAX
@@ -2527,13 +2528,17 @@ bool Renderer::CreateSkyboxShaders()
 // ============================================================================
 bool Renderer::CreateTerrainShaders()
 {
-    // 编译地形顶点着色器
+    // 编译地形顶点着色器（使用TerrainNew版本）
     Microsoft::WRL::ComPtr<ID3DBlob> vsBlob;
-    if (!CompileShaderFromFile(L"Shaders/TerrainVertexShader.hlsl", "VS", "vs_5_0", vsBlob.GetAddressOf()))
+    if (!CompileShaderFromFile(L"Shaders/TerrainNewVertexShader.hlsl", "VS", "vs_5_0", vsBlob.GetAddressOf()))
     {
-        m_lastError = L"Failed to compile TerrainVertexShader.hlsl (VS).";
-        OutputDebugStringW(L"[TERRAIN DEBUG] Failed to compile TerrainVertexShader.hlsl\n");
-        return false;
+        // 如果TerrainNew版本不存在，尝试使用标准版本
+        if (!CompileShaderFromFile(L"Shaders/VertexShader.hlsl", "VS", "vs_5_0", vsBlob.GetAddressOf()))
+        {
+            m_lastError = L"Failed to compile TerrainNewVertexShader.hlsl or VertexShader.hlsl (VS).";
+            OutputDebugStringW(L"[TERRAIN DEBUG] Failed to compile terrain vertex shader\n");
+            return false;
+        }
     }
     
     HRESULT hr = m_device->CreateVertexShader(
@@ -2828,51 +2833,31 @@ void Renderer::RenderSkybox()
 }
 
 // ============================================================================
-// 初始化地形 (CDLOD系统)
+// 初始化地形 (使用 TerrainNew - 基础网格生成)
 // ============================================================================
 bool Renderer::InitializeTerrain()
 {
     // 创建地形对象
-    m_terrain = new Terrain();
+    m_terrain = new TerrainNew();
     
     // ========================================================================
-    // 设置超大规模CDLOD地形参数
+    // 设置地形参数
     // ========================================================================
-    TerrainParams params;
-    params.heightmapWidth = 1025;        // 高度图宽度（像素），2^n+1 格式最优
-    params.heightmapHeight = 1025;       // 高度图高度（像素）
-    params.worldSizeX = 4096.0f;         // 世界空间X方向大小（4公里）
-    params.worldSizeZ = 4096.0f;         // 世界空间Z方向大小（4公里）
-    params.heightScale = 400.0f;         // 高度缩放因子（400米高差）
+    TerrainNewParams params;
+    params.gridWidth = 256;              // 网格宽度（顶点数）
+    params.gridHeight = 256;             // 网格高度（顶点数）
+    params.worldSizeX = 1024.0f;         // 世界空间X方向大小（1公里）
+    params.worldSizeZ = 1024.0f;         // 世界空间Z方向大小（1公里）
+    params.heightScale = 100.0f;         // 高度缩放因子（100米高差）
     params.heightOffset = 0.0f;          // 高度偏移量
     
-    // ========================================================================
-    // 配置CDLOD设置 - 10级LOD支持超远视距
-    // ========================================================================
-    CDLODSettings& settings = m_terrain->GetSettings();
-    settings.maxLODLevels = 10;              // 10级LOD，支持2^10=1024倍缩放
-    settings.gridMeshDimension = 32;         // 每个节点32x32网格
-    settings.LOD0Range = 50.0f;              // LOD 0 可见距离50米
-    settings.LODDistanceRatio = 2.0f;        // 每级别距离翻倍
-    // LOD距离配置:
-    // LOD 0: 50m   (最高细节)
-    // LOD 1: 100m
-    // LOD 2: 200m
-    // LOD 3: 400m
-    // LOD 4: 800m
-    // LOD 5: 1600m
-    // LOD 6: 3200m
-    // LOD 7: 6400m
-    // LOD 8: 12800m
-    // LOD 9: 25600m (最远视距约25公里)
-    settings.morphStartRatio = 0.66f;        // morphing开始比例
-    settings.enableMorphing = true;          // 启用morphing
-    settings.enableFrustumCulling = true;    // 启用视锥剔除
-    settings.debugVisualization = false;     // 调试可视化
-    settings.enableLODColorDebug = false;    // LOD颜色调试
-    
-    // 打印LOD距离配置
-    settings.PrintLODRanges();
+    // Chunk和LOD参数
+    params.chunkSize = 64;               // 每个chunk的网格大小（顶点数-1）
+    params.maxLODLevels = 4;             // 最大LOD级别数
+    params.lodDistances[0] = 50.0f;      // LOD 0: 50米内（最高细节）
+    params.lodDistances[1] = 150.0f;     // LOD 1: 150米内
+    params.lodDistances[2] = 400.0f;     // LOD 2: 400米内
+    params.lodDistances[3] = 1000.0f;    // LOD 3: 1000米内（最低细节）
     
     // 尝试加载高度图，如果失败则使用程序化生成
     wchar_t exePath[MAX_PATH] = { 0 };
@@ -2905,7 +2890,7 @@ bool Renderer::InitializeTerrain()
             {
                 if (m_terrain->CreateFromHeightmap(m_device.Get(), path, params))
                 {
-                    OutputDebugStringW(L"[CDLOD] Terrain loaded from heightmap: ");
+                    OutputDebugStringW(L"[TerrainNew] Terrain loaded from heightmap: ");
                     OutputDebugStringW(path.c_str());
                     OutputDebugStringW(L"\n");
                     return true;
@@ -2914,16 +2899,15 @@ bool Renderer::InitializeTerrain()
         }
     }
     
-    // 如果加载高度图失败，使用程序化生成
-    OutputDebugStringW(L"[CDLOD] Heightmap not found, using procedural terrain generation.\n");
+    // 如果加载高度图失败，使用程序化生成（随机算法）
+    OutputDebugStringW(L"[TerrainNew] Heightmap not found, using procedural terrain generation.\n");
     if (m_terrain->CreateProcedural(m_device.Get(), params))
     {
-        OutputDebugStringW(L"[CDLOD] Procedural terrain created successfully.\n");
+        OutputDebugStringW(L"[TerrainNew] Procedural terrain created successfully.\n");
         
-        const CDLODStats& stats = m_terrain->GetStats();
         wchar_t msg[512];
-        swprintf_s(msg, L"[CDLOD] Terrain initialized: worldSize=%.0fx%.0f, heightScale=%.0f\n", 
-                   params.worldSizeX, params.worldSizeZ, params.heightScale);
+        swprintf_s(msg, L"[TerrainNew] Terrain initialized: %dx%d grid, worldSize=%.0fx%.0f, heightScale=%.0f\n", 
+                   params.gridWidth, params.gridHeight, params.worldSizeX, params.worldSizeZ, params.heightScale);
         OutputDebugStringW(msg);
         
         return true;
@@ -2936,7 +2920,7 @@ bool Renderer::InitializeTerrain()
 }
 
 // ============================================================================
-// 渲染地形 (CDLOD系统)
+// 渲染地形 (TerrainNew - 基础网格渲染)
 // ============================================================================
 void Renderer::RenderTerrain()
 {
@@ -2945,31 +2929,19 @@ void Renderer::RenderTerrain()
         static bool warned = false;
         if (!warned)
         {
-            OutputDebugStringW(L"[CDLOD] RenderTerrain: Terrain is null!\n");
+            OutputDebugStringW(L"[TerrainNew] RenderTerrain: Terrain is null!\n");
             warned = true;
         }
         return;
     }
     
-    // 检查地形资源
-    if (!m_terrain->GetVertexBuffer())
-    {
-        static bool warned = false;
-        if (!warned)
-        {
-            OutputDebugStringW(L"[CDLOD] Terrain mesh template not created!\n");
-            warned = true;
-        }
-        return;
-    }
-    
-    // 检查shader资源
+    // 检查shader资源（TerrainNew使用chunk系统，不需要全局vertex buffer）
     if (!m_terrainVS || !m_terrainPS || !m_terrainInputLayout)
     {
         static bool warned = false;
         if (!warned)
         {
-            OutputDebugStringW(L"[CDLOD] Terrain shaders not created!\n");
+            OutputDebugStringW(L"[TerrainNew] Terrain shaders not created!\n");
             warned = true;
         }
         return;
@@ -3038,7 +3010,7 @@ void Renderer::RenderTerrain()
         m_context->Unmap(m_constantBuffer.Get(), 0);
     }
     
-    // 绑定高度图采样器到顶点着色器
+    // 绑定采样器
     if (m_samplerState)
     {
         m_context->VSSetSamplers(0, 1, m_samplerState.GetAddressOf());
@@ -3055,78 +3027,42 @@ void Renderer::RenderTerrain()
     // 确保深度测试启用
     m_context->OMSetDepthStencilState(m_depthStencilState.Get(), 0);
     
-    // 调试输出（首次和每60帧）
-    static int frameCount = 0;
+    // 调试输出（首次渲染）
     static bool firstRender = true;
-    frameCount++;
-    
     if (firstRender)
     {
-        const TerrainParams& params = m_terrain->GetParams();
+        const TerrainNewParams& params = m_terrain->GetParams();
         wchar_t msg[512];
-        swprintf_s(msg, L"[CDLOD] First render - Terrain: %.0fx%.0f, Height: %.0f, Camera: (%.1f, %.1f, %.1f)\n",
-                  params.worldSizeX, params.worldSizeZ, params.heightScale,
+        swprintf_s(msg, L"[TerrainNew] First render - Grid: %dx%d, World: %.0fx%.0f, Height: %.0f, Camera: (%.1f, %.1f, %.1f)\n",
+                  params.gridWidth, params.gridHeight, params.worldSizeX, params.worldSizeZ, params.heightScale,
                   camPos.x, camPos.y, camPos.z);
         OutputDebugStringW(msg);
         firstRender = false;
     }
     
-    // 使用CDLOD渲染
-    m_terrain->Render(m_context.Get(), camPos, viewMatrix, projMatrix);
-    
-    // 周期性统计输出
-    if (frameCount % 300 == 0)
-    {
-        const Terrain::RenderStats& stats = m_terrain->GetRenderStats();
-        wchar_t msg[256];
-        swprintf_s(msg, L"[CDLOD] Stats: %d nodes, %d draws, %d tris\n",
-                  stats.visiblePatches, stats.drawCalls, stats.totalTriangles);
-        OutputDebugStringW(msg);
-    }
+    // 渲染地形（TerrainNew需要相机位置）
+    m_terrain->Render(m_context.Get(), camPos);
     
     // 恢复光栅化状态
     m_context->RSSetState(oldRasterizerState.Get());
 }
 
 // ============================================================================
-// 切换地形LOD锁定
+// 切换地形LOD锁定（TerrainNew不支持LOD，保留函数接口但不执行）
 // ============================================================================
 void Renderer::ToggleTerrainLODLock()
 {
-    if (m_terrain)
-    {
-        bool currentLocked = m_terrain->IsLODLocked();
-        m_terrain->SetLODLocked(!currentLocked);
-        
-        wchar_t msg[256];
-        if (!currentLocked)
-        {
-            swprintf_s(msg, L"[TERRAIN] LOD locked at current level\n");
-        }
-        else
-        {
-            swprintf_s(msg, L"[TERRAIN] LOD unlocked, using distance-based selection\n");
-        }
-        OutputDebugStringW(msg);
-    }
+    // TerrainNew 不支持LOD系统
+    OutputDebugStringW(L"[TerrainNew] LOD system not available in TerrainNew\n");
 }
 
 // ============================================================================
-// 设置地形LOD锁定级别
+// 设置地形LOD锁定级别（TerrainNew不支持LOD，保留函数接口但不执行）
 // ============================================================================
 void Renderer::SetTerrainLODLockLevel(int level)
 {
-    if (m_terrain)
-    {
-        const CDLODSettings& settings = m_terrain->GetSettings();
-        if (level >= 0 && level < settings.maxLODLevels)
-        {
-            m_terrain->SetLockedLODLevel(level);
-            wchar_t msg[256];
-            swprintf_s(msg, L"[CDLOD] LOD locked to level %d\n", level);
-            OutputDebugStringW(msg);
-        }
-    }
+    // TerrainNew 不支持LOD系统
+    OutputDebugStringW(L"[TerrainNew] LOD system not available in TerrainNew\n");
 }
 
 // ============================================================================

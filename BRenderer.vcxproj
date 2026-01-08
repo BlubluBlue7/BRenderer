@@ -185,6 +185,7 @@ if exist "%VCPKG_RELEASE_BIN%\pugixml.dll" copy /Y "%VCPKG_RELEASE_BIN%\pugixml.
     <ClCompile Include="Platform\Window.cpp" />
     <ClCompile Include="Renderer.cpp" />
     <ClCompile Include="Terrain.cpp" />
+    <ClCompile Include="Terrain_new.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Camera.h" />
@@ -195,6 +196,7 @@ if exist "%VCPKG_RELEASE_BIN%\pugixml.dll" copy /Y "%VCPKG_RELEASE_BIN%\pugixml.
     <ClInclude Include="Platform\Window.h" />
     <ClInclude Include="Renderer.h" />
     <ClInclude Include="Terrain.h" />
+    <ClInclude Include="Terrain_new.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

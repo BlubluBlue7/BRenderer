@@ -23,6 +23,7 @@
 
 class Camera;
 class Terrain;
+class TerrainNew;  // 前向声明
 
 class Renderer
 {
@@ -119,7 +120,7 @@ private:
     Camera* m_camera = nullptr;  // 相机指针
     
     // 地形相关
-    Terrain* m_terrain = nullptr;  // 地形对象
+    TerrainNew* m_terrain = nullptr;  // 地形对象
     
     // Shadow Map相关资源
     static const int SHADOW_MAP_SIZE = 2048;  // Shadow map分辨率
