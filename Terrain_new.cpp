@@ -146,52 +146,201 @@ void TerrainNew::GenerateProceduralHeight()
 
     m_heightData.resize(width * height);
 
-    // 使用随机数生成器
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_real_distribution<float> dis(0.0f, 1.0f);
-
-    // 简单的随机高度生成算法
-    // 使用多层噪声叠加来生成更自然的地形
+    // ========================================================================
+    // 平滑噪声生成算法 - 使用改进的Perlin噪声和分形布朗运动
+    // ========================================================================
+    
+    // 哈希函数 - 生成伪随机值
+    auto hash = [](int x, int z, int seed = 0) -> float {
+        int n = x + z * 57 + seed * 131;
+        n = (n << 13) ^ n;
+        return (1.0f - ((n * (n * n * 15731 + 789221) + 1376312589) & 0x7FFFFFFF) / 1073741824.0f);
+    };
+    
+    // 平滑插值函数 - Quintic曲线（比smoothstep更平滑）
+    auto smoothstep = [](float t) -> float {
+        t = std::max(0.0f, std::min(1.0f, t));
+        return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
+    };
+    
+    // 梯度噪声（类Perlin噪声）- 生成平滑的噪声值
+    auto gradientNoise = [&hash, &smoothstep](float x, float z, float scale, int seed = 0) -> float {
+        float scaledX = x * scale;
+        float scaledZ = z * scale;
+        
+        int ix = static_cast<int>(floorf(scaledX));
+        int iz = static_cast<int>(floorf(scaledZ));
+        float fx = scaledX - ix;
+        float fz = scaledZ - iz;
+        
+        // 获取四个角的值
+        float n00 = hash(ix, iz, seed);
+        float n10 = hash(ix + 1, iz, seed);
+        float n01 = hash(ix, iz + 1, seed);
+        float n11 = hash(ix + 1, iz + 1, seed);
+        
+        // 使用平滑插值
+        float sx = smoothstep(fx);
+        float sz = smoothstep(fz);
+        
+        // 双线性插值
+        float top = n00 * (1.0f - sx) + n10 * sx;
+        float bottom = n01 * (1.0f - sx) + n11 * sx;
+        return top * (1.0f - sz) + bottom * sz;
+    };
+    
+    // 分形布朗运动 (fBm) - 多层噪声叠加
+    auto fbm = [&gradientNoise](float x, float z, int octaves, float scale, float lacunarity, float persistence, int seed = 0) -> float {
+        float value = 0.0f;
+        float amplitude = 1.0f;
+        float frequency = 1.0f;
+        float maxValue = 0.0f;
+        
+        for (int i = 0; i < octaves; ++i)
+        {
+            value += gradientNoise(x, z, scale * frequency, seed + i) * amplitude;
+            maxValue += amplitude;
+            amplitude *= persistence;
+            frequency *= lacunarity;
+        }
+        
+        // 归一化到 [-1, 1]
+        return value / maxValue;
+    };
+    
+    // 生成平滑的地形高度
+    float minH = FLT_MAX, maxH = -FLT_MAX;
+    
     for (int z = 0; z < height; ++z)
     {
         for (int x = 0; x < width; ++x)
         {
+            // 归一化坐标到0-1范围
             float fx = static_cast<float>(x) / (width - 1);
             float fz = static_cast<float>(z) / (height - 1);
-
-            // 基础高度 - 使用简单的正弦波叠加
+            
+            // 使用分形布朗运动生成平滑的基础地形
+            // 大尺度地形 - 使用较少的octaves和较大的scale
+            float baseHeight = fbm(fx, fz, 4, 2.0f, 2.0f, 0.5f, 0);
+            baseHeight = (baseHeight + 1.0f) * 0.5f;  // 转换到 [0, 1]
+            
+            // 中尺度细节 - 添加丘陵和山谷
+            float hills = fbm(fx, fz, 3, 6.0f, 2.0f, 0.45f, 100);
+            hills = (hills + 1.0f) * 0.5f;
+            
+            // 小尺度细节 - 添加细微变化
+            float detail = fbm(fx, fz, 2, 20.0f, 2.0f, 0.4f, 200);
+            detail = (detail + 1.0f) * 0.5f;
+            
+            // 混合各层 - 使用权重控制
             float h = 0.0f;
-
-            // 大尺度起伏
-            h += sinf(fx * 3.14159f * 2.0f) * 0.3f;
-            h += sinf(fz * 3.14159f * 2.0f) * 0.3f;
-            h += sinf((fx + fz) * 3.14159f * 3.0f) * 0.2f;
-
-            // 中尺度细节
-            h += sinf(fx * 3.14159f * 8.0f) * 0.15f;
-            h += sinf(fz * 3.14159f * 8.0f) * 0.15f;
-
-            // 小尺度噪声
-            h += dis(gen) * 0.1f;
-
-            // 归一化到0-1范围
-            h = (h + 1.0f) * 0.5f;
+            h += baseHeight * 0.5f;      // 基础地形 50%
+            h += hills * 0.3f;           // 丘陵 30%
+            h += detail * 0.2f;          // 细节 20%
+            
+            // 边缘衰减 - 让地形边缘平滑过渡到0
+            float edgeFade = 1.0f;
+            float edgeDist = 0.1f;  // 边缘距离（10%的区域）
+            if (fx < edgeDist) edgeFade *= fx / edgeDist;
+            if (fz < edgeDist) edgeFade *= fz / edgeDist;
+            if (fx > 1.0f - edgeDist) edgeFade *= (1.0f - fx) / edgeDist;
+            if (fz > 1.0f - edgeDist) edgeFade *= (1.0f - fz) / edgeDist;
+            
+            h *= edgeFade;
+            
+            // 确保在有效范围内
             h = std::max(0.0f, std::min(1.0f, h));
-
+            
             m_heightData[z * width + x] = h;
+            
+            minH = std::min(minH, h);
+            maxH = std::max(maxH, h);
         }
     }
-
+    
+    // 可选：对高度图进行平滑滤波（进一步减少突变）
+    SmoothHeightmap(width, height);
+    
     wchar_t msg[256];
-    swprintf_s(msg, L"[TerrainNew] Procedural heightmap generated: %dx%d\n", width, height);
+    swprintf_s(msg, L"[TerrainNew] Procedural heightmap generated: %dx%d, height range [%.2f, %.2f]\n", 
+               width, height, minH, maxH);
     OutputDebugStringW(msg);
+}
+
+void TerrainNew::SmoothHeightmap(int width, int height)
+{
+    if (m_heightData.empty() || width < 3 || height < 3)
+        return;
+    
+    // 创建临时缓冲区存储平滑后的数据
+    std::vector<float> smoothedData(width * height);
+    
+    // 使用简单的3x3高斯滤波核进行平滑
+    // 权重: 中心4, 上下左右2, 四个角1
+    for (int z = 1; z < height - 1; ++z)
+    {
+        for (int x = 1; x < width - 1; ++x)
+        {
+            float sum = 0.0f;
+            float weight = 0.0f;
+            
+            // 3x3 高斯核
+            for (int dz = -1; dz <= 1; ++dz)
+            {
+                for (int dx = -1; dx <= 1; ++dx)
+                {
+                    int nx = x + dx;
+                    int nz = z + dz;
+                    float w = (dx == 0 && dz == 0) ? 4.0f : 
+                             ((dx == 0 || dz == 0) ? 2.0f : 1.0f);
+                    
+                    sum += m_heightData[nz * width + nx] * w;
+                    weight += w;
+                }
+            }
+            
+            smoothedData[z * width + x] = sum / weight;
+        }
+    }
+    
+    // 保留边缘（不处理边界）
+    for (int z = 0; z < height; ++z)
+    {
+        for (int x = 0; x < width; ++x)
+        {
+            if (x == 0 || x == width - 1 || z == 0 || z == height - 1)
+            {
+                smoothedData[z * width + x] = m_heightData[z * width + x];
+            }
+        }
+    }
+    
+    // 应用平滑结果（混合原始和平滑数据，避免过度平滑）
+    float blendFactor = 0.7f;  // 70%平滑，30%原始
+    for (int i = 0; i < width * height; ++i)
+    {
+        m_heightData[i] = m_heightData[i] * (1.0f - blendFactor) + smoothedData[i] * blendFactor;
+    }
 }
 
 bool TerrainNew::GenerateChunks(ID3D11Device* device)
 {
     if (!device)
         return false;
+
+    // 创建chunk常量缓冲区
+    D3D11_BUFFER_DESC cbDesc = {};
+    cbDesc.Usage = D3D11_USAGE_DYNAMIC;
+    cbDesc.ByteWidth = sizeof(float) * 16;  // 4个float4 (chunkParams, chunkBounds, terrainParams, heightParams)
+    cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    
+    HRESULT hr = device->CreateBuffer(&cbDesc, nullptr, m_chunkConstantBuffer.GetAddressOf());
+    if (FAILED(hr))
+    {
+        OutputDebugStringW(L"[TerrainNew] Failed to create chunk constant buffer\n");
+        return false;
+    }
 
     // 计算chunk数量
     m_chunkCountX = (m_params.gridWidth - 1 + m_params.chunkSize - 1) / m_params.chunkSize;
@@ -380,9 +529,13 @@ void TerrainNew::GenerateChunkMesh(int chunkX, int chunkZ, int lodLevel,
             v.color[1] = 0.5f + colorFactor * 0.5f;
             v.color[2] = 0.5f + colorFactor * 0.5f;
 
-            // 纹理坐标
-            v.texCoord[0] = static_cast<float>(gridX) / (m_params.gridWidth - 1);
-            v.texCoord[1] = static_cast<float>(gridZ) / (m_params.gridHeight - 1);
+            // 纹理坐标：存储全局网格坐标（用于morphing和边界对齐）
+            // 使用全局网格坐标确保相邻chunk的边界顶点对齐
+            v.texCoord[0] = static_cast<float>(gridX);  // 全局网格X坐标
+            v.texCoord[1] = static_cast<float>(gridZ);  // 全局网格Z坐标
+            
+            // 注意：texCoord存储的是全局网格坐标，不是局部坐标
+            // 这样可以确保边界顶点在morphing时移动到相同的全局位置
 
             vertices.push_back(v);
         }
@@ -500,7 +653,13 @@ void TerrainNew::SelectChunks(const DirectX::XMFLOAT3& cameraPosition, std::vect
         
         // 计算LOD级别
         int lodLevel = CalculateLODLevel(distance);
+        
+        // 计算morphing因子（在切换到下一级LOD之前进行morphing）
+        float morphFactor = CalculateMorphFactor(distance, lodLevel);
+        
+        // 如果morphFactor接近1.0，应该使用下一级LOD（但为了简化，我们仍然使用当前LOD并应用morphing）
         chunk.lodLevel = lodLevel;
+        chunk.morphFactor = morphFactor;
         
         // 确保LOD级别有效
         if (lodLevel >= 0 && lodLevel < static_cast<int>(chunk.vertexBuffers.size()))
@@ -519,6 +678,38 @@ int TerrainNew::CalculateLODLevel(float distance) const
     }
     return m_params.maxLODLevels - 1;
 }
+
+float TerrainNew::CalculateMorphFactor(float distance, int lodLevel) const
+{
+    // CDLOD morphing：在LOD边界附近平滑过渡
+    // morphFactor = 0: 完全使用当前LOD几何
+    // morphFactor = 1: 完全morphed到下一个（更粗糙）LOD
+    
+    if (lodLevel >= m_params.maxLODLevels - 1)
+        return 0.0f;  // 最低LOD级别，不需要morphing
+    
+    // 获取当前LOD的距离阈值
+    float currentLODDist = m_params.lodDistances[lodLevel];
+    
+    // Morphing在距离阈值的指定比例处开始，在阈值处完成
+    float morphStart = currentLODDist * m_params.morphStartRatio;
+    float morphEnd = currentLODDist;
+    
+    if (distance <= morphStart)
+        return 0.0f;  // 距离很近，不需要morphing
+    
+    // 如果距离超过morphEnd，应该已经切换到下一级LOD了
+    // 但为了安全，我们仍然返回1.0（完全morphed）
+    if (distance >= morphEnd)
+        return 1.0f;  // 距离较远，完全morphed
+    
+    // 线性插值计算morphFactor
+    float morphFactor = (distance - morphStart) / (morphEnd - morphStart);
+    
+    // 确保在有效范围内
+    return std::max(0.0f, std::min(1.0f, morphFactor));
+}
+
 
 void TerrainNew::CalculateChunkHeightRange(TerrainChunk& chunk)
 {
@@ -572,6 +763,49 @@ void TerrainNew::Render(ID3D11DeviceContext* context, const DirectX::XMFLOAT3& c
         if (!chunk->vertexBuffers[lodLevel] || !chunk->indexBuffers[lodLevel])
             continue;
 
+        // 计算当前LOD的网格大小
+        int lodDivisor = 1 << lodLevel;
+        int chunkGridSize = m_params.chunkSize / lodDivisor;
+        chunkGridSize = std::max(2, chunkGridSize);
+
+        // 更新chunk常量缓冲区（传递morphing参数）
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        HRESULT hr = context->Map(m_chunkConstantBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+        if (SUCCEEDED(hr))
+        {
+            float* data = static_cast<float*>(mapped.pData);
+            
+            // chunkParams: x=morphFactor, y=lodLevel, z=chunkGridSize, w=unused
+            data[0] = chunk->morphFactor;
+            data[1] = static_cast<float>(lodLevel);
+            data[2] = static_cast<float>(chunkGridSize);
+            data[3] = 0.0f;
+            
+            // chunkBounds: x=minX, y=minZ, z=maxX, w=maxZ
+            data[4] = chunk->minX;
+            data[5] = chunk->minZ;
+            data[6] = chunk->maxX;
+            data[7] = chunk->maxZ;
+            
+            // terrainParams: x=worldSizeX, y=worldSizeZ, z=gridWidth-1, w=gridHeight-1
+            data[8] = m_params.worldSizeX;
+            data[9] = m_params.worldSizeZ;
+            data[10] = static_cast<float>(m_params.gridWidth - 1);
+            data[11] = static_cast<float>(m_params.gridHeight - 1);
+            
+            // heightParams: x=heightScale, y=heightOffset, z=1/(gridWidth-1), w=1/(gridHeight-1)
+            data[12] = m_params.heightScale;
+            data[13] = m_params.heightOffset;
+            data[14] = 1.0f / (m_params.gridWidth - 1);
+            data[15] = 1.0f / (m_params.gridHeight - 1);
+            
+            context->Unmap(m_chunkConstantBuffer.Get(), 0);
+        }
+
+        // 绑定chunk常量缓冲区到顶点着色器 slot 2
+        ID3D11Buffer* cb_ptr = m_chunkConstantBuffer.Get();
+        context->VSSetConstantBuffers(2, 1, &cb_ptr);
+
         // 设置顶点缓冲区
         UINT stride = sizeof(Vertex);
         UINT offset = 0;
@@ -590,6 +824,30 @@ void TerrainNew::Render(ID3D11DeviceContext* context, const DirectX::XMFLOAT3& c
         // 更新统计
         if (lodLevel < 8)
             m_renderStats.lodDistribution[lodLevel]++;
+    }
+    
+    // 调试输出（每300帧输出一次）
+    static int frameCount = 0;
+    if (++frameCount % 300 == 0)
+    {
+        float avgMorphFactor = 0.0f;
+        int morphingChunks = 0;
+        for (TerrainChunk* chunk : m_selectedChunks)
+        {
+            if (chunk->morphFactor > 0.001f)
+            {
+                avgMorphFactor += chunk->morphFactor;
+                morphingChunks++;
+            }
+        }
+        if (morphingChunks > 0)
+        {
+            avgMorphFactor /= morphingChunks;
+            wchar_t msg[256];
+            swprintf_s(msg, L"[TerrainNew] Morphing: %d chunks morphing, avg factor: %.3f\n",
+                      morphingChunks, avgMorphFactor);
+            OutputDebugStringW(msg);
+        }
     }
 }
 

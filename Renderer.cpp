@@ -2858,6 +2858,7 @@ bool Renderer::InitializeTerrain()
     params.lodDistances[1] = 150.0f;     // LOD 1: 150米内
     params.lodDistances[2] = 400.0f;     // LOD 2: 400米内
     params.lodDistances[3] = 1000.0f;    // LOD 3: 1000米内（最低细节）
+    params.morphStartRatio = 0.66f;      // Morphing在距离阈值的66%处开始
     
     // 尝试加载高度图，如果失败则使用程序化生成
     wchar_t exePath[MAX_PATH] = { 0 };

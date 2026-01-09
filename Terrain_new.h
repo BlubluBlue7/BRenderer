@@ -31,6 +31,9 @@ struct TerrainNewParams
     int chunkSize = 64;               // 每个chunk的网格大小（顶点数-1）
     int maxLODLevels = 4;             // 最大LOD级别数
     float lodDistances[4] = {50.0f, 150.0f, 400.0f, 1000.0f};  // 每个LOD级别的距离阈值
+    
+    // Morphing参数
+    float morphStartRatio = 0.66f;   // Morphing开始距离比例（66%处开始）
 };
 
 // ============================================================================
@@ -41,6 +44,7 @@ struct TerrainChunk
     int chunkX;                       // Chunk在X方向的索引
     int chunkZ;                       // Chunk在Z方向的索引
     int lodLevel;                     // 当前LOD级别
+    float morphFactor;                // Morphing因子 (0-1)
     
     float minX, minZ, maxX, maxZ;    // 世界空间边界
     float minY, maxY;                 // 高度范围（用于剔除）
@@ -138,6 +142,9 @@ private:
     // 生成程序化高度数据（随机算法）
     void GenerateProceduralHeight();
 
+    // 平滑高度图（减少突变）
+    void SmoothHeightmap(int width, int height);
+
     // 生成所有chunk的网格（所有LOD级别）
     bool GenerateChunks(ID3D11Device* device);
 
@@ -158,6 +165,9 @@ private:
 
     // 计算chunk的LOD级别（基于距离）
     int CalculateLODLevel(float distance) const;
+
+    // 计算morphing因子（基于距离和LOD级别）
+    float CalculateMorphFactor(float distance, int lodLevel) const;
 
     // 计算chunk的高度范围
     void CalculateChunkHeightRange(TerrainChunk& chunk);
@@ -182,4 +192,7 @@ private:
     // 渲染统计
     RenderStats m_renderStats;
     std::vector<TerrainChunk*> m_selectedChunks;
+    
+    // Chunk常量缓冲区（用于传递morphing参数）
+    Microsoft::WRL::ComPtr<ID3D11Buffer> m_chunkConstantBuffer;
 };
