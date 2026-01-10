@@ -898,7 +898,7 @@ int TerrainNew::BuildQuadTreeRecursive(float minX, float minZ, float maxX, float
     node.centerZ = (minZ + maxZ) * 0.5f;
     node.size = maxX - minX;
     node.level = level;
-    node.lodLevel = level;  // LOD级别基于树的层级
+    // 注意：LOD级别不再基于树层级，而是在选择时基于距离动态计算
     node.hasChildren = false;
     node.isLeaf = false;
 
@@ -997,10 +997,21 @@ void TerrainNew::SelectChunks(const DirectX::XMFLOAT3& cameraPosition, std::vect
     // 计算视距（基于最远的LOD距离）
     float viewDistance = m_params.lodDistances[m_params.maxLODLevels - 1] * 1.5f;
 
-    // 从根节点开始递归选择
+    // 第一遍：从根节点开始递归选择，计算初始LOD
     for (int rootIndex : m_rootNodeIndices)
     {
         SelectChunksRecursive(rootIndex, cameraPosition, viewDistance, outChunks);
+    }
+    
+    // 第二遍：应用邻居LOD约束（确保相邻chunk LOD差不超过1级）
+    // 这需要多次迭代直到LOD稳定
+    ApplyNeighborLODConstraints(outChunks);
+    
+    // 第三遍：重新计算morphing因子（基于约束后的LOD）
+    for (TerrainChunk* chunk : outChunks)
+    {
+        float chunkDistXZ = chunk->GetDistanceToCameraXZ(cameraPosition.x, cameraPosition.z);
+        chunk->morphFactor = CalculateMorphFactor(chunkDistXZ, chunk->lodLevel);
     }
 }
 
@@ -1012,14 +1023,15 @@ void TerrainNew::SelectChunksRecursive(int nodeIndex, const DirectX::XMFLOAT3& c
 
     QuadTreeNode& node = m_quadTree[nodeIndex];
 
-    // 1. 计算到相机的距离
-    float distance = node.GetDistanceToCamera(cameraPosition.x, cameraPosition.y, cameraPosition.z);
+    // 1. 计算到相机的距离（使用XZ平面距离，更稳定）
+    float distanceXZ = node.GetDistanceToCameraXZ(cameraPosition.x, cameraPosition.z);
+    float distance3D = node.GetDistanceToCamera(cameraPosition.x, cameraPosition.y, cameraPosition.z);
 
-    // 2. 简单的距离剔除
-    if (distance > viewDistance + node.size * 0.5f)
+    // 2. 距离剔除
+    if (distanceXZ > viewDistance + node.size * 0.707f)
         return;
 
-    // 3. 简单的高度剔除
+    // 3. 高度剔除
     if (cameraPosition.y < node.minY - 200.0f || cameraPosition.y > node.maxY + 500.0f)
         return;
 
@@ -1037,7 +1049,7 @@ void TerrainNew::SelectChunksRecursive(int nodeIndex, const DirectX::XMFLOAT3& c
     }
     else
     {
-        // 5. 使用当前节点的chunk（较低细节）
+        // 5. 使用当前节点的chunk
         // 遍历该节点覆盖的所有chunk
         for (int z = node.chunkStartZ; z <= node.chunkEndZ; ++z)
         {
@@ -1048,47 +1060,14 @@ void TerrainNew::SelectChunksRecursive(int nodeIndex, const DirectX::XMFLOAT3& c
                 {
                     TerrainChunk& chunk = m_chunks[chunkIndex];
                     
-                    // 计算chunk到相机的距离
-                    float chunkDist = chunk.GetDistanceToCamera(cameraPosition.x, cameraPosition.y, cameraPosition.z);
+                    // 计算chunk到相机的XZ平面距离（更一致的LOD计算）
+                    float chunkDistXZ = chunk.GetDistanceToCameraXZ(cameraPosition.x, cameraPosition.z);
                     
-                    // 基于距离计算LOD级别
-                    int lodLevel = CalculateLODLevel(chunkDist);
+                    // 基于距离计算初始LOD级别
+                    int lodLevel = CalculateLODLevel(chunkDistXZ);
                     
-                    // 检查邻居chunk的LOD，确保边界连续性
-                    // 规则：当前chunk的LOD不能比邻居低超过1级
-                    int maxNeighborLOD = lodLevel;
-                    
-                    // 检查4个邻居（上下左右）- 使用正确的偏移数组
-                    static const int neighborOffsets[4][2] = {
-                        {0, -1},  // 上
-                        {0,  1},  // 下
-                        {-1, 0},  // 左
-                        { 1, 0}   // 右
-                    };
-                    
-                    for (int i = 0; i < 4; ++i) {
-                        int nx = x + neighborOffsets[i][0];
-                        int nz = z + neighborOffsets[i][1];
-                        
-                        if (nx >= 0 && nx < m_chunkCountX && nz >= 0 && nz < m_chunkCountZ) {
-                            int neighborIndex = nz * m_chunkCountX + nx;
-                            if (neighborIndex >= 0 && neighborIndex < static_cast<int>(m_chunks.size())) {
-                                const TerrainChunk& neighbor = m_chunks[neighborIndex];
-                                maxNeighborLOD = std::max(maxNeighborLOD, neighbor.lodLevel);
-                            }
-                        }
-                    }
-                    
-                    // 如果邻居有更高细节的LOD（更小的数字），当前chunk不能相差超过1级
-                    // 这确保了边界处的连续性
-                    lodLevel = std::min(lodLevel, maxNeighborLOD + 1);
-                    
-                    // 计算morphing因子
-                    float morphFactor = CalculateMorphFactor(chunkDist, lodLevel);
-                    
-                    // 设置chunk的LOD
+                    // 设置chunk的初始LOD（邻居约束将在后续统一处理）
                     chunk.lodLevel = lodLevel;
-                    chunk.morphFactor = morphFactor;
                     
                     // 确保LOD级别有效
                     if (lodLevel >= 0 && lodLevel < static_cast<int>(chunk.vertexBuffers.size()))
@@ -1104,15 +1083,57 @@ void TerrainNew::SelectChunksRecursive(int nodeIndex, const DirectX::XMFLOAT3& c
 bool TerrainNew::ShouldSubdivide(const QuadTreeNode& node, const DirectX::XMFLOAT3& cameraPosition,
                                  float viewDistance) const
 {
-    // 计算到相机的距离
-    float distance = node.GetDistanceToCamera(cameraPosition.x, cameraPosition.y, cameraPosition.z);
+    // 使用XZ平面距离来决定细分（忽略高度差，更稳定）
+    float distance = node.GetDistanceToCameraXZ(cameraPosition.x, cameraPosition.z);
     
-    // 基于距离和节点大小决定是否细分
-    // 距离越近，节点越大，越应该细分
-    float subdivisionDistance = node.size * 2.0f;  // 可调整因子
+    // ================================================================
+    // 基于屏幕空间误差的细分决策
+    // ================================================================
+    // 核心思想：
+    // 1. 节点的"几何误差"与节点大小成正比
+    // 2. 屏幕空间误差 = 几何误差 / 距离 * 屏幕系数
+    // 3. 当屏幕空间误差超过阈值时，需要细分
     
-    // 如果距离小于细分距离，使用子节点
-    return distance < subdivisionDistance;
+    // 几何误差：节点越大，包含的地形细节越多，误差越大
+    // 这里使用节点对角线长度的一半作为几何误差的估计
+    float geometricError = node.size * 0.707f;  // sqrt(2)/2 ≈ 0.707
+    
+    // 屏幕空间误差系数（可调整）
+    // 较小的值 = 更激进的细分（更高质量）
+    // 较大的值 = 更保守的细分（更高性能）
+    const float screenErrorThreshold = 50.0f;  // 像素误差阈值
+    const float fovFactor = 1000.0f;  // 基于FOV和屏幕分辨率的估计系数
+    
+    // 计算屏幕空间误差
+    // 当距离很近时，避免除零
+    float safeDistance = std::max(1.0f, distance);
+    float screenError = (geometricError / safeDistance) * fovFactor;
+    
+    // 方法1：基于屏幕空间误差
+    bool subdivideByScreenError = screenError > screenErrorThreshold;
+    
+    // 方法2：基于LOD距离阈值（确保与chunk LOD计算一致）
+    // 如果节点内最近点的LOD级别需要比节点能提供的更精细，则细分
+    int requiredLOD = CalculateLODLevel(distance);
+    
+    // 节点能提供的最粗LOD（基于其覆盖的chunk数量）
+    // 如果节点只覆盖1个chunk，不需要进一步细分
+    int chunkWidth = node.chunkEndX - node.chunkStartX + 1;
+    int chunkHeight = node.chunkEndZ - node.chunkStartZ + 1;
+    bool hasMultipleChunks = (chunkWidth > 1 || chunkHeight > 1);
+    
+    // 组合决策：
+    // - 如果节点覆盖多个chunk，且屏幕误差较大或需要高细节LOD，则细分
+    // - 如果节点只覆盖1个chunk，不需要细分（已经是叶子）
+    if (!hasMultipleChunks)
+        return false;
+    
+    // 结合两种方法：屏幕误差驱动 + LOD距离驱动
+    // 使用较保守的策略：只要任一条件满足就细分
+    bool subdivideByLOD = (requiredLOD < m_params.maxLODLevels - 1) && 
+                          (distance < m_params.lodDistances[std::max(0, requiredLOD)]);
+    
+    return subdivideByScreenError || subdivideByLOD;
 }
 
 int TerrainNew::CalculateLODLevel(float distance) const
@@ -1166,6 +1187,99 @@ float TerrainNew::CalculateMorphFactor(float distance, int lodLevel) const
     
     // 确保在有效范围内
     return std::max(0.0f, std::min(1.0f, morphFactor));
+}
+
+int TerrainNew::GetNeighborMaxLOD(int chunkX, int chunkZ, const std::vector<int>& lodMap) const
+{
+    // 检查8个方向的邻居（包括对角线）
+    // 返回邻居中最精细的LOD（最小的数字）
+    static const int neighborOffsets[8][2] = {
+        { 0, -1},  // 上
+        { 0,  1},  // 下
+        {-1,  0},  // 左
+        { 1,  0},  // 右
+        {-1, -1},  // 左上
+        { 1, -1},  // 右上
+        {-1,  1},  // 左下
+        { 1,  1}   // 右下
+    };
+    
+    int minNeighborLOD = m_params.maxLODLevels - 1;  // 初始化为最粗糙的LOD
+    
+    for (int i = 0; i < 8; ++i)
+    {
+        int nx = chunkX + neighborOffsets[i][0];
+        int nz = chunkZ + neighborOffsets[i][1];
+        
+        // 检查边界
+        if (nx >= 0 && nx < m_chunkCountX && nz >= 0 && nz < m_chunkCountZ)
+        {
+            int neighborIndex = nz * m_chunkCountX + nx;
+            if (neighborIndex >= 0 && neighborIndex < static_cast<int>(lodMap.size()))
+            {
+                int neighborLOD = lodMap[neighborIndex];
+                if (neighborLOD >= 0)  // -1 表示未选中的chunk
+                {
+                    minNeighborLOD = std::min(minNeighborLOD, neighborLOD);
+                }
+            }
+        }
+    }
+    
+    return minNeighborLOD;
+}
+
+void TerrainNew::ApplyNeighborLODConstraints(std::vector<TerrainChunk*>& chunks)
+{
+    if (chunks.empty())
+        return;
+    
+    // 创建LOD映射表（所有chunk的当前LOD，未选中的标记为-1）
+    std::vector<int> lodMap(m_chunkCountX * m_chunkCountZ, -1);
+    
+    // 初始化LOD映射
+    for (TerrainChunk* chunk : chunks)
+    {
+        int index = chunk->chunkZ * m_chunkCountX + chunk->chunkX;
+        if (index >= 0 && index < static_cast<int>(lodMap.size()))
+        {
+            lodMap[index] = chunk->lodLevel;
+        }
+    }
+    
+    // 迭代应用邻居约束，直到LOD稳定
+    // 约束规则：当前chunk的LOD不能比任何邻居粗糙超过1级
+    // （即如果邻居LOD=1，当前chunk最多为LOD=2）
+    const int maxIterations = m_params.maxLODLevels + 2;  // 防止无限循环
+    
+    for (int iteration = 0; iteration < maxIterations; ++iteration)
+    {
+        bool changed = false;
+        
+        for (TerrainChunk* chunk : chunks)
+        {
+            int index = chunk->chunkZ * m_chunkCountX + chunk->chunkX;
+            int currentLOD = lodMap[index];
+            
+            // 获取邻居中最精细的LOD
+            int minNeighborLOD = GetNeighborMaxLOD(chunk->chunkX, chunk->chunkZ, lodMap);
+            
+            // 约束：当前LOD不能比邻居的最精细LOD粗糙超过1级
+            // 即：currentLOD <= minNeighborLOD + 1
+            int constrainedLOD = std::min(currentLOD, minNeighborLOD + 1);
+            
+            if (constrainedLOD != currentLOD)
+            {
+                lodMap[index] = constrainedLOD;
+                chunk->lodLevel = constrainedLOD;
+                changed = true;
+            }
+        }
+        
+        // 如果没有变化，LOD已经稳定
+        if (!changed)
+            break;
+    }
 }
 
 
