@@ -92,6 +92,7 @@ private:
     // 地形相关shader资源
     Microsoft::WRL::ComPtr<ID3D11VertexShader>    m_terrainVS;
     Microsoft::WRL::ComPtr<ID3D11PixelShader>     m_terrainPS;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader>     m_terrainWireframePS;  // 线框像素着色器（黑色）
     Microsoft::WRL::ComPtr<ID3D11InputLayout>     m_terrainInputLayout;
     Microsoft::WRL::ComPtr<ID3DBlob>              m_terrainVSBlob;
     Microsoft::WRL::ComPtr<ID3D11Buffer>          m_skyboxVertexBuffer;

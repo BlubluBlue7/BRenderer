@@ -2576,6 +2576,22 @@ bool Renderer::CreateTerrainShaders()
         return false;
     }
     
+    // 编译线框像素着色器（用于叠加黑色线框）
+    Microsoft::WRL::ComPtr<ID3DBlob> wireframePsBlob;
+    if (CompileShaderFromFile(L"Shaders/TerrainWireframePS.hlsl", "PS", "ps_5_0", wireframePsBlob.GetAddressOf()))
+    {
+        hr = m_device->CreatePixelShader(
+            wireframePsBlob->GetBufferPointer(),
+            wireframePsBlob->GetBufferSize(),
+            nullptr,
+            m_terrainWireframePS.GetAddressOf()
+        );
+        if (SUCCEEDED(hr))
+        {
+            OutputDebugStringW(L"[TERRAIN DEBUG] Terrain wireframe pixel shader created successfully.\n");
+        }
+    }
+    
     // 创建地形输入布局（与通用shader相同，因为使用相同的Vertex结构）
     D3D11_INPUT_ELEMENT_DESC terrainLayout[] =
     {
@@ -2611,18 +2627,18 @@ bool Renderer::CreateTerrainShaders()
 // ============================================================================
 bool Renderer::CreateTerrainRasterizerStates()
 {
-    // 创建线框光栅化状态
+    // 创建线框光栅化状态（用于叠加渲染）
     D3D11_RASTERIZER_DESC wireframeDesc = {};
     wireframeDesc.FillMode = D3D11_FILL_WIREFRAME;  // 线框模式
     wireframeDesc.CullMode = D3D11_CULL_BACK;       // 背面剔除
     wireframeDesc.FrontCounterClockwise = false;    // 逆时针为正面
-    wireframeDesc.DepthBias = 0;
+    wireframeDesc.DepthBias = -100;                 // 深度偏移，让线框稍微靠前避免z-fighting
     wireframeDesc.DepthBiasClamp = 0.0f;
-    wireframeDesc.SlopeScaledDepthBias = 0.0f;
+    wireframeDesc.SlopeScaledDepthBias = -1.0f;     // 斜率缩放偏移
     wireframeDesc.DepthClipEnable = true;
     wireframeDesc.ScissorEnable = false;
     wireframeDesc.MultisampleEnable = false;
-    wireframeDesc.AntialiasedLineEnable = false;
+    wireframeDesc.AntialiasedLineEnable = true;     // 开启线条抗锯齿
     
     HRESULT hr = m_device->CreateRasterizerState(&wireframeDesc, m_terrainWireframeRasterizerState.GetAddressOf());
     if (FAILED(hr))
@@ -2854,11 +2870,11 @@ bool Renderer::InitializeTerrain()
     // Chunk和LOD参数
     params.chunkSize = 64;               // 每个chunk的网格大小（顶点数-1）
     params.maxLODLevels = 4;             // 最大LOD级别数
-    params.lodDistances[0] = 50.0f;      // LOD 0: 50米内（最高细节）
-    params.lodDistances[1] = 150.0f;     // LOD 1: 150米内
-    params.lodDistances[2] = 400.0f;     // LOD 2: 400米内
-    params.lodDistances[3] = 1000.0f;    // LOD 3: 1000米内（最低细节）
-    params.morphStartRatio = 0.66f;      // Morphing在距离阈值的66%处开始
+    params.lodDistances[0] = 100.0f;     // LOD 0: 100米内（最高细节）
+    params.lodDistances[1] = 250.0f;     // LOD 1: 250米内
+    params.lodDistances[2] = 600.0f;     // LOD 2: 600米内
+    params.lodDistances[3] = 1500.0f;    // LOD 3: 1500米内（最低细节）
+    params.morphStartRatio = 0.66f;       // Morphing在距离阈值的30%处开始（70%的范围用于过渡）
     
     // 尝试加载高度图，如果失败则使用程序化生成
     wchar_t exePath[MAX_PATH] = { 0 };
@@ -2952,15 +2968,8 @@ void Renderer::RenderTerrain()
     Microsoft::WRL::ComPtr<ID3D11RasterizerState> oldRasterizerState;
     m_context->RSGetState(oldRasterizerState.GetAddressOf());
     
-    // 设置光栅化状态
-    if (m_terrainWireframe && m_terrainWireframeRasterizerState)
-    {
-        m_context->RSSetState(m_terrainWireframeRasterizerState.Get());
-    }
-    else
-    {
-        m_context->RSSetState(nullptr);
-    }
+    // 先使用正常填充模式渲染（始终执行）
+    m_context->RSSetState(nullptr);
     
     // 设置地形shader和输入布局
     m_context->IASetInputLayout(m_terrainInputLayout.Get());
@@ -3041,8 +3050,30 @@ void Renderer::RenderTerrain()
         firstRender = false;
     }
     
-    // 渲染地形（TerrainNew需要相机位置）
+    // 渲染地形（TerrainNew需要相机位置）- 正常填充模式
     m_terrain->Render(m_context.Get(), camPos);
+    
+    // ========================================================================
+    // 如果启用线框模式，叠加渲染黑色线框
+    // ========================================================================
+    if (m_terrainWireframe && m_terrainWireframeRasterizerState && m_terrainWireframePS)
+    {
+        // 切换到线框光栅化状态
+        m_context->RSSetState(m_terrainWireframeRasterizerState.Get());
+        
+        // 使用线框像素着色器（纯黑色）
+        m_context->PSSetShader(m_terrainWireframePS.Get(), nullptr, 0);
+        
+        // 添加深度偏移避免z-fighting（让线框稍微靠前）
+        // 通过修改深度状态或者在常量缓冲区中添加偏移
+        // 这里直接再渲染一遍，依靠线框模式的特性
+        
+        // 再次渲染地形（线框模式）
+        m_terrain->Render(m_context.Get(), camPos);
+        
+        // 恢复正常像素着色器
+        m_context->PSSetShader(m_terrainPS.Get(), nullptr, 0);
+    }
     
     // 恢复光栅化状态
     m_context->RSSetState(oldRasterizerState.Get());

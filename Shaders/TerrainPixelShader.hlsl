@@ -267,22 +267,18 @@ float4 PS(PSInput input) : SV_TARGET
     finalColor = lerp(finalColor, fogColor, fogFactor * 0.7);
     
     // ========================================================================
-    // LOD调试可视化（可通过常量缓冲区控制开关）
+    // LOD调试可视化 - 使用顶点着色器传递的调试颜色
     // ========================================================================
-    // 取消下面的注释以启用LOD调试颜色
-    /*
-    int lodIndex = clamp((int)lodLevel, 0, 9);
-    float3 lodDebugColor = lodColors[lodIndex];
+    // 直接使用顶点颜色（包含LOD级别信息）
+    // LOD 0 = 绿色, LOD 1 = 蓝色, LOD 2 = 黄色, LOD 3 = 红色
+    // Morphing时颜色会平滑过渡
+    finalColor = lerp(finalColor, input.color, 0.7);  // 70%调试色 + 30%原色
     
-    // 混合LOD颜色（50%调试色 + 50%原色）
-    finalColor = lerp(finalColor, lodDebugColor, 0.5);
-    
-    // 在LOD边界处显示morphing效果（白色边缘）
+    // 在morphing时增加亮度提示
     if (morphFactor > 0.01 && morphFactor < 0.99)
     {
-        finalColor = lerp(finalColor, float3(1, 1, 1), morphFactor * 0.3);
+        finalColor = lerp(finalColor, float3(1, 1, 1), morphFactor * 0.2);
     }
-    */
     
     // ========================================================================
     // 输出

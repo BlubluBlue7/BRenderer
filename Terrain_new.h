@@ -37,6 +37,16 @@ struct TerrainNewParams
 };
 
 // ============================================================================
+// 共享LOD索引数据 - 所有chunk共享相同LOD级别的索引
+// ============================================================================
+struct SharedLODIndices
+{
+    Microsoft::WRL::ComPtr<ID3D11Buffer> indexBuffer;   // 索引缓冲区
+    UINT indexCount;                                    // 索引数量
+    int gridSize;                                       // 网格大小（顶点数-1）
+};
+
+// ============================================================================
 // Chunk结构 - 表示地形的一个区块
 // ============================================================================
 struct TerrainChunk
@@ -49,10 +59,8 @@ struct TerrainChunk
     float minX, minZ, maxX, maxZ;    // 世界空间边界
     float minY, maxY;                 // 高度范围（用于剔除）
     
-    // GPU资源（每个LOD级别都有独立的缓冲区）
-    std::vector<Microsoft::WRL::ComPtr<ID3D11Buffer>> vertexBuffers;  // 每个LOD的顶点缓冲区
-    std::vector<Microsoft::WRL::ComPtr<ID3D11Buffer>> indexBuffers;   // 每个LOD的索引缓冲区
-    std::vector<UINT> indexCounts;                                    // 每个LOD的索引数量
+    // 每个chunk的顶点缓冲区（不同LOD级别）
+    std::vector<Microsoft::WRL::ComPtr<ID3D11Buffer>> vertexBuffers;
     
     // 计算到相机的距离
     float GetDistanceToCamera(float camX, float camY, float camZ) const
@@ -78,26 +86,84 @@ struct TerrainChunk
 };
 
 // ============================================================================
-// 四叉树节点
+// 简单的AABB包围盒（用于视锥剔除）
+// ============================================================================
+struct AABB
+{
+    float minX, minY, minZ;
+    float maxX, maxY, maxZ;
+    
+    AABB() : minX(0), minY(0), minZ(0), maxX(0), maxY(0), maxZ(0) {}
+    
+    AABB(float minX_, float minY_, float minZ_, float maxX_, float maxY_, float maxZ_)
+        : minX(minX_), minY(minY_), minZ(minZ_)
+        , maxX(maxX_), maxY(maxY_), maxZ(maxZ_) {}
+    
+    // 获取中心点
+    void GetCenter(float& x, float& y, float& z) const
+    {
+        x = (minX + maxX) * 0.5f;
+        y = (minY + maxY) * 0.5f;
+        z = (minZ + maxZ) * 0.5f;
+    }
+    
+    // 获取半径（用于球体近似）
+    float GetRadius() const
+    {
+        float dx = (maxX - minX) * 0.5f;
+        float dy = (maxY - minY) * 0.5f;
+        float dz = (maxZ - minZ) * 0.5f;
+        return sqrtf(dx * dx + dy * dy + dz * dz);
+    }
+};
+
+// ============================================================================
+// 四叉树节点 - 支持真正的层次结构
 // ============================================================================
 struct QuadTreeNode
 {
-    float minX, minZ, maxX, maxZ;    // 世界空间边界
-    float minY, maxY;                 // 高度范围
+    float minX, minZ, maxX, maxZ;    // 世界空间边界（XZ平面）
+    float minY, maxY;                 // 高度范围（用于剔除）
+    float centerX, centerZ;           // 中心点（用于距离计算）
+    float size;                       // 节点大小（边长）
     
-    int lodLevel;                     // LOD级别
-    int chunkX, chunkZ;                // Chunk索引
+    int level;                        // 树的层级（0=根节点）
+    int lodLevel;                     // 对应的LOD级别
     
-    int childIndices[4];              // 子节点索引 [TopLeft, TopRight, BottomLeft, BottomRight]
+    // 如果是叶子节点，存储对应的chunk索引
+    int chunkStartX, chunkStartZ;     // Chunk起始索引
+    int chunkEndX, chunkEndZ;         // Chunk结束索引
+    bool isLeaf;                      // 是否是叶子节点
+    
+    // 如果是分支节点，存储子节点索引
+    int childIndices[4];              // 子节点索引 [0]=LeftTop, [1]=RightTop, [2]=LeftBottom, [3]=RightBottom
     bool hasChildren;
     
     QuadTreeNode()
         : minX(0), minZ(0), maxX(0), maxZ(0)
         , minY(0), maxY(0)
-        , lodLevel(0), chunkX(0), chunkZ(0)
-        , hasChildren(false)
+        , centerX(0), centerZ(0), size(0)
+        , level(0), lodLevel(0)
+        , chunkStartX(0), chunkStartZ(0)
+        , chunkEndX(0), chunkEndZ(0)
+        , isLeaf(false), hasChildren(false)
     {
         childIndices[0] = childIndices[1] = childIndices[2] = childIndices[3] = -1;
+    }
+    
+    // 计算到相机的距离（使用中心点）
+    float GetDistanceToCamera(float camX, float camY, float camZ) const
+    {
+        float dx = centerX - camX;
+        float dy = ((minY + maxY) * 0.5f) - camY;
+        float dz = centerZ - camZ;
+        return sqrtf(dx * dx + dy * dy + dz * dz);
+    }
+    
+    // 检查点是否在节点范围内
+    bool Contains(float x, float z) const
+    {
+        return x >= minX && x <= maxX && z >= minZ && z <= maxZ;
     }
 };
 
@@ -145,23 +211,49 @@ private:
     // 平滑高度图（减少突变）
     void SmoothHeightmap(int width, int height);
 
-    // 生成所有chunk的网格（所有LOD级别）
-    bool GenerateChunks(ID3D11Device* device);
+    // 生成共享的LOD索引（所有LOD级别）
+    bool GenerateSharedLODIndices(ID3D11Device* device);
+    
+    // 创建高度图GPU纹理（用于shader中采样）
+    bool CreateHeightmapTexture(ID3D11Device* device);
+    
+    // 生成所有chunk的顶点数据
+    bool GenerateChunkVertices(ID3D11Device* device);
 
-    // 生成单个chunk的网格（指定LOD级别）
-    void GenerateChunkMesh(int chunkX, int chunkZ, int lodLevel,
-                           std::vector<Vertex>& vertices, std::vector<uint32_t>& indices);
+    // 生成LOD索引模板
+    void GenerateLODIndicesTemplate(int lodLevel, int gridSize, std::vector<uint32_t>& indices);
 
-    // 创建chunk的GPU缓冲区
-    bool CreateChunkBuffers(ID3D11Device* device, TerrainChunk& chunk,
-                            const std::vector<Vertex>& vertices, const std::vector<uint32_t>& indices,
-                            int lodLevel);
+    // 生成单个chunk特定LOD的顶点
+    void GenerateChunkLODVertices(int chunkX, int chunkZ, int lodLevel, std::vector<Vertex>& vertices);
 
-    // 构建四叉树
+    // 创建LOD索引缓冲区
+    bool CreateLODIndexBuffer(ID3D11Device* device, SharedLODIndices& lodIndices,
+                              const std::vector<uint32_t>& indices);
+    
+    // 创建chunk顶点缓冲区
+    bool CreateChunkVertexBuffer(ID3D11Device* device, TerrainChunk& chunk, int lodLevel,
+                                 const std::vector<Vertex>& vertices);
+
+    // 构建四叉树（递归构建层次结构）
     void BuildQuadTree();
+    
+    // 递归构建四叉树节点
+    int BuildQuadTreeRecursive(float minX, float minZ, float maxX, float maxZ, 
+                               int level, int maxDepth);
+    
+    // 计算节点的高度范围
+    void CalculateNodeHeightRange(QuadTreeNode& node);
 
-    // 选择要渲染的chunk（基于距离和LOD）
+    // 选择要渲染的chunk（基于四叉树，支持视锥剔除）
     void SelectChunks(const DirectX::XMFLOAT3& cameraPosition, std::vector<TerrainChunk*>& outChunks);
+    
+    // 递归选择chunk（四叉树遍历）
+    void SelectChunksRecursive(int nodeIndex, const DirectX::XMFLOAT3& cameraPosition,
+                               float viewDistance, std::vector<TerrainChunk*>& outChunks);
+    
+    // 判断节点是否应该细分
+    bool ShouldSubdivide(const QuadTreeNode& node, const DirectX::XMFLOAT3& cameraPosition,
+                         float viewDistance) const;
 
     // 计算chunk的LOD级别（基于距离）
     int CalculateLODLevel(float distance) const;
@@ -180,6 +272,9 @@ private:
     int m_heightmapWidth;
     int m_heightmapHeight;
 
+    // 共享的LOD索引数据（所有chunk共享）
+    std::vector<SharedLODIndices> m_sharedLODIndices;
+    
     // Chunk数据
     std::vector<TerrainChunk> m_chunks;
     int m_chunkCountX;
@@ -195,4 +290,9 @@ private:
     
     // Chunk常量缓冲区（用于传递morphing参数）
     Microsoft::WRL::ComPtr<ID3D11Buffer> m_chunkConstantBuffer;
+    
+    // 高度图纹理资源（用于shader中动态采样高度）
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_heightmapTexture;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_heightmapSRV;
+    Microsoft::WRL::ComPtr<ID3D11SamplerState> m_heightmapSampler;
 };

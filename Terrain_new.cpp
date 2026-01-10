@@ -51,8 +51,12 @@ bool TerrainNew::CreateFromHeightmap(ID3D11Device* device, const std::wstring& h
         GenerateProceduralHeight();
     }
 
-    // 生成chunk网格
-    if (!GenerateChunks(device))
+    // 生成共享的LOD索引
+    if (!GenerateSharedLODIndices(device))
+        return false;
+    
+    // 生成所有chunk的顶点数据
+    if (!GenerateChunkVertices(device))
         return false;
 
     // 构建四叉树
@@ -76,8 +80,12 @@ bool TerrainNew::CreateProcedural(ID3D11Device* device, const TerrainNewParams& 
     // 生成程序化高度数据
     GenerateProceduralHeight();
 
-    // 生成chunk网格
-    if (!GenerateChunks(device))
+    // 生成共享的LOD索引
+    if (!GenerateSharedLODIndices(device))
+        return false;
+    
+    // 生成所有chunk的顶点数据
+    if (!GenerateChunkVertices(device))
         return false;
 
     // 构建四叉树
@@ -323,15 +331,86 @@ void TerrainNew::SmoothHeightmap(int width, int height)
     }
 }
 
-bool TerrainNew::GenerateChunks(ID3D11Device* device)
+bool TerrainNew::CreateHeightmapTexture(ID3D11Device* device)
+{
+    if (!device || m_heightData.empty())
+        return false;
+    
+    // 创建高度图纹理（R32_FLOAT格式，存储归一化高度值）
+    D3D11_TEXTURE2D_DESC texDesc = {};
+    texDesc.Width = m_heightmapWidth;
+    texDesc.Height = m_heightmapHeight;
+    texDesc.MipLevels = 1;
+    texDesc.ArraySize = 1;
+    texDesc.Format = DXGI_FORMAT_R32_FLOAT;  // 32位浮点格式，存储高度值
+    texDesc.SampleDesc.Count = 1;
+    texDesc.SampleDesc.Quality = 0;
+    texDesc.Usage = D3D11_USAGE_DEFAULT;
+    texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    texDesc.CPUAccessFlags = 0;
+    
+    D3D11_SUBRESOURCE_DATA initData = {};
+    initData.pSysMem = m_heightData.data();
+    initData.SysMemPitch = m_heightmapWidth * sizeof(float);
+    initData.SysMemSlicePitch = 0;
+    
+    HRESULT hr = device->CreateTexture2D(&texDesc, &initData, m_heightmapTexture.GetAddressOf());
+    if (FAILED(hr))
+    {
+        OutputDebugStringW(L"[TerrainNew] Failed to create heightmap texture\n");
+        return false;
+    }
+    
+    // 创建Shader Resource View
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Format = texDesc.Format;
+    srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Texture2D.MipLevels = 1;
+    srvDesc.Texture2D.MostDetailedMip = 0;
+    
+    hr = device->CreateShaderResourceView(m_heightmapTexture.Get(), &srvDesc, m_heightmapSRV.GetAddressOf());
+    if (FAILED(hr))
+    {
+        OutputDebugStringW(L"[TerrainNew] Failed to create heightmap SRV\n");
+        return false;
+    }
+    
+    // 创建采样器状态（线性插值）
+    D3D11_SAMPLER_DESC samplerDesc = {};
+    samplerDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    samplerDesc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+    samplerDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+    samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    samplerDesc.MipLODBias = 0.0f;
+    samplerDesc.MaxAnisotropy = 1;
+    samplerDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    samplerDesc.MinLOD = 0;
+    samplerDesc.MaxLOD = D3D11_FLOAT32_MAX;
+    
+    hr = device->CreateSamplerState(&samplerDesc, m_heightmapSampler.GetAddressOf());
+    if (FAILED(hr))
+    {
+        OutputDebugStringW(L"[TerrainNew] Failed to create heightmap sampler\n");
+        return false;
+    }
+    
+    wchar_t msg[256];
+    swprintf_s(msg, L"[TerrainNew] Heightmap texture created: %dx%d (R32_FLOAT)\n", 
+               m_heightmapWidth, m_heightmapHeight);
+    OutputDebugStringW(msg);
+    
+    return true;
+}
+
+bool TerrainNew::GenerateSharedLODIndices(ID3D11Device* device)
 {
     if (!device)
         return false;
 
-    // 创建chunk常量缓冲区
+    // 创建chunk常量缓冲区（5个float4 = 20个float）
     D3D11_BUFFER_DESC cbDesc = {};
     cbDesc.Usage = D3D11_USAGE_DYNAMIC;
-    cbDesc.ByteWidth = sizeof(float) * 16;  // 4个float4 (chunkParams, chunkBounds, terrainParams, heightParams)
+    cbDesc.ByteWidth = sizeof(float) * 20;  // chunkParams + chunkBounds + terrainParams + heightParams + cameraParams
     cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     cbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     
@@ -341,6 +420,48 @@ bool TerrainNew::GenerateChunks(ID3D11Device* device)
         OutputDebugStringW(L"[TerrainNew] Failed to create chunk constant buffer\n");
         return false;
     }
+    
+    // 创建高度图纹理（用于shader中动态采样）
+    if (!CreateHeightmapTexture(device))
+    {
+        OutputDebugStringW(L"[TerrainNew] Failed to create heightmap texture\n");
+        return false;
+    }
+
+    // 为每个LOD级别生成共享的索引
+    m_sharedLODIndices.clear();
+    m_sharedLODIndices.resize(m_params.maxLODLevels);
+
+    for (int lod = 0; lod < m_params.maxLODLevels; ++lod)
+    {
+        int lodDivisor = 1 << lod;
+        int gridSize = m_params.chunkSize / lodDivisor;
+        gridSize = std::max(2, gridSize);
+
+        std::vector<uint32_t> indices;
+        GenerateLODIndicesTemplate(lod, gridSize, indices);
+
+        if (!CreateLODIndexBuffer(device, m_sharedLODIndices[lod], indices))
+        {
+            OutputDebugStringW(L"[TerrainNew] Failed to create LOD index buffer\n");
+            return false;
+        }
+
+        m_sharedLODIndices[lod].gridSize = gridSize;
+
+        wchar_t msg[256];
+        swprintf_s(msg, L"[TerrainNew] LOD %d indices: %d (gridSize: %d)\n",
+                   lod, static_cast<int>(indices.size()), gridSize);
+        OutputDebugStringW(msg);
+    }
+    
+    return true;
+}
+
+bool TerrainNew::GenerateChunkVertices(ID3D11Device* device)
+{
+    if (!device)
+        return false;
 
     // 计算chunk数量
     m_chunkCountX = (m_params.gridWidth - 1 + m_params.chunkSize - 1) / m_params.chunkSize;
@@ -352,7 +473,7 @@ bool TerrainNew::GenerateChunks(ID3D11Device* device)
     m_chunks.clear();
     m_chunks.reserve(m_chunkCountX * m_chunkCountZ);
 
-    // 为每个chunk生成所有LOD级别的网格
+    // 为每个chunk生成所有LOD级别的顶点
     for (int z = 0; z < m_chunkCountZ; ++z)
     {
         for (int x = 0; x < m_chunkCountX; ++x)
@@ -361,6 +482,7 @@ bool TerrainNew::GenerateChunks(ID3D11Device* device)
             chunk.chunkX = x;
             chunk.chunkZ = z;
             chunk.lodLevel = 0;
+            chunk.morphFactor = 0.0f;
 
             // 计算世界空间边界
             chunk.minX = -m_params.worldSizeX * 0.5f + x * chunkWorldSizeX;
@@ -368,17 +490,16 @@ bool TerrainNew::GenerateChunks(ID3D11Device* device)
             chunk.maxX = chunk.minX + chunkWorldSizeX;
             chunk.maxZ = chunk.minZ + chunkWorldSizeZ;
 
-            // 为每个LOD级别生成网格
+            // 为每个LOD级别生成顶点
+            chunk.vertexBuffers.resize(m_params.maxLODLevels);
             for (int lod = 0; lod < m_params.maxLODLevels; ++lod)
             {
                 std::vector<Vertex> vertices;
-                std::vector<uint32_t> indices;
+                GenerateChunkLODVertices(x, z, lod, vertices);
 
-                GenerateChunkMesh(x, z, lod, vertices, indices);
-
-                if (!CreateChunkBuffers(device, chunk, vertices, indices, lod))
+                if (!CreateChunkVertexBuffer(device, chunk, lod, vertices))
                 {
-                    OutputDebugStringW(L"[TerrainNew] Failed to create chunk buffers\n");
+                    OutputDebugStringW(L"[TerrainNew] Failed to create chunk vertex buffer\n");
                     return false;
                 }
             }
@@ -393,37 +514,63 @@ bool TerrainNew::GenerateChunks(ID3D11Device* device)
     return true;
 }
 
-void TerrainNew::GenerateChunkMesh(int chunkX, int chunkZ, int lodLevel,
-                                    std::vector<Vertex>& vertices, std::vector<uint32_t>& indices)
+void TerrainNew::GenerateLODIndicesTemplate(int lodLevel, int gridSize, std::vector<uint32_t>& indices)
 {
-    vertices.clear();
     indices.clear();
 
+    // 生成索引（拓扑结构对所有chunk相同）
+    for (int z = 0; z < gridSize; ++z)
+    {
+        for (int x = 0; x < gridSize; ++x)
+        {
+            uint32_t topLeft = z * (gridSize + 1) + x;
+            uint32_t topRight = topLeft + 1;
+            uint32_t bottomLeft = (z + 1) * (gridSize + 1) + x;
+            uint32_t bottomRight = bottomLeft + 1;
+
+            // 第一个三角形
+            indices.push_back(topLeft);
+            indices.push_back(bottomLeft);
+            indices.push_back(topRight);
+
+            // 第二个三角形
+            indices.push_back(topRight);
+            indices.push_back(bottomLeft);
+            indices.push_back(bottomRight);
+        }
+    }
+}
+
+void TerrainNew::GenerateChunkLODVertices(int chunkX, int chunkZ, int lodLevel,
+                                           std::vector<Vertex>& vertices)
+{
+    vertices.clear();
+
     // 计算LOD级别的网格分辨率
-    int lodDivisor = 1 << lodLevel;  // LOD 0: 1, LOD 1: 2, LOD 2: 4, ...
-    int chunkGridSize = m_params.chunkSize / lodDivisor;
-    chunkGridSize = std::max(2, chunkGridSize);  // 至少2x2
+    int lodDivisor = 1 << lodLevel;
+    int gridSize = m_params.chunkSize / lodDivisor;
+    gridSize = std::max(2, gridSize);
 
     // 计算chunk的世界空间大小
     float chunkWorldSizeX = m_params.worldSizeX / m_chunkCountX;
     float chunkWorldSizeZ = m_params.worldSizeZ / m_chunkCountZ;
 
     // 计算顶点步长
-    float stepX = chunkWorldSizeX / chunkGridSize;
-    float stepZ = chunkWorldSizeZ / chunkGridSize;
+    float stepX = chunkWorldSizeX / gridSize;
+    float stepZ = chunkWorldSizeZ / gridSize;
 
     // 计算高度图采样步长
     float heightStepX = static_cast<float>(m_heightmapWidth - 1) / (m_params.gridWidth - 1);
     float heightStepZ = static_cast<float>(m_heightmapHeight - 1) / (m_params.gridHeight - 1);
 
     // 生成顶点
-    for (int z = 0; z <= chunkGridSize; ++z)
+    for (int z = 0; z <= gridSize; ++z)
     {
-        for (int x = 0; x <= chunkGridSize; ++x)
+        for (int x = 0; x <= gridSize; ++x)
         {
             Vertex v;
 
-            // 计算在chunk内的局部坐标
+            // 计算全局网格坐标
             int gridX = chunkX * m_params.chunkSize + (x * lodDivisor);
             int gridZ = chunkZ * m_params.chunkSize + (z * lodDivisor);
 
@@ -462,63 +609,181 @@ void TerrainNew::GenerateChunkMesh(int chunkX, int chunkZ, int lodLevel,
             v.position[1] = worldY;
             v.position[2] = worldZ;
 
-            // 计算法线（简化版，使用相邻顶点）
-            float hLeft = h00;
-            float hRight = h10;
-            float hDown = h00;
-            float hUp = h01;
-
-            if (gridX > 0)
+            // ================================================================
+            // 计算法线（完整精确版本，基于周围三角形的面法线）
+            // ================================================================
+            // 对于规则网格，每个顶点最多被6个三角形共享：
+            //     NW  N
+            //      |\ |
+            //   W--[●]--E
+            //      | \|
+            //      S  SE
+            // 我们计算所有相邻三角形的面法线，然后平均得到顶点法线
+            
+            DirectX::XMFLOAT3 accumulatedNormal(0.0f, 0.0f, 0.0f);
+            int triangleCount = 0;
+            
+            // 辅助函数：采样指定网格位置的世界空间坐标
+            auto sampleWorldPos = [&](int gx, int gz) -> DirectX::XMFLOAT3 {
+                // 限制在有效范围内
+                gx = std::max(0, std::min(gx, m_params.gridWidth - 1));
+                gz = std::max(0, std::min(gz, m_params.gridHeight - 1));
+                
+                // 采样高度
+                float hx = gx * heightStepX;
+                float hz = gz * heightStepZ;
+                int hx0 = static_cast<int>(hx);
+                int hz0 = static_cast<int>(hz);
+                int hx1 = std::min(hx0 + 1, m_heightmapWidth - 1);
+                int hz1 = std::min(hz0 + 1, m_heightmapHeight - 1);
+                float fx = hx - hx0;
+                float fz = hz - hz0;
+                
+                float h00 = m_heightData[hz0 * m_heightmapWidth + hx0];
+                float h10 = m_heightData[hz0 * m_heightmapWidth + hx1];
+                float h01 = m_heightData[hz1 * m_heightmapWidth + hx0];
+                float h11 = m_heightData[hz1 * m_heightmapWidth + hx1];
+                
+                float h = (h00 * (1 - fx) + h10 * fx) * (1 - fz) +
+                         (h01 * (1 - fx) + h11 * fx) * fz;
+                
+                float wx = -m_params.worldSizeX * 0.5f + gx * (m_params.worldSizeX / (m_params.gridWidth - 1));
+                float wy = h * m_params.heightScale + m_params.heightOffset;
+                float wz = -m_params.worldSizeZ * 0.5f + gz * (m_params.worldSizeZ / (m_params.gridHeight - 1));
+                
+                return DirectX::XMFLOAT3(wx, wy, wz);
+            };
+            
+            // 辅助函数：计算三角形面法线（使用叉积）
+            auto computeFaceNormal = [](const DirectX::XMFLOAT3& p0, 
+                                       const DirectX::XMFLOAT3& p1, 
+                                       const DirectX::XMFLOAT3& p2) -> DirectX::XMFLOAT3 {
+                // 计算两条边向量
+                DirectX::XMVECTOR v0 = DirectX::XMLoadFloat3(&p0);
+                DirectX::XMVECTOR v1 = DirectX::XMLoadFloat3(&p1);
+                DirectX::XMVECTOR v2 = DirectX::XMLoadFloat3(&p2);
+                
+                DirectX::XMVECTOR edge1 = DirectX::XMVectorSubtract(v1, v0);
+                DirectX::XMVECTOR edge2 = DirectX::XMVectorSubtract(v2, v0);
+                
+                // 叉积得到面法线（已经包含了面积权重）
+                DirectX::XMVECTOR faceNormal = DirectX::XMVector3Cross(edge1, edge2);
+                
+                DirectX::XMFLOAT3 result;
+                DirectX::XMStoreFloat3(&result, faceNormal);
+                return result;
+            };
+            
+            DirectX::XMFLOAT3 centerPos = sampleWorldPos(gridX, gridZ);
+            
+            // 计算周围8个三角形的面法线并累加
+            // 注意：顶点顺序必须是逆时针（CCW），这样法线才会向上（Y+）
+            // 在右手坐标系中，Y轴向上，X轴向右，Z轴向前（屏幕外）
+            
+            // 三角形1: 当前顶点 - 右侧 - 右上 (逆时针)
+            if (gridX < m_params.gridWidth - 1 && gridZ < m_params.gridHeight - 1)
             {
-                float hx = (gridX - 1) * heightStepX;
-                int hx0_l = static_cast<int>(hx);
-                int hx1_l = std::min(hx0_l + 1, m_heightmapWidth - 1);
-                float fx_l = hx - hx0_l;
-                float h00_l = m_heightData[hz0 * m_heightmapWidth + hx0_l];
-                float h10_l = m_heightData[hz0 * m_heightmapWidth + hx1_l];
-                hLeft = h00_l * (1 - fx_l) + h10_l * fx_l;
+                DirectX::XMFLOAT3 right = sampleWorldPos(gridX + 1, gridZ);
+                DirectX::XMFLOAT3 rightUp = sampleWorldPos(gridX + 1, gridZ + 1);
+                DirectX::XMFLOAT3 fn = computeFaceNormal(centerPos, rightUp, right);  // 修改顺序！
+                accumulatedNormal.x += fn.x;
+                accumulatedNormal.y += fn.y;
+                accumulatedNormal.z += fn.z;
+                triangleCount++;
             }
-            if (gridX < m_params.gridWidth - 1)
+            
+            // 三角形2: 当前顶点 - 右上 - 上方 (逆时针)
+            if (gridX < m_params.gridWidth - 1 && gridZ < m_params.gridHeight - 1)
             {
-                float hx = (gridX + 1) * heightStepX;
-                int hx0_r = static_cast<int>(hx);
-                int hx1_r = std::min(hx0_r + 1, m_heightmapWidth - 1);
-                float fx_r = hx - hx0_r;
-                float h00_r = m_heightData[hz0 * m_heightmapWidth + hx0_r];
-                float h10_r = m_heightData[hz0 * m_heightmapWidth + hx1_r];
-                hRight = h00_r * (1 - fx_r) + h10_r * fx_r;
+                DirectX::XMFLOAT3 rightUp = sampleWorldPos(gridX + 1, gridZ + 1);
+                DirectX::XMFLOAT3 up = sampleWorldPos(gridX, gridZ + 1);
+                DirectX::XMFLOAT3 fn = computeFaceNormal(centerPos, up, rightUp);  // 修改顺序！
+                accumulatedNormal.x += fn.x;
+                accumulatedNormal.y += fn.y;
+                accumulatedNormal.z += fn.z;
+                triangleCount++;
             }
-            if (gridZ > 0)
+            
+            // 三角形3: 当前顶点 - 上方 - 左上 (逆时针)
+            if (gridX > 0 && gridZ < m_params.gridHeight - 1)
             {
-                float hz = (gridZ - 1) * heightStepZ;
-                int hz0_d = static_cast<int>(hz);
-                int hz1_d = std::min(hz0_d + 1, m_heightmapHeight - 1);
-                float fz_d = hz - hz0_d;
-                float h00_d = m_heightData[hz0_d * m_heightmapWidth + hx0];
-                float h01_d = m_heightData[hz1_d * m_heightmapWidth + hx0];
-                hDown = h00_d * (1 - fz_d) + h01_d * fz_d;
+                DirectX::XMFLOAT3 up = sampleWorldPos(gridX, gridZ + 1);
+                DirectX::XMFLOAT3 leftUp = sampleWorldPos(gridX - 1, gridZ + 1);
+                DirectX::XMFLOAT3 fn = computeFaceNormal(centerPos, leftUp, up);  // 修改顺序！
+                accumulatedNormal.x += fn.x;
+                accumulatedNormal.y += fn.y;
+                accumulatedNormal.z += fn.z;
+                triangleCount++;
             }
-            if (gridZ < m_params.gridHeight - 1)
+            
+            // 三角形4: 当前顶点 - 左上 - 左侧 (逆时针)
+            if (gridX > 0 && gridZ < m_params.gridHeight - 1)
             {
-                float hz = (gridZ + 1) * heightStepZ;
-                int hz0_u = static_cast<int>(hz);
-                int hz1_u = std::min(hz0_u + 1, m_heightmapHeight - 1);
-                float fz_u = hz - hz0_u;
-                float h00_u = m_heightData[hz0_u * m_heightmapWidth + hx0];
-                float h01_u = m_heightData[hz1_u * m_heightmapWidth + hx0];
-                hUp = h00_u * (1 - fz_u) + h01_u * fz_u;
+                DirectX::XMFLOAT3 leftUp = sampleWorldPos(gridX - 1, gridZ + 1);
+                DirectX::XMFLOAT3 left = sampleWorldPos(gridX - 1, gridZ);
+                DirectX::XMFLOAT3 fn = computeFaceNormal(centerPos, left, leftUp);  // 修改顺序！
+                accumulatedNormal.x += fn.x;
+                accumulatedNormal.y += fn.y;
+                accumulatedNormal.z += fn.z;
+                triangleCount++;
             }
-
-            // 计算法线向量
-            float dx = stepX * 2.0f;
-            float dz = stepZ * 2.0f;
-            float dhx = (hRight - hLeft) * m_params.heightScale;
-            float dhz = (hUp - hDown) * m_params.heightScale;
-
-            DirectX::XMFLOAT3 normal(-dhx / dx, 1.0f, -dhz / dz);
-            DirectX::XMVECTOR n = DirectX::XMVector3Normalize(DirectX::XMLoadFloat3(&normal));
-
-            DirectX::XMStoreFloat3(&normal, n);
+            
+            // 三角形5: 当前顶点 - 左侧 - 左下 (逆时针)
+            if (gridX > 0 && gridZ > 0)
+            {
+                DirectX::XMFLOAT3 left = sampleWorldPos(gridX - 1, gridZ);
+                DirectX::XMFLOAT3 leftDown = sampleWorldPos(gridX - 1, gridZ - 1);
+                DirectX::XMFLOAT3 fn = computeFaceNormal(centerPos, leftDown, left);  // 修改顺序！
+                accumulatedNormal.x += fn.x;
+                accumulatedNormal.y += fn.y;
+                accumulatedNormal.z += fn.z;
+                triangleCount++;
+            }
+            
+            // 三角形6: 当前顶点 - 左下 - 下方 (逆时针)
+            if (gridX > 0 && gridZ > 0)
+            {
+                DirectX::XMFLOAT3 leftDown = sampleWorldPos(gridX - 1, gridZ - 1);
+                DirectX::XMFLOAT3 down = sampleWorldPos(gridX, gridZ - 1);
+                DirectX::XMFLOAT3 fn = computeFaceNormal(centerPos, down, leftDown);  // 修改顺序！
+                accumulatedNormal.x += fn.x;
+                accumulatedNormal.y += fn.y;
+                accumulatedNormal.z += fn.z;
+                triangleCount++;
+            }
+            
+            // 三角形7: 当前顶点 - 下方 - 右下 (逆时针)
+            if (gridX < m_params.gridWidth - 1 && gridZ > 0)
+            {
+                DirectX::XMFLOAT3 down = sampleWorldPos(gridX, gridZ - 1);
+                DirectX::XMFLOAT3 rightDown = sampleWorldPos(gridX + 1, gridZ - 1);
+                DirectX::XMFLOAT3 fn = computeFaceNormal(centerPos, rightDown, down);  // 修改顺序！
+                accumulatedNormal.x += fn.x;
+                accumulatedNormal.y += fn.y;
+                accumulatedNormal.z += fn.z;
+                triangleCount++;
+            }
+            
+            // 三角形8: 当前顶点 - 右下 - 右侧 (逆时针)
+            if (gridX < m_params.gridWidth - 1 && gridZ > 0)
+            {
+                DirectX::XMFLOAT3 rightDown = sampleWorldPos(gridX + 1, gridZ - 1);
+                DirectX::XMFLOAT3 right = sampleWorldPos(gridX + 1, gridZ);
+                DirectX::XMFLOAT3 fn = computeFaceNormal(centerPos, right, rightDown);  // 修改顺序！
+                accumulatedNormal.x += fn.x;
+                accumulatedNormal.y += fn.y;
+                accumulatedNormal.z += fn.z;
+                triangleCount++;
+            }
+            
+            // 归一化累加的法线（叉积已经包含了面积权重，所以直接平均即可）
+            DirectX::XMVECTOR normalVec = DirectX::XMLoadFloat3(&accumulatedNormal);
+            normalVec = DirectX::XMVector3Normalize(normalVec);
+            
+            DirectX::XMFLOAT3 normal;
+            DirectX::XMStoreFloat3(&normal, normalVec);
+            
+            // 存储到顶点
             v.normal[0] = normal.x;
             v.normal[1] = normal.y;
             v.normal[2] = normal.z;
@@ -529,55 +794,41 @@ void TerrainNew::GenerateChunkMesh(int chunkX, int chunkZ, int lodLevel,
             v.color[1] = 0.5f + colorFactor * 0.5f;
             v.color[2] = 0.5f + colorFactor * 0.5f;
 
-            // 纹理坐标：存储全局网格坐标（用于morphing和边界对齐）
-            // 使用全局网格坐标确保相邻chunk的边界顶点对齐
-            v.texCoord[0] = static_cast<float>(gridX);  // 全局网格X坐标
-            v.texCoord[1] = static_cast<float>(gridZ);  // 全局网格Z坐标
-            
-            // 注意：texCoord存储的是全局网格坐标，不是局部坐标
-            // 这样可以确保边界顶点在morphing时移动到相同的全局位置
+            // 纹理坐标：存储全局网格坐标
+            v.texCoord[0] = static_cast<float>(gridX);
+            v.texCoord[1] = static_cast<float>(gridZ);
 
             vertices.push_back(v);
         }
     }
-
-    // 生成索引
-    for (int z = 0; z < chunkGridSize; ++z)
-    {
-        for (int x = 0; x < chunkGridSize; ++x)
-        {
-            uint32_t topLeft = z * (chunkGridSize + 1) + x;
-            uint32_t topRight = topLeft + 1;
-            uint32_t bottomLeft = (z + 1) * (chunkGridSize + 1) + x;
-            uint32_t bottomRight = bottomLeft + 1;
-
-            // 第一个三角形
-            indices.push_back(topLeft);
-            indices.push_back(bottomLeft);
-            indices.push_back(topRight);
-
-            // 第二个三角形
-            indices.push_back(topRight);
-            indices.push_back(bottomLeft);
-            indices.push_back(bottomRight);
-        }
-    }
 }
 
-bool TerrainNew::CreateChunkBuffers(ID3D11Device* device, TerrainChunk& chunk,
-                                    const std::vector<Vertex>& vertices, const std::vector<uint32_t>& indices,
-                                    int lodLevel)
+bool TerrainNew::CreateLODIndexBuffer(ID3D11Device* device, SharedLODIndices& lodIndices,
+                                      const std::vector<uint32_t>& indices)
 {
-    if (!device || vertices.empty() || indices.empty())
+    if (!device || indices.empty())
         return false;
 
-    // 确保有足够的缓冲区
-    if (chunk.vertexBuffers.size() <= static_cast<size_t>(lodLevel))
-    {
-        chunk.vertexBuffers.resize(lodLevel + 1);
-        chunk.indexBuffers.resize(lodLevel + 1);
-        chunk.indexCounts.resize(lodLevel + 1);
-    }
+    lodIndices.indexCount = static_cast<UINT>(indices.size());
+
+    // 创建索引缓冲区
+    D3D11_BUFFER_DESC ibd = {};
+    ibd.Usage = D3D11_USAGE_DEFAULT;
+    ibd.ByteWidth = static_cast<UINT>(sizeof(uint32_t) * indices.size());
+    ibd.BindFlags = D3D11_BIND_INDEX_BUFFER;
+
+    D3D11_SUBRESOURCE_DATA idata = {};
+    idata.pSysMem = indices.data();
+
+    HRESULT hr = device->CreateBuffer(&ibd, &idata, lodIndices.indexBuffer.GetAddressOf());
+    return SUCCEEDED(hr);
+}
+
+bool TerrainNew::CreateChunkVertexBuffer(ID3D11Device* device, TerrainChunk& chunk, int lodLevel,
+                                         const std::vector<Vertex>& vertices)
+{
+    if (!device || vertices.empty())
+        return false;
 
     // 创建顶点缓冲区
     D3D11_BUFFER_DESC vbd = {};
@@ -589,25 +840,7 @@ bool TerrainNew::CreateChunkBuffers(ID3D11Device* device, TerrainChunk& chunk,
     vdata.pSysMem = vertices.data();
 
     HRESULT hr = device->CreateBuffer(&vbd, &vdata, chunk.vertexBuffers[lodLevel].GetAddressOf());
-    if (FAILED(hr))
-        return false;
-
-    // 创建索引缓冲区
-    D3D11_BUFFER_DESC ibd = {};
-    ibd.Usage = D3D11_USAGE_DEFAULT;
-    ibd.ByteWidth = static_cast<UINT>(sizeof(uint32_t) * indices.size());
-    ibd.BindFlags = D3D11_BIND_INDEX_BUFFER;
-
-    D3D11_SUBRESOURCE_DATA idata = {};
-    idata.pSysMem = indices.data();
-
-    hr = device->CreateBuffer(&ibd, &idata, chunk.indexBuffers[lodLevel].GetAddressOf());
-    if (FAILED(hr))
-        return false;
-
-    chunk.indexCounts[lodLevel] = static_cast<UINT>(indices.size());
-
-    return true;
+    return SUCCEEDED(hr);
 }
 
 void TerrainNew::BuildQuadTree()
@@ -615,25 +848,142 @@ void TerrainNew::BuildQuadTree()
     m_quadTree.clear();
     m_rootNodeIndices.clear();
 
-    // 简化版：每个chunk作为一个节点
-    for (size_t i = 0; i < m_chunks.size(); ++i)
+    if (m_chunks.empty())
+        return;
+
+    // 计算地形的世界空间范围
+    float minX = -m_params.worldSizeX * 0.5f;
+    float minZ = -m_params.worldSizeZ * 0.5f;
+    float maxX = m_params.worldSizeX * 0.5f;
+    float maxZ = m_params.worldSizeZ * 0.5f;
+
+    // 计算四叉树的最大深度
+    // 深度应该使叶子节点大致对应1-4个chunk
+    int maxDepth = 0;
+    int chunkCount = std::max(m_chunkCountX, m_chunkCountZ);
+    while ((1 << maxDepth) < chunkCount / 2)
+        maxDepth++;
+    maxDepth = std::max(2, std::min(maxDepth, 6));  // 限制在2-6层
+
+    // 递归构建四叉树
+    int rootIndex = BuildQuadTreeRecursive(minX, minZ, maxX, maxZ, 0, maxDepth);
+    if (rootIndex >= 0)
     {
-        QuadTreeNode node;
-        const TerrainChunk& chunk = m_chunks[i];
+        m_rootNodeIndices.push_back(rootIndex);
+    }
 
-        node.minX = chunk.minX;
-        node.minZ = chunk.minZ;
-        node.maxX = chunk.maxX;
-        node.maxZ = chunk.maxZ;
-        node.minY = chunk.minY;
-        node.maxY = chunk.maxY;
-        node.chunkX = chunk.chunkX;
-        node.chunkZ = chunk.chunkZ;
-        node.lodLevel = 0;
-        node.hasChildren = false;
+    // 统计叶子节点数量
+    int leafCount = 0;
+    for (const auto& node : m_quadTree)
+    {
+        if (node.isLeaf)
+            leafCount++;
+    }
 
-        m_quadTree.push_back(node);
-        m_rootNodeIndices.push_back(static_cast<int>(i));
+    wchar_t msg[256];
+    swprintf_s(msg, L"[TerrainNew] QuadTree built: %d total nodes, %d leaf nodes, max depth: %d\n",
+               static_cast<int>(m_quadTree.size()), leafCount, maxDepth);
+    OutputDebugStringW(msg);
+}
+
+int TerrainNew::BuildQuadTreeRecursive(float minX, float minZ, float maxX, float maxZ,
+                                       int level, int maxDepth)
+{
+    QuadTreeNode node;
+    node.minX = minX;
+    node.minZ = minZ;
+    node.maxX = maxX;
+    node.maxZ = maxZ;
+    node.centerX = (minX + maxX) * 0.5f;
+    node.centerZ = (minZ + maxZ) * 0.5f;
+    node.size = maxX - minX;
+    node.level = level;
+    node.lodLevel = level;  // LOD级别基于树的层级
+    node.hasChildren = false;
+    node.isLeaf = false;
+
+    // 计算该节点覆盖的chunk范围
+    float chunkWorldSizeX = m_params.worldSizeX / m_chunkCountX;
+    float chunkWorldSizeZ = m_params.worldSizeZ / m_chunkCountZ;
+
+    node.chunkStartX = static_cast<int>((minX + m_params.worldSizeX * 0.5f) / chunkWorldSizeX);
+    node.chunkStartZ = static_cast<int>((minZ + m_params.worldSizeZ * 0.5f) / chunkWorldSizeZ);
+    node.chunkEndX = static_cast<int>((maxX + m_params.worldSizeX * 0.5f) / chunkWorldSizeX);
+    node.chunkEndZ = static_cast<int>((maxZ + m_params.worldSizeZ * 0.5f) / chunkWorldSizeZ);
+
+    // 限制在有效范围内
+    node.chunkStartX = std::max(0, std::min(node.chunkStartX, m_chunkCountX - 1));
+    node.chunkStartZ = std::max(0, std::min(node.chunkStartZ, m_chunkCountZ - 1));
+    node.chunkEndX = std::max(0, std::min(node.chunkEndX, m_chunkCountX - 1));
+    node.chunkEndZ = std::max(0, std::min(node.chunkEndZ, m_chunkCountZ - 1));
+
+    // 计算高度范围
+    CalculateNodeHeightRange(node);
+
+    // 当前节点索引
+    int currentIndex = static_cast<int>(m_quadTree.size());
+    m_quadTree.push_back(node);
+
+    // 判断是否需要继续细分
+    bool shouldSubdivide = false;
+    if (level < maxDepth)
+    {
+        int chunkWidth = node.chunkEndX - node.chunkStartX + 1;
+        int chunkHeight = node.chunkEndZ - node.chunkStartZ + 1;
+        
+        // 如果节点覆盖多个chunk，继续细分
+        if (chunkWidth > 1 || chunkHeight > 1)
+            shouldSubdivide = true;
+    }
+
+    if (shouldSubdivide)
+    {
+        // 细分为4个子节点
+        float midX = (minX + maxX) * 0.5f;
+        float midZ = (minZ + maxZ) * 0.5f;
+
+        // 子节点顺序：0=LeftTop, 1=RightTop, 2=LeftBottom, 3=RightBottom
+        m_quadTree[currentIndex].childIndices[0] = BuildQuadTreeRecursive(minX, minZ, midX, midZ, level + 1, maxDepth);
+        m_quadTree[currentIndex].childIndices[1] = BuildQuadTreeRecursive(midX, minZ, maxX, midZ, level + 1, maxDepth);
+        m_quadTree[currentIndex].childIndices[2] = BuildQuadTreeRecursive(minX, midZ, midX, maxZ, level + 1, maxDepth);
+        m_quadTree[currentIndex].childIndices[3] = BuildQuadTreeRecursive(midX, midZ, maxX, maxZ, level + 1, maxDepth);
+
+        m_quadTree[currentIndex].hasChildren = true;
+    }
+    else
+    {
+        // 叶子节点
+        m_quadTree[currentIndex].isLeaf = true;
+    }
+
+    return currentIndex;
+}
+
+void TerrainNew::CalculateNodeHeightRange(QuadTreeNode& node)
+{
+    node.minY = FLT_MAX;
+    node.maxY = -FLT_MAX;
+
+    // 遍历该节点覆盖的所有chunk，计算高度范围
+    for (int z = node.chunkStartZ; z <= node.chunkEndZ; ++z)
+    {
+        for (int x = node.chunkStartX; x <= node.chunkEndX; ++x)
+        {
+            int chunkIndex = z * m_chunkCountX + x;
+            if (chunkIndex >= 0 && chunkIndex < static_cast<int>(m_chunks.size()))
+            {
+                const TerrainChunk& chunk = m_chunks[chunkIndex];
+                node.minY = std::min(node.minY, chunk.minY);
+                node.maxY = std::max(node.maxY, chunk.maxY);
+            }
+        }
+    }
+
+    // 如果没有找到有效chunk，使用默认值
+    if (node.minY == FLT_MAX)
+    {
+        node.minY = 0.0f;
+        node.maxY = m_params.heightScale;
     }
 }
 
@@ -641,69 +991,177 @@ void TerrainNew::SelectChunks(const DirectX::XMFLOAT3& cameraPosition, std::vect
 {
     outChunks.clear();
 
-    // 简单的视锥剔除（基于高度范围）
-    for (auto& chunk : m_chunks)
+    if (m_quadTree.empty() || m_rootNodeIndices.empty())
+        return;
+
+    // 计算视距（基于最远的LOD距离）
+    float viewDistance = m_params.lodDistances[m_params.maxLODLevels - 1] * 1.5f;
+
+    // 从根节点开始递归选择
+    for (int rootIndex : m_rootNodeIndices)
     {
-        // 计算到相机的距离
-        float distance = chunk.GetDistanceToCamera(cameraPosition.x, cameraPosition.y, cameraPosition.z);
-        
-        // 简单的视锥剔除：如果chunk在相机下方太远，跳过
-        if (cameraPosition.y < chunk.minY - 200.0f)
-            continue;
-        
-        // 计算LOD级别
-        int lodLevel = CalculateLODLevel(distance);
-        
-        // 计算morphing因子（在切换到下一级LOD之前进行morphing）
-        float morphFactor = CalculateMorphFactor(distance, lodLevel);
-        
-        // 如果morphFactor接近1.0，应该使用下一级LOD（但为了简化，我们仍然使用当前LOD并应用morphing）
-        chunk.lodLevel = lodLevel;
-        chunk.morphFactor = morphFactor;
-        
-        // 确保LOD级别有效
-        if (lodLevel >= 0 && lodLevel < static_cast<int>(chunk.vertexBuffers.size()))
+        SelectChunksRecursive(rootIndex, cameraPosition, viewDistance, outChunks);
+    }
+}
+
+void TerrainNew::SelectChunksRecursive(int nodeIndex, const DirectX::XMFLOAT3& cameraPosition,
+                                       float viewDistance, std::vector<TerrainChunk*>& outChunks)
+{
+    if (nodeIndex < 0 || nodeIndex >= static_cast<int>(m_quadTree.size()))
+        return;
+
+    QuadTreeNode& node = m_quadTree[nodeIndex];
+
+    // 1. 计算到相机的距离
+    float distance = node.GetDistanceToCamera(cameraPosition.x, cameraPosition.y, cameraPosition.z);
+
+    // 2. 简单的距离剔除
+    if (distance > viewDistance + node.size * 0.5f)
+        return;
+
+    // 3. 简单的高度剔除
+    if (cameraPosition.y < node.minY - 200.0f || cameraPosition.y > node.maxY + 500.0f)
+        return;
+
+    // 4. 判断是否应该使用子节点（更高细节）
+    if (node.hasChildren && ShouldSubdivide(node, cameraPosition, viewDistance))
+    {
+        // 递归处理子节点
+        for (int i = 0; i < 4; ++i)
         {
-            outChunks.push_back(&chunk);
+            if (node.childIndices[i] >= 0)
+            {
+                SelectChunksRecursive(node.childIndices[i], cameraPosition, viewDistance, outChunks);
+            }
+        }
+    }
+    else
+    {
+        // 5. 使用当前节点的chunk（较低细节）
+        // 遍历该节点覆盖的所有chunk
+        for (int z = node.chunkStartZ; z <= node.chunkEndZ; ++z)
+        {
+            for (int x = node.chunkStartX; x <= node.chunkEndX; ++x)
+            {
+                int chunkIndex = z * m_chunkCountX + x;
+                if (chunkIndex >= 0 && chunkIndex < static_cast<int>(m_chunks.size()))
+                {
+                    TerrainChunk& chunk = m_chunks[chunkIndex];
+                    
+                    // 计算chunk到相机的距离
+                    float chunkDist = chunk.GetDistanceToCamera(cameraPosition.x, cameraPosition.y, cameraPosition.z);
+                    
+                    // 基于距离计算LOD级别
+                    int lodLevel = CalculateLODLevel(chunkDist);
+                    
+                    // 检查邻居chunk的LOD，确保边界连续性
+                    // 规则：当前chunk的LOD不能比邻居低超过1级
+                    int maxNeighborLOD = lodLevel;
+                    
+                    // 检查4个邻居（上下左右）- 使用正确的偏移数组
+                    static const int neighborOffsets[4][2] = {
+                        {0, -1},  // 上
+                        {0,  1},  // 下
+                        {-1, 0},  // 左
+                        { 1, 0}   // 右
+                    };
+                    
+                    for (int i = 0; i < 4; ++i) {
+                        int nx = x + neighborOffsets[i][0];
+                        int nz = z + neighborOffsets[i][1];
+                        
+                        if (nx >= 0 && nx < m_chunkCountX && nz >= 0 && nz < m_chunkCountZ) {
+                            int neighborIndex = nz * m_chunkCountX + nx;
+                            if (neighborIndex >= 0 && neighborIndex < static_cast<int>(m_chunks.size())) {
+                                const TerrainChunk& neighbor = m_chunks[neighborIndex];
+                                maxNeighborLOD = std::max(maxNeighborLOD, neighbor.lodLevel);
+                            }
+                        }
+                    }
+                    
+                    // 如果邻居有更高细节的LOD（更小的数字），当前chunk不能相差超过1级
+                    // 这确保了边界处的连续性
+                    lodLevel = std::min(lodLevel, maxNeighborLOD + 1);
+                    
+                    // 计算morphing因子
+                    float morphFactor = CalculateMorphFactor(chunkDist, lodLevel);
+                    
+                    // 设置chunk的LOD
+                    chunk.lodLevel = lodLevel;
+                    chunk.morphFactor = morphFactor;
+                    
+                    // 确保LOD级别有效
+                    if (lodLevel >= 0 && lodLevel < static_cast<int>(chunk.vertexBuffers.size()))
+                    {
+                        outChunks.push_back(&chunk);
+                    }
+                }
+            }
         }
     }
 }
 
+bool TerrainNew::ShouldSubdivide(const QuadTreeNode& node, const DirectX::XMFLOAT3& cameraPosition,
+                                 float viewDistance) const
+{
+    // 计算到相机的距离
+    float distance = node.GetDistanceToCamera(cameraPosition.x, cameraPosition.y, cameraPosition.z);
+    
+    // 基于距离和节点大小决定是否细分
+    // 距离越近，节点越大，越应该细分
+    float subdivisionDistance = node.size * 2.0f;  // 可调整因子
+    
+    // 如果距离小于细分距离，使用子节点
+    return distance < subdivisionDistance;
+}
+
 int TerrainNew::CalculateLODLevel(float distance) const
 {
-    for (int i = 0; i < m_params.maxLODLevels; ++i)
+    // CDLOD核心原则：
+    // - 在距离范围 [0, threshold_i] 内使用 LOD i
+    // - 但在接近threshold时开始morphing到下一级LOD
+    // - morphing完成后（距离达到threshold），切换到下一级LOD
+    
+    for (int i = 0; i < m_params.maxLODLevels - 1; ++i)
     {
-        if (distance <= m_params.lodDistances[i])
+        // 如果距离小于当前LOD的阈值，使用当前LOD
+        if (distance < m_params.lodDistances[i])
             return i;
     }
+    
+    // 距离超过所有阈值，使用最粗糙的LOD
     return m_params.maxLODLevels - 1;
 }
 
 float TerrainNew::CalculateMorphFactor(float distance, int lodLevel) const
 {
-    // CDLOD morphing：在LOD边界附近平滑过渡
-    // morphFactor = 0: 完全使用当前LOD几何
-    // morphFactor = 1: 完全morphed到下一个（更粗糙）LOD
+    // CDLOD morphing原理：
+    // 当使用LOD N时，在接近LOD N的距离阈值时，
+    // 将LOD N中"多余的顶点"（在LOD N+1中不存在的）morph到LOD N+1的位置
+    // 
+    // morphFactor = 0: 完全使用LOD N的几何（无morphing）
+    // morphFactor = 1: 多余顶点完全morphed到LOD N+1的位置（准备切换LOD）
     
     if (lodLevel >= m_params.maxLODLevels - 1)
-        return 0.0f;  // 最低LOD级别，不需要morphing
+        return 0.0f;  // 最粗糙的LOD，没有下一级可以morph了
     
-    // 获取当前LOD的距离阈值
-    float currentLODDist = m_params.lodDistances[lodLevel];
+    // 当前LOD的有效距离范围
+    float lodStart = (lodLevel > 0) ? m_params.lodDistances[lodLevel - 1] : 0.0f;
+    float lodEnd = m_params.lodDistances[lodLevel];
     
-    // Morphing在距离阈值的指定比例处开始，在阈值处完成
-    float morphStart = currentLODDist * m_params.morphStartRatio;
-    float morphEnd = currentLODDist;
+    // Morphing开始的距离（在LOD有效范围的后半段）
+    float morphStart = lodStart + (lodEnd - lodStart) * m_params.morphStartRatio;
+    float morphEnd = lodEnd;
     
+    // 如果距离还没到morphing开始点，不需要morph
     if (distance <= morphStart)
-        return 0.0f;  // 距离很近，不需要morphing
+        return 0.0f;
     
-    // 如果距离超过morphEnd，应该已经切换到下一级LOD了
-    // 但为了安全，我们仍然返回1.0（完全morphed）
+    // 如果距离超过morphing结束点，完全morphed（即将切换LOD）
     if (distance >= morphEnd)
-        return 1.0f;  // 距离较远，完全morphed
+        return 1.0f;
     
-    // 线性插值计算morphFactor
+    // 在morphing范围内，线性插值
     float morphFactor = (distance - morphStart) / (morphEnd - morphStart);
     
     // 确保在有效范围内
@@ -743,7 +1201,7 @@ void TerrainNew::CalculateChunkHeightRange(TerrainChunk& chunk)
 
 void TerrainNew::Render(ID3D11DeviceContext* context, const DirectX::XMFLOAT3& cameraPosition)
 {
-    if (!context || m_chunks.empty())
+    if (!context || m_chunks.empty() || m_sharedLODIndices.empty())
         return;
 
     // 选择要渲染的chunk
@@ -752,34 +1210,66 @@ void TerrainNew::Render(ID3D11DeviceContext* context, const DirectX::XMFLOAT3& c
     // 重置统计
     m_renderStats = RenderStats();
     m_renderStats.visibleChunks = static_cast<int>(m_selectedChunks.size());
+    
+    // 绑定高度图纹理到顶点着色器
+    if (m_heightmapSRV)
+    {
+        ID3D11ShaderResourceView* srv = m_heightmapSRV.Get();
+        context->VSSetShaderResources(0, 1, &srv);
+    }
+    
+    // 绑定高度图采样器到顶点着色器
+    if (m_heightmapSampler)
+    {
+        ID3D11SamplerState* sampler = m_heightmapSampler.Get();
+        context->VSSetSamplers(0, 1, &sampler);
+    }
 
     // 渲染每个选中的chunk
     for (TerrainChunk* chunk : m_selectedChunks)
     {
         int lodLevel = chunk->lodLevel;
-        if (lodLevel < 0 || lodLevel >= static_cast<int>(chunk->vertexBuffers.size()))
+        
+        // 检查LOD级别有效性
+        if (lodLevel < 0 || lodLevel >= static_cast<int>(m_sharedLODIndices.size()))
+            continue;
+        
+        if (lodLevel >= static_cast<int>(chunk->vertexBuffers.size()))
             continue;
 
-        if (!chunk->vertexBuffers[lodLevel] || !chunk->indexBuffers[lodLevel])
+        const SharedLODIndices& lodIndices = m_sharedLODIndices[lodLevel];
+        if (!lodIndices.indexBuffer || !chunk->vertexBuffers[lodLevel])
             continue;
 
-        // 计算当前LOD的网格大小
-        int lodDivisor = 1 << lodLevel;
-        int chunkGridSize = m_params.chunkSize / lodDivisor;
-        chunkGridSize = std::max(2, chunkGridSize);
+        // 计算全局网格起点
+        int globalGridStartX = chunk->chunkX * m_params.chunkSize;
+        int globalGridStartZ = chunk->chunkZ * m_params.chunkSize;
+        
+        // 计算chunk到相机的距离（用于统一的morphing计算）
+        float chunkDistToCamera = chunk->GetDistanceToCamera(cameraPosition.x, cameraPosition.y, cameraPosition.z);
 
-        // 更新chunk常量缓冲区（传递morphing参数）
+        // 更新chunk常量缓冲区
         D3D11_MAPPED_SUBRESOURCE mapped;
         HRESULT hr = context->Map(m_chunkConstantBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
         if (SUCCEEDED(hr))
         {
             float* data = static_cast<float*>(mapped.pData);
             
-            // chunkParams: x=morphFactor, y=lodLevel, z=chunkGridSize, w=unused
-            data[0] = chunk->morphFactor;
+            // 计算morphing距离范围（基于当前LOD）
+            // morphing是从当前LOD向下一级LOD过渡
+            float lodStart = (lodLevel > 0) ? m_params.lodDistances[lodLevel - 1] : 0.0f;
+            float lodEnd = (lodLevel < m_params.maxLODLevels - 1) ? 
+                          m_params.lodDistances[lodLevel] : 
+                          m_params.lodDistances[m_params.maxLODLevels - 1];
+            
+            float morphStart = lodStart + (lodEnd - lodStart) * m_params.morphStartRatio;
+            float morphEnd = lodEnd;
+            
+            // chunkParams: x=chunkDistToCamera, y=lodLevel, z=morphStartDist, w=morphEndDist
+            data[0] = chunkDistToCamera;  // 传递chunk到相机的距离（用于shader中计算morphFactor）
             data[1] = static_cast<float>(lodLevel);
-            data[2] = static_cast<float>(chunkGridSize);
-            data[3] = 0.0f;
+            data[2] = morphStart;
+            data[3] = morphEnd;
             
             // chunkBounds: x=minX, y=minZ, z=maxX, w=maxZ
             data[4] = chunk->minX;
@@ -799,6 +1289,12 @@ void TerrainNew::Render(ID3D11DeviceContext* context, const DirectX::XMFLOAT3& c
             data[14] = 1.0f / (m_params.gridWidth - 1);
             data[15] = 1.0f / (m_params.gridHeight - 1);
             
+            // cameraParams: x=cameraPosX, y=cameraPosY, z=cameraPosZ, w=unused
+            data[16] = cameraPosition.x;
+            data[17] = cameraPosition.y;
+            data[18] = cameraPosition.z;
+            data[19] = 0.0f;
+            
             context->Unmap(m_chunkConstantBuffer.Get(), 0);
         }
 
@@ -806,20 +1302,20 @@ void TerrainNew::Render(ID3D11DeviceContext* context, const DirectX::XMFLOAT3& c
         ID3D11Buffer* cb_ptr = m_chunkConstantBuffer.Get();
         context->VSSetConstantBuffers(2, 1, &cb_ptr);
 
-        // 设置顶点缓冲区
+        // 设置顶点缓冲区（每个chunk独立）
         UINT stride = sizeof(Vertex);
         UINT offset = 0;
         ID3D11Buffer* vb = chunk->vertexBuffers[lodLevel].Get();
         context->IASetVertexBuffers(0, 1, &vb, &stride, &offset);
 
-        // 设置索引缓冲区
-        context->IASetIndexBuffer(chunk->indexBuffers[lodLevel].Get(), DXGI_FORMAT_R32_UINT, 0);
+        // 设置共享的索引缓冲区
+        context->IASetIndexBuffer(lodIndices.indexBuffer.Get(), DXGI_FORMAT_R32_UINT, 0);
 
-        // 设置图元拓扑（已经在RenderTerrain中设置，但为了确保正确，这里也设置）
+        // 设置图元拓扑
         context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
         // 绘制
-        context->DrawIndexed(chunk->indexCounts[lodLevel], 0, 0);
+        context->DrawIndexed(lodIndices.indexCount, 0, 0);
 
         // 更新统计
         if (lodLevel < 8)
@@ -830,24 +1326,29 @@ void TerrainNew::Render(ID3D11DeviceContext* context, const DirectX::XMFLOAT3& c
     static int frameCount = 0;
     if (++frameCount % 300 == 0)
     {
+        // 统计LOD分布
+        int lodCounts[8] = {0};
         float avgMorphFactor = 0.0f;
         int morphingChunks = 0;
+        
         for (TerrainChunk* chunk : m_selectedChunks)
         {
+            if (chunk->lodLevel >= 0 && chunk->lodLevel < 8)
+                lodCounts[chunk->lodLevel]++;
+            
             if (chunk->morphFactor > 0.001f)
             {
                 avgMorphFactor += chunk->morphFactor;
                 morphingChunks++;
             }
         }
-        if (morphingChunks > 0)
-        {
-            avgMorphFactor /= morphingChunks;
-            wchar_t msg[256];
-            swprintf_s(msg, L"[TerrainNew] Morphing: %d chunks morphing, avg factor: %.3f\n",
-                      morphingChunks, avgMorphFactor);
-            OutputDebugStringW(msg);
-        }
+        
+        wchar_t msg[512];
+        swprintf_s(msg, L"[TerrainNew] QuadTree: %d visible chunks, LOD: [%d,%d,%d,%d], morphing: %d chunks (avg: %.3f)\n",
+                  m_renderStats.visibleChunks,
+                  lodCounts[0], lodCounts[1], lodCounts[2], lodCounts[3],
+                  morphingChunks, morphingChunks > 0 ? avgMorphFactor / morphingChunks : 0.0f);
+        OutputDebugStringW(msg);
     }
 }
 
