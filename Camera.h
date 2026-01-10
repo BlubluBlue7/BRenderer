@@ -14,6 +14,9 @@
 // 相机类
 // 支持第一人称视角控制（FPS 风格）
 // ============================================================================
+// 前向声明
+class TerrainNew;
+
 class Camera
 {
 public:
@@ -42,6 +45,21 @@ public:
     void SetMoveRight(bool move) { m_moveRight = move; }
     void SetMoveUp(bool move) { m_moveUp = move; }
     void SetMoveDown(bool move) { m_moveDown = move; }
+    
+    // 设置地形引用（用于高度查询）
+    void SetTerrain(TerrainNew* terrain) { m_terrain = terrain; }
+    
+    // 设置角色高度偏移（角色眼睛离地面的高度）
+    void SetCharacterHeight(float height) { m_characterHeight = height; }
+    
+    // 启用/禁用地形跟随
+    void SetFollowTerrain(bool follow) { m_followTerrain = follow; }
+    
+    // 切换地形跟随状态（返回新的状态）
+    bool ToggleFollowTerrain() { m_followTerrain = !m_followTerrain; return m_followTerrain; }
+    
+    // 获取当前是否跟随地形
+    bool IsFollowingTerrain() const { return m_followTerrain; }
 
 private:
     // 相机位置
@@ -63,6 +81,11 @@ private:
     bool m_moveRight;
     bool m_moveUp;
     bool m_moveDown;
+    
+    // 地形相关
+    TerrainNew* m_terrain = nullptr;  // 地形引用（用于高度查询）
+    float m_characterHeight = 1.7f;   // 角色高度偏移（默认1.7米，适合第一人称视角）
+    bool m_followTerrain = true;      // 是否跟随地形高度
     
     // 计算前方向量
     DirectX::XMFLOAT3 GetForwardVector() const;

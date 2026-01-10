@@ -56,6 +56,9 @@ public:
     // 设置地形LOD锁定级别
     void SetTerrainLODLockLevel(int level);
 
+    // 获取地形
+    TerrainNew* GetTerrain() const { return m_terrain; }
+
 private:
     // 从文件编译 Shader
     bool CompileShaderFromFile(const wchar_t* filename, const char* entryPoint, const char* target, ID3DBlob** blob);

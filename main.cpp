@@ -135,6 +135,18 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
     // ========================================================================
     Camera camera;
     renderer.SetCamera(&camera);
+    
+    // 将地形对象传递给相机，以便相机能够查询高度
+    // 注意：地形在 Initialize 中创建，所以需要在地形初始化之后设置
+    if (renderer.GetTerrain())
+    {
+        camera.SetTerrain(renderer.GetTerrain());
+        camera.SetCharacterHeight(1.7f);  // 设置角色高度为1.7米（眼睛高度）
+        camera.SetFollowTerrain(true);    // 启用地形跟随
+        
+        // 初始化相机位置：设置在地形中心附近，高度会在第一帧 Update 时自动调整
+        // 相机位置会在第一帧 Update 时自动调整到地形高度 + 角色高度
+    }
 
     // ========================================================================
     // 步骤 4: 设置窗口输入回调
@@ -221,6 +233,19 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
             if (pressed)
             {
                 renderer.ToggleLightRotationPaused();
+            }
+            break;
+        case 'F':
+        case 'f':
+            // F键：切换自由相机视角（地形跟随/自由飞行）
+            if (pressed)
+            {
+                bool isFollowing = camera.ToggleFollowTerrain();
+                // 输出调试信息
+                wchar_t msg[256];
+                swprintf_s(msg, L"[Camera] Terrain following: %s\n", 
+                          isFollowing ? L"ON" : L"OFF");
+                OutputDebugStringW(msg);
             }
             break;
         }

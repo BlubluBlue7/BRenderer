@@ -1,4 +1,5 @@
 #include "Camera.h"
+#include "Terrain_new.h"
 #include <DirectXMath.h>
 
 using namespace DirectX;
@@ -16,10 +17,10 @@ inline float clamp(float value, float min, float max)
 // 构造函数：初始化相机参数（支持大规模地形4096x4096米）
 // ============================================================================
 Camera::Camera()
-    : m_position(0.0f, 500.0f, 1000.0f)  // 初始位置：较高位置俯瞰大型地形
-    , m_pitch(-0.4f)                      // 初始俯仰角：向下看
-    , m_yaw(XM_PI)                        // 初始偏航角：看向-Z方向（地形中心）
-    , m_moveSpeed(50.0f)                  // 移动速度：50米/秒（适合大地形）
+    : m_position(0.0f, 100.0f, 0.0f)     // 初始位置：地形中心附近，高度待地形查询后设置
+    , m_pitch(-0.2f)                      // 初始俯仰角：稍微向下看（第一人称视角）
+    , m_yaw(0.0f)                         // 初始偏航角：朝向+X方向
+    , m_moveSpeed(10.0f)                  // 移动速度：10米/秒（适合角色移动）
     , m_rotationSpeed(2.0f)               // 旋转速度：2弧度/秒
     , m_mouseSensitivity(0.002f)          // 鼠标灵敏度
     , m_moveForward(false)
@@ -28,6 +29,8 @@ Camera::Camera()
     , m_moveRight(false)
     , m_moveUp(false)
     , m_moveDown(false)
+    , m_characterHeight(1.7f)             // 角色高度：1.7米（眼睛高度）
+    , m_followTerrain(true)               // 默认启用地形跟随
 {
 }
 
@@ -39,40 +42,98 @@ void Camera::Update(float deltaTime)
     // 限制俯仰角范围（避免翻转）
     m_pitch = clamp(m_pitch, -XM_PI / 2.0f + 0.1f, XM_PI / 2.0f - 0.1f);
     
-    // 计算移动方向
+    // 计算移动方向（只考虑水平方向，不包含垂直移动）
     XMFLOAT3 forward = GetForwardVector();
     XMFLOAT3 right = GetRightVector();
-    XMFLOAT3 up = GetUpVector();
     
     XMVECTOR moveDir = XMVectorSet(0.0f, 0.0f, 0.0f, 0.0f);
     
-    // 前后移动
-    if (m_moveForward)
-        moveDir = XMVectorAdd(moveDir, XMLoadFloat3(&forward));
-    if (m_moveBackward)
-        moveDir = XMVectorSubtract(moveDir, XMLoadFloat3(&forward));
-    
-    // 左右移动
-    if (m_moveRight)
-        moveDir = XMVectorAdd(moveDir, XMLoadFloat3(&right));
-    if (m_moveLeft)
-        moveDir = XMVectorSubtract(moveDir, XMLoadFloat3(&right));
-    
-    // 上下移动
-    if (m_moveUp)
-        moveDir = XMVectorAdd(moveDir, XMLoadFloat3(&up));
-    if (m_moveDown)
-        moveDir = XMVectorSubtract(moveDir, XMLoadFloat3(&up));
-    
-    // 归一化移动方向并应用速度
-    float length = 0.0f;
-    XMStoreFloat(&length, XMVector3Length(moveDir));
-    if (length > 0.0001f)
+    // 前后移动（只使用水平分量）
+    XMVECTOR forwardVec = XMLoadFloat3(&forward);
+    XMVECTOR forwardHorizontal = XMVectorSetY(forwardVec, 0.0f);  // 移除垂直分量
+    float forwardLen = 0.0f;
+    XMStoreFloat(&forwardLen, XMVector3Length(forwardHorizontal));
+    if (forwardLen > 0.0001f)
     {
-        moveDir = XMVector3Normalize(moveDir);
-        XMVECTOR position = XMLoadFloat3(&m_position);
-        position = XMVectorAdd(position, XMVectorScale(moveDir, m_moveSpeed * deltaTime));
-        XMStoreFloat3(&m_position, position);
+        forwardHorizontal = XMVector3Normalize(forwardHorizontal);
+    }
+    
+    if (m_moveForward)
+        moveDir = XMVectorAdd(moveDir, forwardHorizontal);
+    if (m_moveBackward)
+        moveDir = XMVectorSubtract(moveDir, forwardHorizontal);
+    
+    // 左右移动（只使用水平分量）
+    XMVECTOR rightVec = XMLoadFloat3(&right);
+    XMVECTOR rightHorizontal = XMVectorSetY(rightVec, 0.0f);  // 移除垂直分量
+    float rightLen = 0.0f;
+    XMStoreFloat(&rightLen, XMVector3Length(rightHorizontal));
+    if (rightLen > 0.0001f)
+    {
+        rightHorizontal = XMVector3Normalize(rightHorizontal);
+    }
+    
+    if (m_moveRight)
+        moveDir = XMVectorAdd(moveDir, rightHorizontal);
+    if (m_moveLeft)
+        moveDir = XMVectorSubtract(moveDir, rightHorizontal);
+    
+    // 根据地形跟随模式处理移动
+    if (m_followTerrain)
+    {
+        // 地形跟随模式：只允许水平移动，垂直位置由地形高度决定
+        // 忽略上下移动（Space/Ctrl）
+        
+        // 归一化移动方向并应用速度
+        float length = 0.0f;
+        XMStoreFloat(&length, XMVector3Length(moveDir));
+        if (length > 0.0001f)
+        {
+            moveDir = XMVector3Normalize(moveDir);
+            XMVECTOR position = XMLoadFloat3(&m_position);
+            
+            // 只更新X和Z坐标（水平移动）
+            XMVECTOR horizontalMove = XMVectorScale(moveDir, m_moveSpeed * deltaTime);
+            horizontalMove = XMVectorSetY(horizontalMove, 0.0f);  // 确保Y分量为0
+            position = XMVectorAdd(position, horizontalMove);
+            XMStoreFloat3(&m_position, position);
+            
+            // 查询地形高度并设置相机高度
+            if (m_terrain)
+            {
+                float terrainHeight = m_terrain->GetHeightAt(m_position.x, m_position.z);
+                m_position.y = terrainHeight + m_characterHeight;
+            }
+        }
+        else if (m_terrain)
+        {
+            // 即使没有移动，也更新高度（处理地形变化的情况）
+            float terrainHeight = m_terrain->GetHeightAt(m_position.x, m_position.z);
+            m_position.y = terrainHeight + m_characterHeight;
+        }
+    }
+    else
+    {
+        // 自由相机模式：允许完全自由的移动，包括垂直移动
+        XMFLOAT3 up = GetUpVector();
+        if (m_moveUp)
+            moveDir = XMVectorAdd(moveDir, XMLoadFloat3(&up));
+        if (m_moveDown)
+            moveDir = XMVectorSubtract(moveDir, XMLoadFloat3(&up));
+        
+        // 归一化移动方向并应用速度
+        float length = 0.0f;
+        XMStoreFloat(&length, XMVector3Length(moveDir));
+        if (length > 0.0001f)
+        {
+            moveDir = XMVector3Normalize(moveDir);
+            XMVECTOR position = XMLoadFloat3(&m_position);
+            
+            // 完全自由的移动（包括垂直方向）
+            XMVECTOR move = XMVectorScale(moveDir, m_moveSpeed * deltaTime);
+            position = XMVectorAdd(position, move);
+            XMStoreFloat3(&m_position, position);
+        }
     }
 }
 
