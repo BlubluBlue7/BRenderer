@@ -24,6 +24,7 @@
 class Camera;
 class Terrain;
 class TerrainNew;  // 前向声明
+class GrassSystem; // 前向声明
 
 class Renderer
 {
@@ -125,6 +126,7 @@ private:
     
     // 地形相关
     TerrainNew* m_terrain = nullptr;  // 地形对象
+    GrassSystem* m_grassSystem = nullptr;  // 草地系统
     
     // Shadow Map相关资源
     static const int SHADOW_MAP_SIZE = 2048;  // Shadow map分辨率

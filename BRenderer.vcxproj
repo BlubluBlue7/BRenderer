@@ -177,6 +177,7 @@ if exist "%VCPKG_RELEASE_BIN%\pugixml.dll" copy /Y "%VCPKG_RELEASE_BIN%\pugixml.
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="Camera.cpp" />
+    <ClCompile Include="GrassSystem.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="Mesh.cpp" />
     <ClCompile Include="MeshGPU.cpp" />
@@ -189,6 +190,7 @@ if exist "%VCPKG_RELEASE_BIN%\pugixml.dll" copy /Y "%VCPKG_RELEASE_BIN%\pugixml.
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Camera.h" />
+    <ClInclude Include="GrassSystem.h" />
     <ClInclude Include="Mesh.h" />
     <ClInclude Include="MeshGPU.h" />
     <ClInclude Include="MeshMgr.h" />

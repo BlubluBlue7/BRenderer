@@ -10,6 +10,10 @@
 #include <random>
 
 #include "stb_image.h"
+#include <d3dcompiler.h>
+#include <d3d11_1.h>  // 用于ID3D11DeviceContext1
+
+#pragma comment(lib, "d3dcompiler.lib")
 
 using namespace DirectX;
 
@@ -19,8 +23,12 @@ using namespace DirectX;
 TerrainNew::TerrainNew()
     : m_heightmapWidth(0)
     , m_heightmapHeight(0)
+    , m_normalmapWidth(0)
+    , m_normalmapHeight(0)
+    , m_hasNormalmap(false)
     , m_chunkCountX(0)
     , m_chunkCountZ(0)
+    , m_useGPUDriven(false)  // 默认使用CPU Driven，GPU Driven需要手动启用
 {
 }
 
@@ -35,6 +43,7 @@ bool TerrainNew::CreateFromHeightmap(ID3D11Device* device, const std::wstring& h
         return false;
 
     m_params = params;
+    m_hasNormalmap = false;  // 默认没有法线图
 
     // 如果提供了高度图路径，尝试加载
     if (!heightmapPath.empty())
@@ -49,6 +58,15 @@ bool TerrainNew::CreateFromHeightmap(ID3D11Device* device, const std::wstring& h
     {
         // 没有高度图，使用随机算法生成
         GenerateProceduralHeight();
+    }
+    
+    // 如果提供了法线图路径，尝试加载
+    if (!params.normalmapPath.empty())
+    {
+        if (!LoadNormalmap(params.normalmapPath))
+        {
+            OutputDebugStringW(L"[TerrainNew] Failed to load normalmap, will compute normals from heightmap.\n");
+        }
     }
 
     // 生成共享的LOD索引
@@ -90,10 +108,34 @@ bool TerrainNew::CreateProcedural(ID3D11Device* device, const TerrainNewParams& 
 
     // 构建四叉树
     BuildQuadTree();
+    
+    // 创建GPU Driven资源（如果启用）
+    if (m_useGPUDriven)
+    {
+        if (!CreateComputeShader(device))
+        {
+            OutputDebugStringW(L"[TerrainNew] Failed to create Compute Shader, GPU Driven disabled\n");
+            m_useGPUDriven = false;
+        }
+        else if (!CreateUnifiedBuffers(device))
+        {
+            OutputDebugStringW(L"[TerrainNew] Failed to create unified buffers, GPU Driven disabled\n");
+            m_useGPUDriven = false;
+        }
+        else if (!CreateGPUBuffers(device))
+        {
+            OutputDebugStringW(L"[TerrainNew] Failed to create GPU buffers, GPU Driven disabled\n");
+            m_useGPUDriven = false;
+        }
+        else
+        {
+            OutputDebugStringW(L"[TerrainNew] GPU Driven resources created successfully\n");
+        }
+    }
 
     wchar_t msg[256];
-    swprintf_s(msg, L"[TerrainNew] Procedural terrain created: %dx%d chunks\n",
-               m_chunkCountX, m_chunkCountZ);
+    swprintf_s(msg, L"[TerrainNew] Procedural terrain created: %dx%d chunks, GPU Driven: %s\n",
+               m_chunkCountX, m_chunkCountZ, m_useGPUDriven ? L"Enabled" : L"Disabled");
     OutputDebugStringW(msg);
 
     return true;
@@ -131,6 +173,43 @@ bool TerrainNew::LoadHeightmap(const std::wstring& path)
 
     wchar_t msg[256];
     swprintf_s(msg, L"[TerrainNew] Heightmap loaded: %dx%d\n", width, height);
+    OutputDebugStringW(msg);
+
+    return true;
+}
+
+bool TerrainNew::LoadNormalmap(const std::wstring& path)
+{
+    if (path.empty())
+        return false;
+
+    // 转换宽字符路径到多字节
+    int size_needed = WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    std::string pathA(size_needed, 0);
+    WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, &pathA[0], size_needed, nullptr, nullptr);
+
+    int width, height, channels;
+    unsigned char* data = stbi_load(pathA.c_str(), &width, &height, &channels, 3);  // 加载RGB（3通道）
+
+    if (!data)
+    {
+        OutputDebugStringW(L"[TerrainNew] Failed to load normalmap image\n");
+        return false;
+    }
+
+    m_normalmapWidth = width;
+    m_normalmapHeight = height;
+
+    // 存储法线图数据（RGB，每个通道0-255）
+    m_normalmapData.resize(width * height * 3);
+    memcpy(m_normalmapData.data(), data, width * height * 3);
+
+    stbi_image_free(data);
+
+    m_hasNormalmap = true;
+
+    wchar_t msg[256];
+    swprintf_s(msg, L"[TerrainNew] Normalmap loaded: %dx%d\n", width, height);
     OutputDebugStringW(msg);
 
     return true;
@@ -402,6 +481,82 @@ bool TerrainNew::CreateHeightmapTexture(ID3D11Device* device)
     return true;
 }
 
+bool TerrainNew::CreateNormalmapTexture(ID3D11Device* device)
+{
+    if (!device || m_normalmapData.empty() || !m_hasNormalmap)
+        return false;
+    
+    // 创建法线图纹理（R8G8B8A8_UNORM格式，存储法线向量）
+    D3D11_TEXTURE2D_DESC texDesc = {};
+    texDesc.Width = m_normalmapWidth;
+    texDesc.Height = m_normalmapHeight;
+    texDesc.MipLevels = 1;
+    texDesc.ArraySize = 1;
+    texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;  // 8位RGBA格式
+    texDesc.SampleDesc.Count = 1;
+    texDesc.SampleDesc.Quality = 0;
+    texDesc.Usage = D3D11_USAGE_DEFAULT;
+    texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    texDesc.CPUAccessFlags = 0;
+    
+    // 将RGB数据转换为RGBA（添加Alpha通道，设为255）
+    std::vector<unsigned char> rgbaData(m_normalmapWidth * m_normalmapHeight * 4);
+    for (int i = 0; i < m_normalmapWidth * m_normalmapHeight; ++i)
+    {
+        rgbaData[i * 4 + 0] = m_normalmapData[i * 3 + 0];  // R
+        rgbaData[i * 4 + 1] = m_normalmapData[i * 3 + 1];  // G
+        rgbaData[i * 4 + 2] = m_normalmapData[i * 3 + 2];  // B
+        rgbaData[i * 4 + 3] = 255;                          // A
+    }
+    
+    D3D11_SUBRESOURCE_DATA initData = {};
+    initData.pSysMem = rgbaData.data();
+    initData.SysMemPitch = m_normalmapWidth * 4;  // RGBA = 4字节
+    initData.SysMemSlicePitch = 0;
+    
+    HRESULT hr = device->CreateTexture2D(&texDesc, &initData, m_normalmapTexture.GetAddressOf());
+    if (FAILED(hr))
+    {
+        OutputDebugStringW(L"[TerrainNew] Failed to create normalmap texture\n");
+        return false;
+    }
+    
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Format = texDesc.Format;
+    srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Texture2D.MipLevels = 1;
+    srvDesc.Texture2D.MostDetailedMip = 0;
+    
+    hr = device->CreateShaderResourceView(m_normalmapTexture.Get(), &srvDesc, m_normalmapSRV.GetAddressOf());
+    if (FAILED(hr))
+    {
+        OutputDebugStringW(L"[TerrainNew] Failed to create normalmap SRV\n");
+        return false;
+    }
+    
+    // 创建采样器（使用线性过滤和包裹模式）
+    D3D11_SAMPLER_DESC samplerDesc = {};
+    samplerDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    samplerDesc.AddressU = D3D11_TEXTURE_ADDRESS_WRAP;
+    samplerDesc.AddressV = D3D11_TEXTURE_ADDRESS_WRAP;
+    samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+    samplerDesc.MaxLOD = D3D11_FLOAT32_MAX;
+    
+    hr = device->CreateSamplerState(&samplerDesc, m_normalmapSampler.GetAddressOf());
+    if (FAILED(hr))
+    {
+        OutputDebugStringW(L"[TerrainNew] Failed to create normalmap sampler\n");
+        return false;
+    }
+    
+    wchar_t msg[256];
+    swprintf_s(msg, L"[TerrainNew] Normalmap texture created: %dx%d (R8G8B8A8_UNORM)\n", 
+               m_normalmapWidth, m_normalmapHeight);
+    OutputDebugStringW(msg);
+    
+    return true;
+}
+
 bool TerrainNew::GenerateSharedLODIndices(ID3D11Device* device)
 {
     if (!device)
@@ -426,6 +581,16 @@ bool TerrainNew::GenerateSharedLODIndices(ID3D11Device* device)
     {
         OutputDebugStringW(L"[TerrainNew] Failed to create heightmap texture\n");
         return false;
+    }
+    
+    // 如果加载了法线图，创建法线图纹理
+    if (m_hasNormalmap)
+    {
+        if (!CreateNormalmapTexture(device))
+        {
+            OutputDebugStringW(L"[TerrainNew] Failed to create normalmap texture\n");
+            m_hasNormalmap = false;  // 标记为未使用法线图
+        }
     }
 
     // 为每个LOD级别生成共享的索引
@@ -1498,4 +1663,701 @@ float TerrainNew::GetHeightAt(float worldX, float worldZ) const
     float h = (h00 * (1 - xf) + h10 * xf) * (1 - zf) + (h01 * (1 - xf) + h11 * xf) * zf;
 
     return h * m_params.heightScale + m_params.heightOffset;
+}
+
+// ============================================================================
+// GPU Driven实现（简化版本）
+// 注意：完整实现需要D3D11.1+支持DrawIndexedIndirect
+// ============================================================================
+
+bool TerrainNew::CreateComputeShader(ID3D11Device* device)
+{
+    if (!device)
+        return false;
+    
+    // 尝试多个可能的路径加载Compute Shader
+    std::vector<std::wstring> pathsToTry;
+    wchar_t exePath[MAX_PATH] = {0};
+    if (GetModuleFileNameW(nullptr, exePath, MAX_PATH) > 0)
+    {
+        std::wstring exeDir = exePath;
+        size_t lastSlash = exeDir.find_last_of(L"\\/");
+        if (lastSlash != std::wstring::npos)
+        {
+            exeDir = exeDir.substr(0, lastSlash + 1);
+            
+            // 尝试项目根目录（向上两级）
+            std::wstring projectRoot = exeDir;
+            for (int i = 0; i < 2; ++i)
+            {
+                size_t slash = projectRoot.find_last_of(L"\\/", projectRoot.length() - 2);
+                if (slash != std::wstring::npos)
+                    projectRoot = projectRoot.substr(0, slash + 1);
+            }
+            
+            pathsToTry.push_back(projectRoot + L"Shaders/TerrainCullCompute.hlsl");
+            pathsToTry.push_back(exeDir + L"Shaders/TerrainCullCompute.hlsl");
+        }
+    }
+    pathsToTry.push_back(L"Shaders/TerrainCullCompute.hlsl");
+    
+    Microsoft::WRL::ComPtr<ID3DBlob> csBlob;
+    Microsoft::WRL::ComPtr<ID3DBlob> errorBlob;
+    HRESULT hr = E_FAIL;
+    
+    for (const auto& path : pathsToTry)
+    {
+        HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFile != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(hFile);
+            
+            // 转换路径
+            int size_needed = WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, nullptr, 0, nullptr, nullptr);
+            std::string pathA(size_needed, 0);
+            WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, &pathA[0], size_needed, nullptr, nullptr);
+            
+            // 读取文件
+            hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (hFile != INVALID_HANDLE_VALUE)
+            {
+                LARGE_INTEGER fileSize;
+                if (GetFileSizeEx(hFile, &fileSize))
+                {
+                    std::vector<char> shaderCode(fileSize.QuadPart + 1);
+                    DWORD bytesRead = 0;
+                    if (ReadFile(hFile, shaderCode.data(), (DWORD)fileSize.QuadPart, &bytesRead, nullptr))
+                    {
+                        shaderCode[bytesRead] = '\0';
+                        hr = D3DCompile(shaderCode.data(), bytesRead, pathA.c_str(), nullptr, nullptr, "CS", "cs_5_0", 0, 0, csBlob.GetAddressOf(), errorBlob.GetAddressOf());
+                        if (SUCCEEDED(hr))
+                        {
+                            break;
+                        }
+                    }
+                }
+                CloseHandle(hFile);
+            }
+        }
+    }
+    
+    if (FAILED(hr) || !csBlob)
+    {
+        if (errorBlob)
+        {
+            OutputDebugStringA((char*)errorBlob->GetBufferPointer());
+        }
+        OutputDebugStringW(L"[TerrainNew] Failed to compile Compute Shader\n");
+        return false;
+    }
+    
+    hr = device->CreateComputeShader(csBlob->GetBufferPointer(), csBlob->GetBufferSize(), nullptr, m_cullComputeShader.GetAddressOf());
+    if (FAILED(hr))
+    {
+        OutputDebugStringW(L"[TerrainNew] Failed to create Compute Shader\n");
+        return false;
+    }
+    
+    OutputDebugStringW(L"[TerrainNew] Compute Shader created successfully\n");
+    return true;
+}
+
+bool TerrainNew::CreateGPUBuffers(ID3D11Device* device)
+{
+    if (!device || m_chunks.empty())
+        return false;
+    
+    // 先创建统一缓冲区（如果还没创建）
+    if (!m_unifiedVertexBuffer || !m_unifiedIndexBuffer)
+    {
+        if (!CreateUnifiedBuffers(device))
+        {
+            OutputDebugStringW(L"[TerrainNew] Failed to create unified buffers\n");
+            return false;
+        }
+    }
+    
+    // 计算每个chunk每个LOD的偏移
+    std::vector<UINT> vertexOffsets;
+    std::vector<UINT> indexOffsets;
+    vertexOffsets.reserve(m_chunks.size() * m_params.maxLODLevels);
+    indexOffsets.reserve(m_chunks.size() * m_params.maxLODLevels);
+    
+    // 计算每个LOD级别的网格大小和顶点数量
+    std::vector<int> lodGridSizes;
+    std::vector<UINT> lodVertexCounts;
+    std::vector<UINT> lodIndexCounts;
+    lodGridSizes.reserve(m_params.maxLODLevels);
+    lodVertexCounts.reserve(m_params.maxLODLevels);
+    lodIndexCounts.reserve(m_params.maxLODLevels);
+    
+    for (int lod = 0; lod < m_params.maxLODLevels; ++lod)
+    {
+        int gridSize = m_params.chunkSize / (1 << lod);
+        lodGridSizes.push_back(gridSize);
+        lodVertexCounts.push_back((gridSize + 1) * (gridSize + 1));
+        lodIndexCounts.push_back(m_sharedLODIndices[lod].indexCount);
+    }
+    
+    // 计算每个chunk每个LOD的偏移
+    UINT currentVertexOffset = 0;
+    UINT currentIndexOffset = 0;
+    
+    for (size_t chunkIdx = 0; chunkIdx < m_chunks.size(); ++chunkIdx)
+    {
+        for (int lod = 0; lod < m_params.maxLODLevels; ++lod)
+        {
+            vertexOffsets.push_back(currentVertexOffset);
+            indexOffsets.push_back(currentIndexOffset);
+            
+            currentVertexOffset += lodVertexCounts[lod];
+            currentIndexOffset += lodIndexCounts[lod];
+        }
+    }
+    
+    // 创建chunk数据缓冲区（Structured Buffer）
+    std::vector<TerrainChunkDataGPU> gpuChunkData;
+    gpuChunkData.reserve(m_chunks.size());
+    
+    for (size_t i = 0; i < m_chunks.size(); ++i)
+    {
+        const auto& chunk = m_chunks[i];
+        TerrainChunkDataGPU gpuChunk;
+        gpuChunk.bounds = DirectX::XMFLOAT4(chunk.minX, chunk.minZ, chunk.maxX, chunk.maxZ);
+        gpuChunk.heightRange = DirectX::XMFLOAT4(chunk.minY, chunk.maxY, 0.0f, 0.0f);
+        gpuChunk.chunkIndex = DirectX::XMUINT2(chunk.chunkX, chunk.chunkZ);
+        // 使用LOD 0的偏移（每个chunk有多个LOD，使用第一个LOD的偏移）
+        gpuChunk.vertexBufferOffset = vertexOffsets[i * m_params.maxLODLevels];
+        gpuChunk.indexBufferOffset = indexOffsets[i * m_params.maxLODLevels];
+        gpuChunkData.push_back(gpuChunk);
+    }
+    
+    D3D11_BUFFER_DESC bd = {};
+    bd.Usage = D3D11_USAGE_DEFAULT;
+    bd.ByteWidth = static_cast<UINT>(sizeof(TerrainChunkDataGPU) * gpuChunkData.size());
+    bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+    bd.StructureByteStride = sizeof(TerrainChunkDataGPU);
+    
+    D3D11_SUBRESOURCE_DATA initData = {};
+    initData.pSysMem = gpuChunkData.data();
+    
+    HRESULT hr = device->CreateBuffer(&bd, &initData, m_chunkDataBuffer.GetAddressOf());
+    if (FAILED(hr))
+        return false;
+    
+    // 创建SRV
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Format = DXGI_FORMAT_UNKNOWN;
+    srvDesc.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
+    srvDesc.BufferEx.FirstElement = 0;
+    srvDesc.BufferEx.NumElements = static_cast<UINT>(gpuChunkData.size());
+    
+    hr = device->CreateShaderResourceView(m_chunkDataBuffer.Get(), &srvDesc, m_chunkDataSRV.GetAddressOf());
+    if (FAILED(hr))
+        return false;
+    
+    // 创建LOD索引数量缓冲区（重用之前计算的lodIndexCounts）
+    // 注意：lodIndexCounts已经在上面计算过了，直接使用
+    bd.ByteWidth = static_cast<UINT>(sizeof(UINT) * lodIndexCounts.size());
+    bd.StructureByteStride = sizeof(UINT);
+    initData.pSysMem = lodIndexCounts.data();
+    
+    hr = device->CreateBuffer(&bd, &initData, m_lodIndexCountsBuffer.GetAddressOf());
+    if (FAILED(hr))
+        return false;
+    
+    srvDesc.BufferEx.NumElements = static_cast<UINT>(lodIndexCounts.size());
+    hr = device->CreateShaderResourceView(m_lodIndexCountsBuffer.Get(), &srvDesc, m_lodIndexCountsSRV.GetAddressOf());
+    if (FAILED(hr))
+        return false;
+    
+    // 创建可见chunk索引缓冲区（UAV）
+    bd.Usage = D3D11_USAGE_DEFAULT;
+    bd.ByteWidth = static_cast<UINT>(sizeof(UINT) * m_chunks.size());
+    bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+    bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+    bd.StructureByteStride = sizeof(UINT);
+    bd.CPUAccessFlags = 0;
+    
+    hr = device->CreateBuffer(&bd, nullptr, m_visibleChunkBuffer.GetAddressOf());
+    if (FAILED(hr))
+        return false;
+    
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+    uavDesc.Format = DXGI_FORMAT_UNKNOWN;
+    uavDesc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+    uavDesc.Buffer.FirstElement = 0;
+    uavDesc.Buffer.NumElements = static_cast<UINT>(m_chunks.size());
+    uavDesc.Buffer.Flags = 0;
+    
+    hr = device->CreateUnorderedAccessView(m_visibleChunkBuffer.Get(), &uavDesc, m_visibleChunkUAV.GetAddressOf());
+    if (FAILED(hr))
+        return false;
+    
+    // 创建间接绘制参数缓冲区（UAV，需要支持间接绘制）
+    bd.ByteWidth = static_cast<UINT>(sizeof(DrawIndexedIndirectArgs) * m_chunks.size());
+    bd.StructureByteStride = sizeof(DrawIndexedIndirectArgs);
+    bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED | D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS;  // 添加间接绘制标志
+    
+    hr = device->CreateBuffer(&bd, nullptr, m_drawCommandsBuffer.GetAddressOf());
+    if (FAILED(hr))
+        return false;
+    
+    uavDesc.Buffer.NumElements = static_cast<UINT>(m_chunks.size());
+    hr = device->CreateUnorderedAccessView(m_drawCommandsBuffer.Get(), &uavDesc, m_drawCommandsUAV.GetAddressOf());
+    if (FAILED(hr))
+        return false;
+    
+    // 创建chunk实例数据缓冲区（UAV，也可作为SRV供VS使用）
+    bd.ByteWidth = static_cast<UINT>(sizeof(ChunkInstanceDataGPU) * m_chunks.size());
+    bd.StructureByteStride = sizeof(ChunkInstanceDataGPU);
+    
+    hr = device->CreateBuffer(&bd, nullptr, m_chunkInstanceBuffer.GetAddressOf());
+    if (FAILED(hr))
+        return false;
+    
+    uavDesc.Buffer.NumElements = static_cast<UINT>(m_chunks.size());
+    hr = device->CreateUnorderedAccessView(m_chunkInstanceBuffer.Get(), &uavDesc, m_chunkInstanceUAV.GetAddressOf());
+    if (FAILED(hr))
+        return false;
+    
+    srvDesc.BufferEx.NumElements = static_cast<UINT>(m_chunks.size());
+    hr = device->CreateShaderResourceView(m_chunkInstanceBuffer.Get(), &srvDesc, m_chunkInstanceSRV.GetAddressOf());
+    if (FAILED(hr))
+        return false;
+    
+    // 创建可见chunk计数缓冲区（UAV，单元素）
+    bd.ByteWidth = sizeof(UINT);
+    bd.StructureByteStride = sizeof(UINT);
+    
+    hr = device->CreateBuffer(&bd, nullptr, m_visibleCountBuffer.GetAddressOf());
+    if (FAILED(hr))
+        return false;
+    
+    uavDesc.Buffer.NumElements = 1;
+    hr = device->CreateUnorderedAccessView(m_visibleCountBuffer.Get(), &uavDesc, m_visibleCountUAV.GetAddressOf());
+    if (FAILED(hr))
+        return false;
+    
+    // 创建Cull参数常量缓冲区
+    bd.Usage = D3D11_USAGE_DYNAMIC;
+    bd.ByteWidth = (sizeof(DirectX::XMFLOAT4) * 8 + sizeof(float) + sizeof(UINT) * 2 + sizeof(float));  // frustumPlanes[6] + lodDistances + morphStartRatio + maxChunkCount + viewDistance + padding
+    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    bd.MiscFlags = 0;
+    bd.StructureByteStride = 0;
+    bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    
+    hr = device->CreateBuffer(&bd, nullptr, m_cullParamsBuffer.GetAddressOf());
+    if (FAILED(hr))
+        return false;
+    
+    OutputDebugStringW(L"[TerrainNew] GPU buffers created successfully\n");
+    return true;
+}
+
+bool TerrainNew::CreateUnifiedBuffers(ID3D11Device* device)
+{
+    if (!device || m_chunks.empty() || m_sharedLODIndices.empty())
+        return false;
+    
+    // 计算每个LOD级别的网格大小
+    std::vector<int> lodGridSizes;
+    lodGridSizes.reserve(m_params.maxLODLevels);
+    for (int lod = 0; lod < m_params.maxLODLevels; ++lod)
+    {
+        int gridSize = m_params.chunkSize / (1 << lod);  // chunkSize / 2^lod
+        lodGridSizes.push_back(gridSize);
+    }
+    
+    // 计算每个LOD级别的顶点数量（每个chunk）
+    std::vector<UINT> lodVertexCounts;
+    lodVertexCounts.reserve(m_params.maxLODLevels);
+    for (int lod = 0; lod < m_params.maxLODLevels; ++lod)
+    {
+        int gridSize = lodGridSizes[lod];
+        UINT vertexCount = (gridSize + 1) * (gridSize + 1);  // (gridSize+1)^2 顶点
+        lodVertexCounts.push_back(vertexCount);
+    }
+    
+    // 计算总顶点数量（所有chunk的所有LOD）
+    UINT totalVertexCount = 0;
+    for (int lod = 0; lod < m_params.maxLODLevels; ++lod)
+    {
+        totalVertexCount += lodVertexCounts[lod] * static_cast<UINT>(m_chunks.size());
+    }
+    
+    // 收集所有顶点数据
+    std::vector<Vertex> allVertices;
+    allVertices.reserve(totalVertexCount);
+    
+    // 计算每个chunk每个LOD在统一缓冲区中的偏移
+    std::vector<UINT> vertexOffsets;
+    vertexOffsets.reserve(m_chunks.size() * m_params.maxLODLevels);
+    
+    UINT currentVertexOffset = 0;
+    for (const auto& chunk : m_chunks)
+    {
+        for (int lod = 0; lod < m_params.maxLODLevels; ++lod)
+        {
+            // 存储偏移
+            vertexOffsets.push_back(currentVertexOffset);
+            
+            // 生成该chunk该LOD的顶点数据
+            std::vector<Vertex> vertices;
+            GenerateChunkLODVertices(chunk.chunkX, chunk.chunkZ, lod, vertices);
+            
+            // 添加到统一缓冲区
+            allVertices.insert(allVertices.end(), vertices.begin(), vertices.end());
+            
+            currentVertexOffset += static_cast<UINT>(vertices.size());
+        }
+    }
+    
+    // 创建统一顶点缓冲区
+    D3D11_BUFFER_DESC vbd = {};
+    vbd.Usage = D3D11_USAGE_DEFAULT;
+    vbd.ByteWidth = static_cast<UINT>(sizeof(Vertex) * allVertices.size());
+    vbd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    
+    D3D11_SUBRESOURCE_DATA vdata = {};
+    vdata.pSysMem = allVertices.data();
+    
+    HRESULT hr = device->CreateBuffer(&vbd, &vdata, m_unifiedVertexBuffer.GetAddressOf());
+    if (FAILED(hr))
+        return false;
+    
+    // 计算总索引数量（所有LOD）
+    UINT totalIndexCount = 0;
+    for (int lod = 0; lod < m_params.maxLODLevels; ++lod)
+    {
+        totalIndexCount += m_sharedLODIndices[lod].indexCount * static_cast<UINT>(m_chunks.size());
+    }
+    
+    // 收集所有索引数据（每个chunk使用相同的LOD索引模板，但需要加上顶点偏移）
+    std::vector<uint32_t> allIndices;
+    allIndices.reserve(totalIndexCount);
+    
+    std::vector<UINT> indexOffsets;
+    indexOffsets.reserve(m_chunks.size() * m_params.maxLODLevels);
+    
+    UINT currentIndexOffset = 0;
+    for (size_t chunkIdx = 0; chunkIdx < m_chunks.size(); ++chunkIdx)
+    {
+        for (int lod = 0; lod < m_params.maxLODLevels; ++lod)
+        {
+            // 存储索引偏移
+            indexOffsets.push_back(currentIndexOffset);
+            
+            // 获取该LOD的索引模板
+            const SharedLODIndices& lodIndices = m_sharedLODIndices[lod];
+            
+            // 计算该chunk该LOD的顶点偏移
+            UINT chunkLodVertexOffset = vertexOffsets[chunkIdx * m_params.maxLODLevels + lod];
+            
+            // 复制索引并加上顶点偏移
+            std::vector<uint32_t> chunkIndices;
+            chunkIndices.reserve(lodIndices.indexCount);
+            
+            // 需要从GPU读取索引数据，这里我们重新生成
+            std::vector<uint32_t> lodIndicesTemplate;
+            int gridSize = lodGridSizes[lod];
+            GenerateLODIndicesTemplate(lod, gridSize, lodIndicesTemplate);
+            
+            for (uint32_t idx : lodIndicesTemplate)
+            {
+                chunkIndices.push_back(idx + chunkLodVertexOffset);
+            }
+            
+            // 添加到统一索引缓冲区
+            allIndices.insert(allIndices.end(), chunkIndices.begin(), chunkIndices.end());
+            
+            currentIndexOffset += static_cast<UINT>(chunkIndices.size());
+        }
+    }
+    
+    // 创建统一索引缓冲区
+    D3D11_BUFFER_DESC ibd = {};
+    ibd.Usage = D3D11_USAGE_DEFAULT;
+    ibd.ByteWidth = static_cast<UINT>(sizeof(uint32_t) * allIndices.size());
+    ibd.BindFlags = D3D11_BIND_INDEX_BUFFER;
+    
+    D3D11_SUBRESOURCE_DATA idata = {};
+    idata.pSysMem = allIndices.data();
+    
+    hr = device->CreateBuffer(&ibd, &idata, m_unifiedIndexBuffer.GetAddressOf());
+    if (FAILED(hr))
+        return false;
+    
+    // 更新GPU chunk数据中的偏移（需要在CreateGPUBuffers之前调用，或者在这里更新）
+    // 注意：这里我们只是创建缓冲区，偏移的更新需要在CreateGPUBuffers中处理
+    // 或者我们需要在这里重新创建GPU chunk数据缓冲区
+    
+    wchar_t msg[256];
+    swprintf_s(msg, L"[TerrainNew] Unified buffers created: %d vertices, %d indices\n",
+               static_cast<int>(allVertices.size()), static_cast<int>(allIndices.size()));
+    OutputDebugStringW(msg);
+    
+    return true;
+}
+
+void TerrainNew::UpdateCullParams(ID3D11DeviceContext* context, const DirectX::XMFLOAT3& cameraPosition,
+                                   const DirectX::XMFLOAT4X4& viewMatrix, const DirectX::XMFLOAT4X4& projMatrix)
+{
+    if (!context || !m_cullParamsBuffer)
+        return;
+    
+    // 从view和proj矩阵提取视锥体平面
+    XMMATRIX view = XMLoadFloat4x4(&viewMatrix);
+    XMMATRIX proj = XMLoadFloat4x4(&projMatrix);
+    XMMATRIX viewProj = XMMatrixMultiply(view, proj);
+    
+    // 提取视锥体平面（使用Gribb-Hartmann方法）
+    // 平面方程: ax + by + cz + d = 0，存储为(normal.xyz, d)
+    DirectX::XMFLOAT4 frustumPlanes[6];
+    
+    // Left plane
+    frustumPlanes[0].x = viewProj.r[0].m128_f32[3] + viewProj.r[0].m128_f32[0];
+    frustumPlanes[0].y = viewProj.r[1].m128_f32[3] + viewProj.r[1].m128_f32[0];
+    frustumPlanes[0].z = viewProj.r[2].m128_f32[3] + viewProj.r[2].m128_f32[0];
+    frustumPlanes[0].w = viewProj.r[3].m128_f32[3] + viewProj.r[3].m128_f32[0];
+    
+    // Right plane
+    frustumPlanes[1].x = viewProj.r[0].m128_f32[3] - viewProj.r[0].m128_f32[0];
+    frustumPlanes[1].y = viewProj.r[1].m128_f32[3] - viewProj.r[1].m128_f32[0];
+    frustumPlanes[1].z = viewProj.r[2].m128_f32[3] - viewProj.r[2].m128_f32[0];
+    frustumPlanes[1].w = viewProj.r[3].m128_f32[3] - viewProj.r[3].m128_f32[0];
+    
+    // Bottom plane
+    frustumPlanes[2].x = viewProj.r[0].m128_f32[3] + viewProj.r[0].m128_f32[1];
+    frustumPlanes[2].y = viewProj.r[1].m128_f32[3] + viewProj.r[1].m128_f32[1];
+    frustumPlanes[2].z = viewProj.r[2].m128_f32[3] + viewProj.r[2].m128_f32[1];
+    frustumPlanes[2].w = viewProj.r[3].m128_f32[3] + viewProj.r[3].m128_f32[1];
+    
+    // Top plane
+    frustumPlanes[3].x = viewProj.r[0].m128_f32[3] - viewProj.r[0].m128_f32[1];
+    frustumPlanes[3].y = viewProj.r[1].m128_f32[3] - viewProj.r[1].m128_f32[1];
+    frustumPlanes[3].z = viewProj.r[2].m128_f32[3] - viewProj.r[2].m128_f32[1];
+    frustumPlanes[3].w = viewProj.r[3].m128_f32[3] - viewProj.r[3].m128_f32[1];
+    
+    // Near plane
+    frustumPlanes[4].x = viewProj.r[0].m128_f32[3] + viewProj.r[0].m128_f32[2];
+    frustumPlanes[4].y = viewProj.r[1].m128_f32[3] + viewProj.r[1].m128_f32[2];
+    frustumPlanes[4].z = viewProj.r[2].m128_f32[3] + viewProj.r[2].m128_f32[2];
+    frustumPlanes[4].w = viewProj.r[3].m128_f32[3] + viewProj.r[3].m128_f32[2];
+    
+    // Far plane
+    frustumPlanes[5].x = viewProj.r[0].m128_f32[3] - viewProj.r[0].m128_f32[2];
+    frustumPlanes[5].y = viewProj.r[1].m128_f32[3] - viewProj.r[1].m128_f32[2];
+    frustumPlanes[5].z = viewProj.r[2].m128_f32[3] - viewProj.r[2].m128_f32[2];
+    frustumPlanes[5].w = viewProj.r[3].m128_f32[3] - viewProj.r[3].m128_f32[2];
+    
+    // 归一化所有平面
+    for (int i = 0; i < 6; ++i)
+    {
+        XMVECTOR plane = XMLoadFloat4(&frustumPlanes[i]);
+        float length = XMVectorGetX(XMVector3Length(plane));
+        if (length > 0.0001f)
+        {
+            plane = XMVectorScale(plane, 1.0f / length);
+            XMStoreFloat4(&frustumPlanes[i], plane);
+        }
+    }
+    
+    // 计算相机方向（从view矩阵提取）
+    XMMATRIX viewInv = XMMatrixInverse(nullptr, view);
+    XMVECTOR cameraDirVec = viewInv.r[2];  // view矩阵的Z轴是相机的向前方向（在view空间是-Z）
+    cameraDirVec = XMVectorNegate(cameraDirVec);  // 反转以得到世界空间的方向
+    cameraDirVec = XMVector3Normalize(cameraDirVec);
+    DirectX::XMFLOAT3 cameraDir;
+    XMStoreFloat3(&cameraDir, cameraDirVec);
+    
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    HRESULT hr = context->Map(m_cullParamsBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (SUCCEEDED(hr))
+    {
+        // 注意：这个结构需要与Compute Shader中的CullParams匹配
+        DirectX::XMFLOAT4* data = static_cast<DirectX::XMFLOAT4*>(mapped.pData);
+        
+        // cameraPos
+        data[0] = DirectX::XMFLOAT4(cameraPosition.x, cameraPosition.y, cameraPosition.z, 0.0f);
+        
+        // cameraDir
+        data[1] = DirectX::XMFLOAT4(cameraDir.x, cameraDir.y, cameraDir.z, 0.0f);
+        
+        // frustumPlanes[6]
+        for (int i = 0; i < 6; ++i)
+        {
+            data[2 + i] = frustumPlanes[i];
+        }
+        
+        // lodDistances
+        data[8] = DirectX::XMFLOAT4(
+            m_params.lodDistances[0],
+            m_params.lodDistances[1],
+            m_params.lodDistances[2],
+            m_params.lodDistances[3]
+        );
+        
+        // morphStartRatio, maxChunkCount, viewDistance, chunkSize, padding
+        float* floatData = reinterpret_cast<float*>(&data[9]);
+        floatData[0] = m_params.morphStartRatio;
+        UINT* uintData = reinterpret_cast<UINT*>(&floatData[1]);
+        uintData[0] = static_cast<UINT>(m_chunks.size());
+        floatData[2] = m_params.lodDistances[m_params.maxLODLevels - 1] * 2.0f;
+        uintData[1] = static_cast<UINT>(m_params.chunkSize);  // chunkSize
+        uintData[2] = 0;  // padding
+        uintData[3] = 0;  // padding
+        
+        context->Unmap(m_cullParamsBuffer.Get(), 0);
+    }
+}
+
+void TerrainNew::RenderGPUDriven(ID3D11DeviceContext* context, const DirectX::XMFLOAT3& cameraPosition,
+                                  const DirectX::XMFLOAT4X4& viewMatrix, const DirectX::XMFLOAT4X4& projMatrix)
+{
+    if (!context || !m_cullComputeShader || m_chunks.empty())
+    {
+        // 如果GPU Driven不可用，回退到CPU Driven
+        Render(context, cameraPosition);
+        return;
+    }
+    
+    // 更新Cull参数
+    UpdateCullParams(context, cameraPosition, viewMatrix, projMatrix);
+    
+    // ========================================================================
+    // 阶段1：Dispatch Compute Shader - GPU端chunk选择和LOD计算
+    // ========================================================================
+    
+    // 清空可见计数（通过Map/Unmap）
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    HRESULT hr = context->Map(m_visibleCountBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (SUCCEEDED(hr))
+    {
+        UINT* count = static_cast<UINT*>(mapped.pData);
+        *count = 0;
+        context->Unmap(m_visibleCountBuffer.Get(), 0);
+    }
+    
+    // 绑定Compute Shader
+    context->CSSetShader(m_cullComputeShader.Get(), nullptr, 0);
+    
+    // 绑定常量缓冲区
+    ID3D11Buffer* cullParamsCB = m_cullParamsBuffer.Get();
+    context->CSSetConstantBuffers(0, 1, &cullParamsCB);
+    
+    // 绑定Structured Buffer作为SRV（输入）
+    ID3D11ShaderResourceView* srvs[] = {
+        m_chunkDataSRV.Get(),
+        m_lodIndexCountsSRV.Get()
+    };
+    context->CSSetShaderResources(0, 2, srvs);
+    
+    // 绑定RW Structured Buffer作为UAV（输出）
+    ID3D11UnorderedAccessView* uavs[] = {
+        m_visibleChunkUAV.Get(),
+        m_drawCommandsUAV.Get(),
+        m_chunkInstanceUAV.Get(),
+        m_visibleCountUAV.Get()
+    };
+    UINT initialCounts[] = { 0, 0, 0, 0 };
+    context->CSSetUnorderedAccessViews(0, 4, uavs, initialCounts);
+    
+    // Dispatch Compute Shader
+    UINT threadGroupCount = (static_cast<UINT>(m_chunks.size()) + 63) / 64;  // 每组64个线程
+    context->Dispatch(threadGroupCount, 1, 1);
+    
+    // 清除UAV绑定（避免资源冲突）
+    ID3D11UnorderedAccessView* nullUAVs[] = { nullptr, nullptr, nullptr, nullptr };
+    context->CSSetUnorderedAccessViews(0, 4, nullUAVs, nullptr);
+    
+    ID3D11ShaderResourceView* nullSRVs[] = { nullptr, nullptr };
+    context->CSSetShaderResources(0, 2, nullSRVs);
+    
+    context->CSSetShader(nullptr, nullptr, 0);
+    
+    // ========================================================================
+    // 阶段2：尝试使用D3D11.1的DrawIndexedInstancedIndirect
+    // ========================================================================
+    
+    // 尝试查询D3D11.1接口
+    ID3D11DeviceContext1* context1Raw = nullptr;
+    hr = context->QueryInterface(__uuidof(ID3D11DeviceContext1), (void**)&context1Raw);
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext1> context1(context1Raw);
+    
+    if (SUCCEEDED(hr) && context1Raw && m_unifiedVertexBuffer && m_unifiedIndexBuffer)
+    {
+        // D3D11.1支持，可以使用DrawIndexedInstancedIndirect
+        
+        // 绑定统一顶点和索引缓冲区
+        UINT stride = sizeof(Vertex);
+        UINT offset = 0;
+        context->IASetVertexBuffers(0, 1, m_unifiedVertexBuffer.GetAddressOf(), &stride, &offset);
+        context->IASetIndexBuffer(m_unifiedIndexBuffer.Get(), DXGI_FORMAT_R32_UINT, 0);
+        context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        
+        // 绑定chunk实例数据到VS（作为SRV，register t2）
+        context->VSSetShaderResources(2, 1, m_chunkInstanceSRV.GetAddressOf());
+        
+        // 绑定高度图纹理
+        if (m_heightmapSRV)
+        {
+            ID3D11ShaderResourceView* heightmapSRV = m_heightmapSRV.Get();
+            context->VSSetShaderResources(0, 1, &heightmapSRV);
+        }
+        if (m_heightmapSampler)
+        {
+            ID3D11SamplerState* sampler = m_heightmapSampler.Get();
+            context->VSSetSamplers(0, 1, &sampler);
+        }
+        
+        // 绑定法线图（如果存在）
+        if (m_hasNormalmap && m_normalmapSRV)
+        {
+            ID3D11ShaderResourceView* normalmapSRV = m_normalmapSRV.Get();
+            context->VSSetShaderResources(1, 1, &normalmapSRV);
+            
+            if (m_normalmapSampler)
+            {
+                ID3D11SamplerState* normalmapSampler = m_normalmapSampler.Get();
+                context->VSSetSamplers(1, 1, &normalmapSampler);
+            }
+        }
+        
+        // 执行间接绘制
+        // 注意：DrawIndexedInstancedIndirect会自动从drawCommandsBuffer读取绘制参数
+        context1Raw->DrawIndexedInstancedIndirect(m_drawCommandsBuffer.Get(), 0);
+        
+        // 清除SRV绑定
+        ID3D11ShaderResourceView* nullSRVs2[] = { nullptr, nullptr, nullptr };
+        context->VSSetShaderResources(0, 3, nullSRVs2);
+        
+        // 调试输出（每300帧输出一次）
+        static int frameCount = 0;
+        if (++frameCount % 300 == 0)
+        {
+            OutputDebugStringW(L"[TerrainNew] GPU Driven rendering using D3D11.1 DrawIndexedInstancedIndirect\n");
+        }
+    }
+    else
+    {
+        // D3D11.1不支持或资源未准备好，回退到CPU Driven
+        static bool warned = false;
+        if (!warned)
+        {
+            if (!context1Raw)
+                OutputDebugStringW(L"[TerrainNew] D3D11.1 not available (ID3D11DeviceContext1 query failed), falling back to CPU Driven\n");
+            else if (!m_unifiedVertexBuffer || !m_unifiedIndexBuffer)
+                OutputDebugStringW(L"[TerrainNew] Unified buffers not created, falling back to CPU Driven\n");
+            warned = true;
+        }
+        Render(context, cameraPosition);
+    }
+}
+
+void TerrainNew::UploadDataToGPU(ID3D11DeviceContext* context)
+{
+    // TODO: 上传数据到GPU（如果需要更新）
+    // 当前数据在CreateGPUBuffers时已经上传
 }

@@ -10,6 +10,7 @@
 
 #include <windows.h>
 #include <d3d11.h>
+#include <d3d11_1.h>  // 用于ID3D11DeviceContext1
 #include <wrl/client.h>
 #include <DirectXMath.h>
 #include <DirectXCollision.h>
@@ -34,6 +35,9 @@ struct TerrainNewParams
     
     // Morphing参数
     float morphStartRatio = 0.66f;   // Morphing开始距离比例（66%处开始）
+    
+    // 纹理路径（可选）
+    std::wstring normalmapPath;       // 法线图路径（如果为空则从高度图计算法线）
 };
 
 // ============================================================================
@@ -212,6 +216,48 @@ struct QuadTreeNode
 };
 
 // ============================================================================
+// GPU端数据结构（用于Compute Shader）
+// ============================================================================
+struct alignas(16) TerrainChunkDataGPU
+{
+    DirectX::XMFLOAT4 bounds;        // minX, minZ, maxX, maxZ
+    DirectX::XMFLOAT4 heightRange;   // minY, maxY, unused, unused
+    DirectX::XMUINT2 chunkIndex;     // chunkX, chunkZ
+    UINT vertexBufferOffset;         // 在统一VB中的偏移（顶点数）
+    UINT indexBufferOffset;          // 在统一IB中的偏移（索引数）
+};
+
+struct alignas(16) QuadTreeNodeGPU
+{
+    DirectX::XMFLOAT4 bounds;        // minX, minZ, maxX, maxZ
+    DirectX::XMFLOAT4 heightRange;   // minY, maxY, centerX, centerZ
+    DirectX::XMUINT4 children;       // child indices [0]=LT, [1]=RT, [2]=LB, [3]=RB
+    DirectX::XMUINT2 chunkRange;     // chunkStartX, chunkStartZ (if leaf)
+    UINT isLeaf;                     // 1=叶子节点, 0=分支节点
+    UINT padding;
+};
+
+struct alignas(16) ChunkInstanceDataGPU
+{
+    DirectX::XMFLOAT4 chunkParams;   // x=chunkDistToCamera, y=lodLevel, z=morphStart, w=morphEnd
+    DirectX::XMFLOAT4 chunkBounds;   // x=minX, y=minZ, z=maxX, w=maxZ
+    UINT vertexOffset;
+    UINT indexOffset;
+    UINT indexCount;
+    UINT padding;
+};
+
+// 间接绘制参数（必须匹配D3D11_DRAW_INDEXED_INSTANCED_INDIRECT_ARGS）
+struct DrawIndexedIndirectArgs
+{
+    UINT IndexCountPerInstance;
+    UINT InstanceCount;
+    UINT StartIndexLocation;
+    INT BaseVertexLocation;
+    UINT StartInstanceLocation;
+};
+
+// ============================================================================
 // 新地形类 - 带Chunk和LOD的地形系统
 // ============================================================================
 class TerrainNew
@@ -223,18 +269,32 @@ public:
     // 从高度图创建地形
     bool CreateFromHeightmap(ID3D11Device* device, const std::wstring& heightmapPath,
                              const TerrainNewParams& params);
+    
+    // 从高度图和法线图创建地形
+    bool CreateFromHeightmapAndNormalmap(ID3D11Device* device, 
+                                         const std::wstring& heightmapPath,
+                                         const std::wstring& normalmapPath,
+                                         const TerrainNewParams& params);
 
     // 程序化生成地形（随机算法）
     bool CreateProcedural(ID3D11Device* device, const TerrainNewParams& params);
 
     // 渲染地形（需要相机位置）
     void Render(ID3D11DeviceContext* context, const DirectX::XMFLOAT3& cameraPosition);
+    
+    // GPU Driven渲染函数（需要view和proj矩阵）
+    void RenderGPUDriven(ID3D11DeviceContext* context, const DirectX::XMFLOAT3& cameraPosition,
+                         const DirectX::XMFLOAT4X4& viewMatrix, const DirectX::XMFLOAT4X4& projMatrix);
 
     // 查询指定世界坐标的高度
     float GetHeightAt(float worldX, float worldZ) const;
 
     // 访问器
     const TerrainNewParams& GetParams() const { return m_params; }
+    
+    // 启用/禁用GPU Driven模式
+    void SetUseGPUDriven(bool enable) { m_useGPUDriven = enable; }
+    bool IsUsingGPUDriven() const { return m_useGPUDriven; }
     
     // 获取统计信息
     struct RenderStats
@@ -248,6 +308,9 @@ public:
 private:
     // 加载高度图
     bool LoadHeightmap(const std::wstring& path);
+    
+    // 加载法线图
+    bool LoadNormalmap(const std::wstring& path);
 
     // 生成程序化高度数据（随机算法）
     void GenerateProceduralHeight();
@@ -260,6 +323,9 @@ private:
     
     // 创建高度图GPU纹理（用于shader中采样）
     bool CreateHeightmapTexture(ID3D11Device* device);
+    
+    // 创建法线图GPU纹理（用于shader中采样）
+    bool CreateNormalmapTexture(ID3D11Device* device);
     
     // 生成所有chunk的顶点数据
     bool GenerateChunkVertices(ID3D11Device* device);
@@ -345,4 +411,55 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_heightmapTexture;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_heightmapSRV;
     Microsoft::WRL::ComPtr<ID3D11SamplerState> m_heightmapSampler;
+    
+    // 法线图纹理资源（用于shader中采样法线，如果提供）
+    std::vector<unsigned char> m_normalmapData;  // 法线图数据（RGB，每个通道0-255）
+    int m_normalmapWidth;
+    int m_normalmapHeight;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_normalmapTexture;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_normalmapSRV;
+    Microsoft::WRL::ComPtr<ID3D11SamplerState> m_normalmapSampler;
+    bool m_hasNormalmap;  // 是否已加载法线图
+    
+    // GPU Driven相关资源
+    bool m_useGPUDriven;  // 是否使用GPU Driven模式
+    
+    // GPU端Structured Buffer
+    Microsoft::WRL::ComPtr<ID3D11Buffer> m_chunkDataBuffer;          // Chunk数据（SRV）
+    Microsoft::WRL::ComPtr<ID3D11Buffer> m_lodIndexCountsBuffer;     // 每个LOD的索引数量（SRV）
+    Microsoft::WRL::ComPtr<ID3D11Buffer> m_visibleChunkBuffer;       // 可见chunk索引列表（UAV）
+    Microsoft::WRL::ComPtr<ID3D11Buffer> m_drawCommandsBuffer;       // 间接绘制参数（UAV）
+    Microsoft::WRL::ComPtr<ID3D11Buffer> m_chunkInstanceBuffer;      // Chunk实例数据（UAV）
+    Microsoft::WRL::ComPtr<ID3D11Buffer> m_visibleCountBuffer;       // 可见chunk计数（UAV）
+    
+    // UAV视图
+    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> m_visibleChunkUAV;
+    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> m_drawCommandsUAV;
+    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> m_chunkInstanceUAV;
+    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> m_visibleCountUAV;
+    
+    // SRV视图
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_chunkDataSRV;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_lodIndexCountsSRV;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_chunkInstanceSRV;  // 用于VS读取
+    
+    // Compute Shader
+    Microsoft::WRL::ComPtr<ID3D11ComputeShader> m_cullComputeShader;
+    
+    // 统一缓冲区（方案A：合并所有chunk的顶点和索引）
+    Microsoft::WRL::ComPtr<ID3D11Buffer> m_unifiedVertexBuffer;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> m_unifiedIndexBuffer;
+    
+    // GPU Cull参数常量缓冲区
+    Microsoft::WRL::ComPtr<ID3D11Buffer> m_cullParamsBuffer;
+    
+    // GPU资源创建函数
+    bool CreateGPUBuffers(ID3D11Device* device);
+    bool CreateComputeShader(ID3D11Device* device);
+    void UploadDataToGPU(ID3D11DeviceContext* context);
+    void UpdateCullParams(ID3D11DeviceContext* context, const DirectX::XMFLOAT3& cameraPosition,
+                          const DirectX::XMFLOAT4X4& viewMatrix, const DirectX::XMFLOAT4X4& projMatrix);
+    
+    // 创建统一顶点/索引缓冲区
+    bool CreateUnifiedBuffers(ID3D11Device* device);
 };

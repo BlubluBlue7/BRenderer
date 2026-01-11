@@ -1,3 +1,9 @@
+// 在包含 Windows.h 之前定义 NOMINMAX，避免 min/max 宏冲突
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#define WIN32_LEAN_AND_MEAN
+
 #include "Renderer.h"
 #include "MeshMgr.h"
 #include "Camera.h"
@@ -5,10 +11,7 @@
 #include "MeshGPU.h"
 #include "Terrain.h"
 #include "Terrain_new.h"
-
-// 在包含 Windows.h 之前定义 NOMINMAX，避免 min/max 宏冲突
-#define NOMINMAX
-#define WIN32_LEAN_AND_MEAN
+#include "GrassSystem.h"
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
@@ -247,6 +250,41 @@ bool Renderer::Initialize(HWND hwnd, int width, int height)
     if (!InitializeTerrain())
     {
         OutputDebugStringW(L"Warning: Failed to initialize terrain.\n");
+    }
+    
+    // ========================================================================
+    // 步骤 13.5: 初始化草地系统（必须在地形初始化之后）
+    // ========================================================================
+    if (m_terrain)
+    {
+        OutputDebugStringW(L"[Renderer] Initializing grass system...\n");
+        m_grassSystem = new GrassSystem();
+        GrassParams grassParams;
+        grassParams.worldSizeX = 1024.0f;
+        grassParams.worldSizeZ = 1024.0f;
+        grassParams.density = 20.0f;  // 增加密度到每平方米20根草
+        grassParams.grassHeight = 0.8f;  // 增加草高度
+        grassParams.grassWidth = 0.03f;  // 增加草宽度
+        grassParams.minHeight = -1000.0f;  // 允许所有高度
+        grassParams.maxHeight = 10000.0f;
+        grassParams.windStrength = 0.5f;
+        grassParams.windSpeed = 1.0f;
+        grassParams.windDirection = {1.0f, 0.0f, 1.0f};
+        
+        if (!m_grassSystem->Initialize(m_device.Get(), grassParams, m_terrain))
+        {
+            OutputDebugStringW(L"[Renderer] Warning: Failed to initialize grass system.\n");
+            delete m_grassSystem;
+            m_grassSystem = nullptr;
+        }
+        else
+        {
+            OutputDebugStringW(L"[Renderer] Grass system initialized successfully.\n");
+        }
+    }
+    else
+    {
+        OutputDebugStringW(L"[Renderer] Warning: Cannot initialize grass system - terrain is null.\n");
     }
     
     // ========================================================================
@@ -578,6 +616,56 @@ void Renderer::RenderFrame(float deltaTime)
     RenderTerrain();
     
     // ========================================================================
+    // 步骤 6.6: 渲染草地（在地形之后渲染，支持Alpha混合）
+    // ========================================================================
+    if (m_grassSystem)
+    {
+        // 获取相机矩阵（用于草地渲染）
+        XMMATRIX viewMatrix;
+        XMMATRIX projMatrix;
+        XMFLOAT3 camPos(0, 100, 0);
+        
+        if (m_camera)
+        {
+            viewMatrix = m_camera->GetViewMatrix();
+            float aspect = (float)m_width / (float)m_height;
+            projMatrix = m_camera->GetProjectionMatrix(aspect);
+            camPos = m_camera->GetPosition();
+        }
+        else
+        {
+            XMVECTOR eye = XMVectorSet(0.0f, 100.0f, 100.0f, 0.0f);
+            XMVECTOR at = XMVectorSet(0.0f, 0.0f, 0.0f, 0.0f);
+            XMVECTOR up = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+            viewMatrix = XMMatrixLookAtLH(eye, at, up);
+            float aspect = (float)m_width / (float)m_height;
+            projMatrix = XMMatrixPerspectiveFovLH(XM_PI / 4.0f, aspect, 0.1f, 1000.0f);
+        }
+        
+        XMFLOAT4X4 viewMatrixFloat, projMatrixFloat;
+        XMStoreFloat4x4(&viewMatrixFloat, XMMatrixTranspose(viewMatrix));
+        XMStoreFloat4x4(&projMatrixFloat, XMMatrixTranspose(projMatrix));
+        
+        // 计算光照参数（与UpdateConstantBuffers中的计算一致）
+        float rotationSpeed = 2.0f * XM_PI / 15.0f;
+        float angle = m_lightRotationTime * rotationSpeed;
+        float lightRadius = 1.0f;
+        float lightHeight = -0.5f;
+        float lightX = cosf(angle) * lightRadius;
+        float lightZ = sinf(angle) * lightRadius;
+        float lightY = lightHeight;
+        XMVECTOR lightPos = XMVectorSet(lightX, lightY, lightZ, 0.0f);
+        XMVECTOR lightDir = XMVector3Normalize(lightPos);
+        XMFLOAT4 lightDirection;
+        XMStoreFloat4(&lightDirection, XMVectorSetW(lightDir, 0.0f));
+        XMFLOAT4 lightColor(1.0f, 1.0f, 1.0f, 0.0f);
+        XMFLOAT4 ambientColor(0.1f, 0.1f, 0.15f, 0.0f);
+        
+        m_grassSystem->Update(deltaTime);
+        m_grassSystem->Render(m_context.Get(), viewMatrixFloat, projMatrixFloat, camPos, lightDirection, lightColor, ambientColor);
+    }
+    
+    // ========================================================================
     // 步骤 7: 设置模型的 Shader 和输入布局
     // 地形渲染后，需要设置模型的shader
     // ========================================================================
@@ -770,6 +858,14 @@ void Renderer::RenderFrame(float deltaTime)
 // ============================================================================
 void Renderer::Cleanup()
 {
+    // 释放草地系统
+    if (m_grassSystem)
+    {
+        m_grassSystem->Cleanup();
+        delete m_grassSystem;
+        m_grassSystem = nullptr;
+    }
+    
     // 释放地形
     if (m_terrain)
     {
@@ -2903,6 +2999,37 @@ bool Renderer::InitializeTerrain()
                 exeDir + L"Res/heightmap.jpg"
             };
             
+            // 尝试加载法线图文件
+            std::vector<std::wstring> normalmapPaths = {
+                projectRoot + L"Res/normalmap.png",
+                projectRoot + L"Res/normalmap.jpg",
+                projectRoot + L"Res/normalmap.bmp",
+                exeDir + L"Res/normalmap.png",
+                exeDir + L"Res/normalmap.jpg"
+            };
+            
+            std::wstring foundNormalmapPath;
+            for (const auto& path : normalmapPaths)
+            {
+                // 检查文件是否存在（简单检查）
+                HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (hFile != INVALID_HANDLE_VALUE)
+                {
+                    CloseHandle(hFile);
+                    foundNormalmapPath = path;
+                    OutputDebugStringW(L"[TerrainNew] Found normalmap: ");
+                    OutputDebugStringW(path.c_str());
+                    OutputDebugStringW(L"\n");
+                    break;
+                }
+            }
+            
+            // 设置法线图路径
+            if (!foundNormalmapPath.empty())
+            {
+                params.normalmapPath = foundNormalmapPath;
+            }
+            
             for (const auto& path : heightmapPaths)
             {
                 if (m_terrain->CreateFromHeightmap(m_device.Get(), path, params))
@@ -2926,6 +3053,36 @@ bool Renderer::InitializeTerrain()
         swprintf_s(msg, L"[TerrainNew] Terrain initialized: %dx%d grid, worldSize=%.0fx%.0f, heightScale=%.0f\n", 
                    params.gridWidth, params.gridHeight, params.worldSizeX, params.worldSizeZ, params.heightScale);
         OutputDebugStringW(msg);
+        
+                    // 初始化草地系统（在地形创建之后）
+                    if (!m_grassSystem)
+                    {
+                        m_grassSystem = new GrassSystem();
+                        GrassParams grassParams;
+                        grassParams.worldSizeX = params.worldSizeX;
+                        grassParams.worldSizeZ = params.worldSizeZ;
+                        grassParams.density = 20.0f;  // 增加密度到每平方米20根草
+                        grassParams.grassHeight = 0.8f;  // 增加草高度
+                        grassParams.grassWidth = 0.03f;  // 增加草宽度
+                        grassParams.windStrength = 0.5f;
+                        grassParams.windSpeed = 1.0f;
+                        grassParams.windDirection = {1.0f, 0.0f, 1.0f};
+                        grassParams.minHeight = -1000.0f;  // 允许所有高度
+                        grassParams.maxHeight = 10000.0f;
+            
+            if (!m_grassSystem->Initialize(m_device.Get(), grassParams, m_terrain))
+            {
+                OutputDebugStringW(L"Warning: Failed to initialize grass system.\n");
+                delete m_grassSystem;
+                m_grassSystem = nullptr;
+            }
+            else
+            {
+                wchar_t grassMsg[256];
+                swprintf_s(grassMsg, L"[Renderer] Grass system initialized with %u instances.\n", m_grassSystem->GetInstanceCount());
+                OutputDebugStringW(grassMsg);
+            }
+        }
         
         return true;
     }
@@ -3050,8 +3207,14 @@ void Renderer::RenderTerrain()
         firstRender = false;
     }
     
-    // 渲染地形（TerrainNew需要相机位置）- 正常填充模式
-    m_terrain->Render(m_context.Get(), camPos);
+    // 渲染地形（尝试使用GPU Driven，如果不支持则回退到CPU Driven）
+    // 注意：需要将view和proj矩阵转换为XMFLOAT4X4格式
+    XMFLOAT4X4 viewMatrixFloat, projMatrixFloat;
+    XMStoreFloat4x4(&viewMatrixFloat, XMMatrixTranspose(viewMatrix));
+    XMStoreFloat4x4(&projMatrixFloat, XMMatrixTranspose(projMatrix));
+    
+    // 尝试使用GPU Driven渲染（内部会检查是否支持，如果不支持会回退到CPU Driven）
+    m_terrain->RenderGPUDriven(m_context.Get(), camPos, viewMatrixFloat, projMatrixFloat);
     
     // ========================================================================
     // 如果启用线框模式，叠加渲染黑色线框

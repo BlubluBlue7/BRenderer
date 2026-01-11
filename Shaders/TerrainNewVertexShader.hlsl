@@ -179,14 +179,20 @@ float2 ComputeMorphedGlobalGridPosition(float2 globalGridPos, float lodLevel, fl
 // ============================================================================
 // Vertex Shader
 // ============================================================================
-PSInput VS(VSInput input)
+PSInput VS(VSInput input, uint instanceId : SV_InstanceID)
 {
     PSInput output;
     
-    // 获取参数
+    // GPU Driven: 从Structured Buffer读取chunk实例数据（如果启用）
+    // 注意：当前实现中，GPU Driven使用instanceId索引到chunkInstances
+    // 但为了向后兼容，如果没有绑定chunkInstances，使用常量缓冲区
     float lodLevel = chunkParams.y;
     float morphStart = chunkParams.z;
     float morphEnd = chunkParams.w;
+    
+    // TODO: 完整的GPU Driven支持
+    // 如果使用GPU Driven，应该从chunkInstances[instanceId]读取参数
+    // 但当前的实现仍然使用常量缓冲区，因为GPU Driven尚未完全实现
     
     // 获取相机位置
     float3 cameraPos = float3(cameraParams.x, cameraParams.y, cameraParams.z);
