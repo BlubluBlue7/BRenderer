@@ -203,6 +203,14 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
                 renderer.ToggleTerrainLODLock();
             }
             break;
+        case 'N':
+        case 'n':
+            // N键：切换地形LOD调试可视化模式
+            if (pressed)
+            {
+                renderer.ToggleTerrainLODDebug();
+            }
+            break;
         case '1':
             if (pressed)
             {

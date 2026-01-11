@@ -41,6 +41,10 @@ cbuffer TerrainBuffer : register(b2)
 Texture2D<float> heightmapTexture : register(t0);
 SamplerState heightmapSampler : register(s0);
 
+// 法线图纹理和采样器（可选）
+Texture2D normalmapTexture : register(t1);
+SamplerState normalmapSampler : register(s1);
+
 // ============================================================================
 // 输入/输出结构
 // ============================================================================
@@ -205,7 +209,32 @@ PSInput VS(VSInput input)
     // ========================================================================
     // Step 6: 计算世界空间法线
     // ========================================================================
-    float3 normal = ComputeNormalWorld(worldXZ);
+    float3 normal;
+    
+    // 如果提供了法线图，从法线图采样；否则从高度图计算
+    // 注意：法线图通常存储为切线空间法线，需要转换到世界空间
+    // 这里简化处理：假设法线图已经是世界空间法线（或近似）
+    float2 normalUV;
+    normalUV.x = (worldXZ.x - terrainOffset.x) / terrainScale.x;
+    normalUV.y = (worldXZ.y - terrainOffset.y) / terrainScale.y;
+    normalUV = saturate(normalUV);
+    
+    // 尝试从法线图采样（如果存在）
+    float4 normalmapSample = normalmapTexture.SampleLevel(normalmapSampler, normalUV, 0);
+    
+    // 如果法线图存在且有效（alpha通道不为0），使用法线图
+    // 否则从高度图计算法线
+    if (normalmapSample.a > 0.001)
+    {
+        // 法线图通常存储为 (0.5, 0.5, 1.0) 对应 (0, 0, 1) 法线
+        // 需要转换：normal = (sample * 2.0 - 1.0)
+        normal = normalize(normalmapSample.rgb * 2.0 - 1.0);
+    }
+    else
+    {
+        // 从高度图计算法线
+        normal = ComputeNormalWorld(worldXZ);
+    }
     
     // ========================================================================
     // Step 7: 变换到裁剪空间

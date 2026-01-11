@@ -296,6 +296,11 @@ public:
     void SetUseGPUDriven(bool enable) { m_useGPUDriven = enable; }
     bool IsUsingGPUDriven() const { return m_useGPUDriven; }
     
+    // 切换LOD调试可视化模式
+    void ToggleLODDebug() { m_showLODDebug = !m_showLODDebug; }
+    void SetLODDebug(bool show) { m_showLODDebug = show; }
+    bool IsLODDebugEnabled() const { return m_showLODDebug; }
+    
     // 获取统计信息
     struct RenderStats
     {
@@ -407,6 +412,9 @@ private:
     // Chunk常量缓冲区（用于传递morphing参数）
     Microsoft::WRL::ComPtr<ID3D11Buffer> m_chunkConstantBuffer;
     
+    // 地形调试常量缓冲区（用于传递LOD调试标志）
+    Microsoft::WRL::ComPtr<ID3D11Buffer> m_terrainDebugBuffer;
+    
     // 高度图纹理资源（用于shader中动态采样高度）
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_heightmapTexture;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_heightmapSRV;
@@ -423,6 +431,9 @@ private:
     
     // GPU Driven相关资源
     bool m_useGPUDriven;  // 是否使用GPU Driven模式
+    
+    // LOD调试可视化
+    bool m_showLODDebug;  // 是否显示LOD调试颜色
     
     // GPU端Structured Buffer
     Microsoft::WRL::ComPtr<ID3D11Buffer> m_chunkDataBuffer;          // Chunk数据（SRV）

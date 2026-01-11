@@ -27,6 +27,8 @@
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "dxguid.lib")
 #pragma comment(lib, "windowscodecs.lib")  // WIC库
+#pragma comment(lib, "dwrite.lib")  // DirectWrite库
+#pragma comment(lib, "d2d1.lib")  // Direct2D库
 
 using namespace DirectX;
 
@@ -532,6 +534,14 @@ bool Renderer::Initialize(HWND hwnd, int width, int height)
         }
         LoadTextures(materialNames, loadedProjectRoot);
     }
+    
+    // ========================================================================
+    // 步骤 16: 初始化文字渲染系统
+    // ========================================================================
+    if (!InitializeTextRendering())
+    {
+        OutputDebugStringW(L"Warning: Failed to initialize text rendering system.\n");
+    }
 
     return true;
 }
@@ -844,7 +854,85 @@ void Renderer::RenderFrame(float deltaTime)
     }
 
     // ========================================================================
-    // 步骤 7: 呈现到屏幕
+    // 步骤 7: 更新FPS和面数统计
+    // ========================================================================
+    UpdateFPS(deltaTime);
+    UpdateTriangleCount();
+    
+    // ========================================================================
+    // 步骤 8: 渲染FPS和面数统计文字
+    // ========================================================================
+    // 注意：Direct2D和Direct3D11共享渲染目标需要在D3D渲染完成后进行
+    // 从当前back buffer获取表面并渲染文字
+    if (m_d2dFactory && m_swapChain && m_dwriteFactory && m_textFormat)
+    {
+        Microsoft::WRL::ComPtr<IDXGISurface> backBuffer;
+        HRESULT hr = m_swapChain->GetBuffer(0, __uuidof(IDXGISurface), reinterpret_cast<void**>(backBuffer.GetAddressOf()));
+        if (SUCCEEDED(hr) && backBuffer)
+        {
+            // 每次都重新创建D2D渲染目标（因为back buffer会变化）
+            m_d2dRenderTarget.Reset();
+            m_textBrush.Reset();
+            
+            D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
+                D2D1_RENDER_TARGET_TYPE_DEFAULT,
+                D2D1::PixelFormat(DXGI_FORMAT_UNKNOWN, D2D1_ALPHA_MODE_PREMULTIPLIED),
+                96.0f, 96.0f  // DPI
+            );
+            
+            hr = m_d2dFactory->CreateDxgiSurfaceRenderTarget(backBuffer.Get(), &props, m_d2dRenderTarget.GetAddressOf());
+            if (SUCCEEDED(hr) && m_d2dRenderTarget)
+            {
+                // 创建文字画刷
+                hr = m_d2dRenderTarget->CreateSolidColorBrush(
+                    D2D1::ColorF(D2D1::ColorF::White),
+                    m_textBrush.GetAddressOf()
+                );
+                
+                if (SUCCEEDED(hr) && m_textBrush)
+                {
+                    // 开始D2D绘制
+                    m_d2dRenderTarget->BeginDraw();
+                    
+                    // 创建文本布局并渲染
+                    wchar_t statsText[256];
+                    swprintf_s(statsText, L"FPS: %.1f\nTriangles: %u\n  Terrain: %u\n  Mesh: %u", 
+                              m_fps, m_totalTriangles, m_terrainTriangles, m_meshTriangles);
+                    
+                    Microsoft::WRL::ComPtr<IDWriteTextLayout> textLayout;
+                    hr = m_dwriteFactory->CreateTextLayout(
+                        statsText,
+                        (UINT32)wcslen(statsText),
+                        m_textFormat.Get(),
+                        (float)m_width,
+                        (float)m_height,
+                        textLayout.GetAddressOf()
+                    );
+                    
+                    if (SUCCEEDED(hr) && textLayout)
+                    {
+                        m_d2dRenderTarget->DrawTextLayout(
+                            D2D1::Point2F(10.0f, 10.0f),
+                            textLayout.Get(),
+                            m_textBrush.Get()
+                        );
+                    }
+                    
+                    // 结束D2D绘制
+                    hr = m_d2dRenderTarget->EndDraw();
+                    if (FAILED(hr))
+                    {
+                        // 如果EndDraw失败，可能渲染目标已失效，下次重新创建
+                        m_d2dRenderTarget.Reset();
+                        m_textBrush.Reset();
+                    }
+                }
+            }
+        }
+    }
+    
+    // ========================================================================
+    // 步骤 9: 呈现到屏幕
     // 将后缓冲区的内容交换到前缓冲区，显示在屏幕上
     // ========================================================================
     // 参数说明：
@@ -3261,6 +3349,21 @@ void Renderer::SetTerrainLODLockLevel(int level)
 }
 
 // ============================================================================
+// 切换地形LOD调试可视化模式
+// ============================================================================
+void Renderer::ToggleTerrainLODDebug()
+{
+    if (m_terrain)
+    {
+        m_terrain->ToggleLODDebug();
+        bool enabled = m_terrain->IsLODDebugEnabled();
+        wchar_t msg[256];
+        swprintf_s(msg, L"[TerrainNew] LOD Debug Visualization: %s\n", enabled ? L"Enabled" : L"Disabled");
+        OutputDebugStringW(msg);
+    }
+}
+
+// ============================================================================
 // 创建Shadow Map资源
 // ============================================================================
 bool Renderer::CreateShadowMap()
@@ -3586,4 +3689,168 @@ void Renderer::RenderShadowMap()
     
     // 恢复光栅化状态
     m_context->RSSetState(oldRasterizerState.Get());
+}
+
+// ============================================================================
+// 初始化文字渲染系统
+// ============================================================================
+bool Renderer::InitializeTextRendering()
+{
+    HRESULT hr;
+    
+    // 创建DirectWrite工厂
+    hr = DWriteCreateFactory(
+        DWRITE_FACTORY_TYPE_SHARED,
+        __uuidof(IDWriteFactory),
+        reinterpret_cast<IUnknown**>(m_dwriteFactory.GetAddressOf())
+    );
+    if (FAILED(hr))
+    {
+        OutputDebugStringW(L"Failed to create DirectWrite factory.\n");
+        return false;
+    }
+    
+    // 创建文本格式
+    hr = m_dwriteFactory->CreateTextFormat(
+        L"Consolas",  // 字体族名
+        nullptr,      // 字体集合（nullptr表示系统字体集合）
+        DWRITE_FONT_WEIGHT_NORMAL,
+        DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL,
+        16.0f,        // 字体大小
+        L"zh-cn",     // 区域设置
+        m_textFormat.GetAddressOf()
+    );
+    if (FAILED(hr))
+    {
+        OutputDebugStringW(L"Failed to create text format.\n");
+        return false;
+    }
+    
+    // 设置文本对齐方式
+    m_textFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+    m_textFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+    
+    // 创建Direct2D工厂（D2D渲染目标在RenderFrame中动态创建）
+    D2D1_FACTORY_OPTIONS options = {};
+    hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory), &options,
+                          reinterpret_cast<void**>(m_d2dFactory.GetAddressOf()));
+    if (FAILED(hr))
+    {
+        OutputDebugStringW(L"Failed to create Direct2D factory.\n");
+        return false;
+    }
+    
+    // D2D渲染目标和画刷在RenderFrame中动态创建，这里只初始化工厂
+    OutputDebugStringW(L"Text rendering system initialized successfully.\n");
+    
+    return true;
+}
+
+// ============================================================================
+// 渲染文字
+// ============================================================================
+void Renderer::RenderText(const wchar_t* text, float x, float y)
+{
+    if (!m_d2dRenderTarget || !m_textFormat || !m_textBrush)
+        return;
+    
+    // 开始D2D绘制
+    m_d2dRenderTarget->BeginDraw();
+    
+    // 创建文本布局
+    Microsoft::WRL::ComPtr<IDWriteTextLayout> textLayout;
+    HRESULT hr = m_dwriteFactory->CreateTextLayout(
+        text,
+        (UINT32)wcslen(text),
+        m_textFormat.Get(),
+        (float)m_width,
+        (float)m_height,
+        textLayout.GetAddressOf()
+    );
+    
+    if (SUCCEEDED(hr) && textLayout)
+    {
+        // 绘制文字
+        m_d2dRenderTarget->DrawTextLayout(
+            D2D1::Point2F(x, y),
+            textLayout.Get(),
+            m_textBrush.Get()
+        );
+    }
+    
+    // 结束D2D绘制
+    m_d2dRenderTarget->EndDraw();
+}
+
+// ============================================================================
+// 更新FPS
+// ============================================================================
+void Renderer::UpdateFPS(float deltaTime)
+{
+    m_frameCount++;
+    m_fpsUpdateTime += deltaTime;
+    
+    // 每秒更新一次FPS
+    if (m_fpsUpdateTime >= 1.0f)
+    {
+        m_fps = m_frameCount / m_fpsUpdateTime;
+        m_frameCount = 0;
+        m_fpsUpdateTime = 0.0f;
+    }
+}
+
+// ============================================================================
+// 更新面数统计
+// ============================================================================
+void Renderer::UpdateTriangleCount()
+{
+    m_totalTriangles = 0;
+    m_terrainTriangles = 0;
+    m_meshTriangles = 0;
+    
+    // 统计地形面数
+    if (m_terrain)
+    {
+        const auto& stats = m_terrain->GetStats();
+        // 根据LOD分布估算面数
+        // 每个chunk在不同LOD级别的面数：
+        // LOD 0: chunkSize * chunkSize * 2 (最高细节)
+        // LOD 1: (chunkSize/2) * (chunkSize/2) * 2
+        // LOD 2: (chunkSize/4) * (chunkSize/4) * 2
+        // LOD 3: (chunkSize/8) * (chunkSize/8) * 2
+        const TerrainNewParams& params = m_terrain->GetParams();
+        int chunkSize = params.chunkSize;
+        
+        for (int lod = 0; lod < 8; ++lod)
+        {
+            int chunkCount = stats.lodDistribution[lod];
+            if (chunkCount > 0)
+            {
+                int gridSize = chunkSize >> lod;  // chunkSize / (2^lod)
+                int trianglesPerChunk = gridSize * gridSize * 2;  // 每个chunk有gridSize*gridSize个四边形，每个四边形2个三角形
+                m_terrainTriangles += chunkCount * trianglesPerChunk;
+            }
+        }
+    }
+    
+    // 统计网格面数
+    if (m_meshMgr)
+    {
+        auto modelGPU = m_meshMgr->GetMeshGPU("Model");
+        if (!modelGPU)
+            modelGPU = m_meshMgr->GetMeshGPU("Triangle");
+        
+        if (modelGPU)
+        {
+            // 统计所有子网格的面数
+            for (uint32_t i = 0; i < modelGPU->GetSubmeshCount(); ++i)
+            {
+                const Submesh& submesh = modelGPU->GetSubmesh(i);
+                m_meshTriangles += submesh.indexCount / 3;  // 每个三角形3个索引
+            }
+        }
+    }
+    
+    m_totalTriangles = m_terrainTriangles + m_meshTriangles;
 }

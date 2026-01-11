@@ -29,6 +29,7 @@ TerrainNew::TerrainNew()
     , m_chunkCountX(0)
     , m_chunkCountZ(0)
     , m_useGPUDriven(false)  // 默认使用CPU Driven，GPU Driven需要手动启用
+    , m_showLODDebug(false)  // 默认不显示LOD调试（正常渲染模式）
 {
 }
 
@@ -576,6 +577,20 @@ bool TerrainNew::GenerateSharedLODIndices(ID3D11Device* device)
         return false;
     }
     
+    // 创建地形调试常量缓冲区（1个float4 = 4个float，对齐到16字节）
+    D3D11_BUFFER_DESC debugCbDesc = {};
+    debugCbDesc.Usage = D3D11_USAGE_DYNAMIC;
+    debugCbDesc.ByteWidth = sizeof(float) * 4;  // showLODDebug + padding
+    debugCbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    debugCbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    
+    hr = device->CreateBuffer(&debugCbDesc, nullptr, m_terrainDebugBuffer.GetAddressOf());
+    if (FAILED(hr))
+    {
+        OutputDebugStringW(L"[TerrainNew] Failed to create terrain debug constant buffer\n");
+        return false;
+    }
+    
     // 创建高度图纹理（用于shader中动态采样）
     if (!CreateHeightmapTexture(device))
     {
@@ -954,10 +969,19 @@ void TerrainNew::GenerateChunkLODVertices(int chunkX, int chunkZ, int lodLevel,
             v.normal[2] = normal.z;
 
             // 颜色
-            float colorFactor = height;
-            v.color[0] = 0.5f + colorFactor * 0.5f;
-            v.color[1] = 0.5f + colorFactor * 0.5f;
-            v.color[2] = 0.5f + colorFactor * 0.5f;
+            // 根据LOD级别设置颜色（用于LOD可视化）
+            // LOD 0 = 绿色, LOD 1 = 蓝色, LOD 2 = 黄色, LOD 3 = 红色
+            static const float lodColors[4][3] = {
+                {0.0f, 1.0f, 0.0f},  // LOD 0: 绿色
+                {0.0f, 0.0f, 1.0f},  // LOD 1: 蓝色
+                {1.0f, 1.0f, 0.0f},  // LOD 2: 黄色
+                {1.0f, 0.0f, 0.0f}   // LOD 3: 红色
+            };
+            
+            int colorLOD = std::min(lodLevel, 3);
+            v.color[0] = lodColors[colorLOD][0];
+            v.color[1] = lodColors[colorLOD][1];
+            v.color[2] = lodColors[colorLOD][2];
 
             // 纹理坐标：存储全局网格坐标
             v.texCoord[0] = static_cast<float>(gridX);
@@ -1503,6 +1527,19 @@ void TerrainNew::Render(ID3D11DeviceContext* context, const DirectX::XMFLOAT3& c
         ID3D11SamplerState* sampler = m_heightmapSampler.Get();
         context->VSSetSamplers(0, 1, &sampler);
     }
+    
+    // 绑定法线图（如果存在）
+    if (m_hasNormalmap && m_normalmapSRV)
+    {
+        ID3D11ShaderResourceView* normalmapSRV = m_normalmapSRV.Get();
+        context->VSSetShaderResources(1, 1, &normalmapSRV);
+        
+        if (m_normalmapSampler)
+        {
+            ID3D11SamplerState* normalmapSampler = m_normalmapSampler.Get();
+            context->VSSetSamplers(1, 1, &normalmapSampler);
+        }
+    }
 
     // 渲染每个选中的chunk
     for (TerrainChunk* chunk : m_selectedChunks)
@@ -1580,6 +1617,20 @@ void TerrainNew::Render(ID3D11DeviceContext* context, const DirectX::XMFLOAT3& c
         // 绑定chunk常量缓冲区到顶点着色器 slot 2
         ID3D11Buffer* cb_ptr = m_chunkConstantBuffer.Get();
         context->VSSetConstantBuffers(2, 1, &cb_ptr);
+        
+        // 更新并绑定地形调试常量缓冲区到像素着色器 slot 3
+        D3D11_MAPPED_SUBRESOURCE debugMapped;
+        if (SUCCEEDED(context->Map(m_terrainDebugBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &debugMapped)))
+        {
+            float* debugData = static_cast<float*>(debugMapped.pData);
+            debugData[0] = m_showLODDebug ? 1.0f : 0.0f;  // showLODDebug
+            debugData[1] = 0.0f;  // padding
+            debugData[2] = 0.0f;  // padding
+            debugData[3] = 0.0f;  // padding
+            context->Unmap(m_terrainDebugBuffer.Get(), 0);
+        }
+        ID3D11Buffer* debugCb_ptr = m_terrainDebugBuffer.Get();
+        context->PSSetConstantBuffers(3, 1, &debugCb_ptr);
 
         // 设置顶点缓冲区（每个chunk独立）
         UINT stride = sizeof(Vertex);
@@ -2324,6 +2375,20 @@ void TerrainNew::RenderGPUDriven(ID3D11DeviceContext* context, const DirectX::XM
                 context->VSSetSamplers(1, 1, &normalmapSampler);
             }
         }
+        
+        // 更新并绑定地形调试常量缓冲区到像素着色器 slot 3
+        D3D11_MAPPED_SUBRESOURCE debugMapped;
+        if (SUCCEEDED(context->Map(m_terrainDebugBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &debugMapped)))
+        {
+            float* debugData = static_cast<float*>(debugMapped.pData);
+            debugData[0] = m_showLODDebug ? 1.0f : 0.0f;  // showLODDebug
+            debugData[1] = 0.0f;  // padding
+            debugData[2] = 0.0f;  // padding
+            debugData[3] = 0.0f;  // padding
+            context->Unmap(m_terrainDebugBuffer.Get(), 0);
+        }
+        ID3D11Buffer* debugCb_ptr = m_terrainDebugBuffer.Get();
+        context->PSSetConstantBuffers(3, 1, &debugCb_ptr);
         
         // 执行间接绘制
         // 注意：DrawIndexedInstancedIndirect会自动从drawCommandsBuffer读取绘制参数

@@ -16,6 +16,10 @@
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 #include <DirectXMath.h>
+#include <dwrite.h>
+#include <d2d1.h>
+#include <d2d1_1.h>
+#include <wincodec.h>
 #include "MeshMgr.h"
 
 // 注意：XMMATRIX在DirectXMath.h中定义，但由于某些编译器问题，这里使用void*作为占位符
@@ -56,6 +60,9 @@ public:
     
     // 设置地形LOD锁定级别
     void SetTerrainLODLockLevel(int level);
+    
+    // 切换地形LOD调试可视化模式
+    void ToggleTerrainLODDebug();
 
     // 获取地形
     TerrainNew* GetTerrain() const { return m_terrain; }
@@ -147,6 +154,22 @@ private:
     bool m_lightRotationPaused = false;  // 光源旋转是否暂停
     bool m_terrainWireframe = false;  // 地形是否使用线框模式
     
+    // DirectWrite文字渲染相关
+    Microsoft::WRL::ComPtr<IDWriteFactory> m_dwriteFactory;
+    Microsoft::WRL::ComPtr<IDWriteTextFormat> m_textFormat;
+    Microsoft::WRL::ComPtr<ID2D1Factory> m_d2dFactory;
+    Microsoft::WRL::ComPtr<ID2D1RenderTarget> m_d2dRenderTarget;
+    Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> m_textBrush;
+    Microsoft::WRL::ComPtr<IDXGISurface> m_dxgiSurface;
+    
+    // FPS和统计相关
+    float m_fps = 0.0f;
+    float m_fpsUpdateTime = 0.0f;
+    int m_frameCount = 0;
+    UINT m_totalTriangles = 0;  // 当前帧渲染的总三角形数
+    UINT m_terrainTriangles = 0;  // 地形三角形数
+    UINT m_meshTriangles = 0;  // 网格三角形数
+    
     // 加载纹理
     bool LoadTexture(const std::wstring& filename);
     // 加载纹理文件（内部辅助函数，返回SRV）
@@ -182,6 +205,12 @@ private:
     bool CreateShadowMap();  // 创建shadow map资源
     bool CreateShadowShaders();  // 创建shadow pass shader
     void RenderShadowMap();  // 渲染shadow map（从光源视角）
+    
+    // 文字渲染相关函数
+    bool InitializeTextRendering();  // 初始化DirectWrite文字渲染
+    void RenderText(const wchar_t* text, float x, float y);  // 渲染文字
+    void UpdateFPS(float deltaTime);  // 更新FPS
+    void UpdateTriangleCount();  // 更新面数统计
 private:
     // 内部辅助函数（使用void*避免XMMATRIX类型在头文件中的问题）
     void GetLightViewMatrixImpl(void* outMatrix) const;  // 获取光源视图矩阵（outMatrix是XMMATRIX*）

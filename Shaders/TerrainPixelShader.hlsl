@@ -55,6 +55,15 @@ cbuffer LightBuffer : register(b1)
     float4x4 lightWorldViewProj; // 光源世界-视图-投影矩阵
 };
 
+// 地形调试参数常量缓冲区
+cbuffer TerrainDebugBuffer : register(b3)
+{
+    float showLODDebug;       // 是否显示LOD调试颜色 (1.0 = 显示, 0.0 = 不显示)
+    float paddingDebug1;
+    float paddingDebug2;
+    float paddingDebug3;
+};
+
 // ============================================================================
 // 像素着色器输入
 // ============================================================================
@@ -269,16 +278,21 @@ float4 PS(PSInput input) : SV_TARGET
     // ========================================================================
     // LOD调试可视化 - 使用顶点着色器传递的调试颜色
     // ========================================================================
-    // 直接使用顶点颜色（包含LOD级别信息）
-    // LOD 0 = 绿色, LOD 1 = 蓝色, LOD 2 = 黄色, LOD 3 = 红色
-    // Morphing时颜色会平滑过渡
-    finalColor = lerp(finalColor, input.color, 0.7);  // 70%调试色 + 30%原色
-    
-    // 在morphing时增加亮度提示
-    if (morphFactor > 0.01 && morphFactor < 0.99)
+    // 如果启用了LOD调试模式，显示LOD颜色；否则使用正常渲染
+    if (showLODDebug > 0.5)
     {
-        finalColor = lerp(finalColor, float3(1, 1, 1), morphFactor * 0.2);
+        // LOD调试模式：使用顶点颜色（包含LOD级别信息）
+        // LOD 0 = 绿色, LOD 1 = 蓝色, LOD 2 = 黄色, LOD 3 = 红色
+        // Morphing时颜色会平滑过渡
+        finalColor = lerp(finalColor, input.color, 0.7);  // 70%调试色 + 30%原色
+        
+        // 在morphing时增加亮度提示
+        if (morphFactor > 0.01 && morphFactor < 0.99)
+        {
+            finalColor = lerp(finalColor, float3(1, 1, 1), morphFactor * 0.2);
+        }
     }
+    // 否则使用正常渲染（不显示LOD颜色）
     
     // ========================================================================
     // 输出
