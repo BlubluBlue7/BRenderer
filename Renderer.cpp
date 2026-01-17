@@ -257,36 +257,9 @@ bool Renderer::Initialize(HWND hwnd, int width, int height)
     // ========================================================================
     // 步骤 13.5: 初始化草地系统（必须在地形初始化之后）
     // ========================================================================
-    if (m_terrain)
+    if (!InitializeGrassSystem())
     {
-        OutputDebugStringW(L"[Renderer] Initializing grass system...\n");
-        m_grassSystem = new GrassSystem();
-        GrassParams grassParams;
-        grassParams.worldSizeX = 1024.0f;
-        grassParams.worldSizeZ = 1024.0f;
-        grassParams.density = 20.0f;  // 增加密度到每平方米20根草
-        grassParams.grassHeight = 0.8f;  // 增加草高度
-        grassParams.grassWidth = 0.03f;  // 增加草宽度
-        grassParams.minHeight = -1000.0f;  // 允许所有高度
-        grassParams.maxHeight = 10000.0f;
-        grassParams.windStrength = 0.5f;
-        grassParams.windSpeed = 1.0f;
-        grassParams.windDirection = {1.0f, 0.0f, 1.0f};
-        
-        if (!m_grassSystem->Initialize(m_device.Get(), grassParams, m_terrain))
-        {
-            OutputDebugStringW(L"[Renderer] Warning: Failed to initialize grass system.\n");
-            delete m_grassSystem;
-            m_grassSystem = nullptr;
-        }
-        else
-        {
-            OutputDebugStringW(L"[Renderer] Grass system initialized successfully.\n");
-        }
-    }
-    else
-    {
-        OutputDebugStringW(L"[Renderer] Warning: Cannot initialize grass system - terrain is null.\n");
+        OutputDebugStringW(L"Warning: Failed to initialize grass system.\n");
     }
     
     // ========================================================================
@@ -626,54 +599,9 @@ void Renderer::RenderFrame(float deltaTime)
     RenderTerrain();
     
     // ========================================================================
-    // 步骤 6.6: 渲染草地（在地形之后渲染，支持Alpha混合）
+    // 步骤 6.6: 渲染草地系统（在地形之后渲染）
     // ========================================================================
-    if (m_grassSystem)
-    {
-        // 获取相机矩阵（用于草地渲染）
-        XMMATRIX viewMatrix;
-        XMMATRIX projMatrix;
-        XMFLOAT3 camPos(0, 100, 0);
-        
-        if (m_camera)
-        {
-            viewMatrix = m_camera->GetViewMatrix();
-            float aspect = (float)m_width / (float)m_height;
-            projMatrix = m_camera->GetProjectionMatrix(aspect);
-            camPos = m_camera->GetPosition();
-        }
-        else
-        {
-            XMVECTOR eye = XMVectorSet(0.0f, 100.0f, 100.0f, 0.0f);
-            XMVECTOR at = XMVectorSet(0.0f, 0.0f, 0.0f, 0.0f);
-            XMVECTOR up = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
-            viewMatrix = XMMatrixLookAtLH(eye, at, up);
-            float aspect = (float)m_width / (float)m_height;
-            projMatrix = XMMatrixPerspectiveFovLH(XM_PI / 4.0f, aspect, 0.1f, 1000.0f);
-        }
-        
-        XMFLOAT4X4 viewMatrixFloat, projMatrixFloat;
-        XMStoreFloat4x4(&viewMatrixFloat, XMMatrixTranspose(viewMatrix));
-        XMStoreFloat4x4(&projMatrixFloat, XMMatrixTranspose(projMatrix));
-        
-        // 计算光照参数（与UpdateConstantBuffers中的计算一致）
-        float rotationSpeed = 2.0f * XM_PI / 15.0f;
-        float angle = m_lightRotationTime * rotationSpeed;
-        float lightRadius = 1.0f;
-        float lightHeight = -0.5f;
-        float lightX = cosf(angle) * lightRadius;
-        float lightZ = sinf(angle) * lightRadius;
-        float lightY = lightHeight;
-        XMVECTOR lightPos = XMVectorSet(lightX, lightY, lightZ, 0.0f);
-        XMVECTOR lightDir = XMVector3Normalize(lightPos);
-        XMFLOAT4 lightDirection;
-        XMStoreFloat4(&lightDirection, XMVectorSetW(lightDir, 0.0f));
-        XMFLOAT4 lightColor(1.0f, 1.0f, 1.0f, 0.0f);
-        XMFLOAT4 ambientColor(0.1f, 0.1f, 0.15f, 0.0f);
-        
-        m_grassSystem->Update(deltaTime);
-        m_grassSystem->Render(m_context.Get(), viewMatrixFloat, projMatrixFloat, camPos, lightDirection, lightColor, ambientColor);
-    }
+    RenderGrassSystem(deltaTime);
     
     // ========================================================================
     // 步骤 7: 设置模型的 Shader 和输入布局
@@ -866,17 +794,39 @@ void Renderer::RenderFrame(float deltaTime)
     // 从当前back buffer获取表面并渲染文字
     if (m_d2dFactory && m_swapChain && m_dwriteFactory && m_textFormat)
     {
-        Microsoft::WRL::ComPtr<IDXGISurface> backBuffer;
-        HRESULT hr = m_swapChain->GetBuffer(0, __uuidof(IDXGISurface), reinterpret_cast<void**>(backBuffer.GetAddressOf()));
+        // 在获取back buffer之前，先解绑D3D11的渲染目标视图，避免冲突
+        m_context->OMSetRenderTargets(0, nullptr, nullptr);
+        
+        // 刷新设备上下文，确保所有D3D操作完成
+        // 这对于确保back buffer可以安全地用于D2D渲染很重要
+        m_context->Flush();
+        
+        // 使用IDXGISurface1接口（D2D需要这个接口）
+        // 直接从GetBuffer获取IDXGISurface1接口
+        Microsoft::WRL::ComPtr<IDXGISurface1> backBuffer;
+        HRESULT hr = m_swapChain->GetBuffer(0, __uuidof(IDXGISurface1), reinterpret_cast<void**>(backBuffer.GetAddressOf()));
+        if (FAILED(hr))
+        {
+            // 如果直接获取IDXGISurface1失败，尝试先获取IDXGISurface再查询
+            Microsoft::WRL::ComPtr<IDXGISurface> backBufferSurface;
+            hr = m_swapChain->GetBuffer(0, IID_PPV_ARGS(&backBufferSurface));
+            if (SUCCEEDED(hr) && backBufferSurface)
+            {
+                // 查询IDXGISurface1接口
+                hr = backBufferSurface.As(&backBuffer);
+            }
+        }
+        
         if (SUCCEEDED(hr) && backBuffer)
         {
             // 每次都重新创建D2D渲染目标（因为back buffer会变化）
             m_d2dRenderTarget.Reset();
             m_textBrush.Reset();
             
+            // 明确指定像素格式（与swap chain格式匹配）
             D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
                 D2D1_RENDER_TARGET_TYPE_DEFAULT,
-                D2D1::PixelFormat(DXGI_FORMAT_UNKNOWN, D2D1_ALPHA_MODE_PREMULTIPLIED),
+                D2D1::PixelFormat(DXGI_FORMAT_R8G8B8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
                 96.0f, 96.0f  // DPI
             );
             
@@ -917,15 +867,57 @@ void Renderer::RenderFrame(float deltaTime)
                             m_textBrush.Get()
                         );
                     }
+                    else
+                    {
+                        // 如果创建文本布局失败，尝试直接绘制文本
+                        static bool textLayoutErrorLogged = false;
+                        if (!textLayoutErrorLogged)
+                        {
+                            wchar_t errorMsg[256];
+                            swprintf_s(errorMsg, L"Failed to create text layout: 0x%08X\n", hr);
+                            OutputDebugStringW(errorMsg);
+                            textLayoutErrorLogged = true;
+                        }
+                    }
                     
                     // 结束D2D绘制
                     hr = m_d2dRenderTarget->EndDraw();
                     if (FAILED(hr))
                     {
                         // 如果EndDraw失败，可能渲染目标已失效，下次重新创建
+                        static bool endDrawErrorLogged = false;
+                        if (!endDrawErrorLogged)
+                        {
+                            wchar_t errorMsg[256];
+                            swprintf_s(errorMsg, L"D2D EndDraw failed: 0x%08X\n", hr);
+                            OutputDebugStringW(errorMsg);
+                            endDrawErrorLogged = true;
+                        }
                         m_d2dRenderTarget.Reset();
                         m_textBrush.Reset();
                     }
+                }
+                else
+                {
+                    static bool brushErrorLogged = false;
+                    if (!brushErrorLogged)
+                    {
+                        wchar_t errorMsg[256];
+                        swprintf_s(errorMsg, L"Failed to create text brush: 0x%08X\n", hr);
+                        OutputDebugStringW(errorMsg);
+                        brushErrorLogged = true;
+                    }
+                }
+            }
+            else
+            {
+                static bool renderTargetErrorLogged = false;
+                if (!renderTargetErrorLogged)
+                {
+                    wchar_t errorMsg[256];
+                    swprintf_s(errorMsg, L"Failed to create D2D render target: 0x%08X\n", hr);
+                    OutputDebugStringW(errorMsg);
+                    renderTargetErrorLogged = true;
                 }
             }
         }
@@ -3142,36 +3134,6 @@ bool Renderer::InitializeTerrain()
                    params.gridWidth, params.gridHeight, params.worldSizeX, params.worldSizeZ, params.heightScale);
         OutputDebugStringW(msg);
         
-                    // 初始化草地系统（在地形创建之后）
-                    if (!m_grassSystem)
-                    {
-                        m_grassSystem = new GrassSystem();
-                        GrassParams grassParams;
-                        grassParams.worldSizeX = params.worldSizeX;
-                        grassParams.worldSizeZ = params.worldSizeZ;
-                        grassParams.density = 20.0f;  // 增加密度到每平方米20根草
-                        grassParams.grassHeight = 0.8f;  // 增加草高度
-                        grassParams.grassWidth = 0.03f;  // 增加草宽度
-                        grassParams.windStrength = 0.5f;
-                        grassParams.windSpeed = 1.0f;
-                        grassParams.windDirection = {1.0f, 0.0f, 1.0f};
-                        grassParams.minHeight = -1000.0f;  // 允许所有高度
-                        grassParams.maxHeight = 10000.0f;
-            
-            if (!m_grassSystem->Initialize(m_device.Get(), grassParams, m_terrain))
-            {
-                OutputDebugStringW(L"Warning: Failed to initialize grass system.\n");
-                delete m_grassSystem;
-                m_grassSystem = nullptr;
-            }
-            else
-            {
-                wchar_t grassMsg[256];
-                swprintf_s(grassMsg, L"[Renderer] Grass system initialized with %u instances.\n", m_grassSystem->GetInstanceCount());
-                OutputDebugStringW(grassMsg);
-            }
-        }
-        
         return true;
     }
     
@@ -3361,6 +3323,73 @@ void Renderer::ToggleTerrainLODDebug()
         swprintf_s(msg, L"[TerrainNew] LOD Debug Visualization: %s\n", enabled ? L"Enabled" : L"Disabled");
         OutputDebugStringW(msg);
     }
+}
+
+// ============================================================================
+// 初始化草地系统
+// ============================================================================
+bool Renderer::InitializeGrassSystem()
+{
+    // 创建草地系统对象
+    m_grassSystem = new GrassSystem();
+    
+    // 初始化草地系统
+    if (!m_grassSystem->Initialize(m_device.Get(), m_context.Get()))
+    {
+        OutputDebugStringW(L"[GrassSystem] Failed to initialize grass system.\n");
+        delete m_grassSystem;
+        m_grassSystem = nullptr;
+        return false;
+    }
+    
+    // 生成多个草的位置，铺满整个地形
+    if (m_terrain)
+    {
+        // 获取地形大小（从地形参数中获取，默认1024x1024）
+        float terrainSizeX = 1024.0f;
+        float terrainSizeZ = 1024.0f;
+        
+        // 创建一个lambda函数来获取地形高度
+        auto getHeightFunc = [this](float x, float z) -> float {
+            return m_terrain->GetHeightAt(x, z);
+        };
+        
+        // 生成草的位置，每隔1个单位创建一个
+        m_grassSystem->GenerateGrassPositions(terrainSizeX, terrainSizeZ, 1.0f, getHeightFunc);
+    }
+    else
+    {
+        // 如果没有地形，生成默认位置的草（高度为0）
+        m_grassSystem->GenerateGrassPositions(1024.0f, 1024.0f, 1.0f, nullptr);
+        OutputDebugStringW(L"[GrassSystem] Warning: No terrain found, generating grass at height 0\n");
+    }
+    
+    OutputDebugStringW(L"[GrassSystem] Grass system initialized successfully.\n");
+    return true;
+}
+
+// ============================================================================
+// 渲染草地系统
+// ============================================================================
+void Renderer::RenderGrassSystem(float deltaTime)
+{
+    if (!m_grassSystem || !m_camera)
+    {
+        return;
+    }
+    
+    // 获取相机的视图和投影矩阵
+    XMMATRIX viewMatrix = m_camera->GetViewMatrix();
+    float aspect = (float)m_width / (float)m_height;
+    XMMATRIX projMatrix = m_camera->GetProjectionMatrix(aspect);
+    
+    // 转换为XMFLOAT4X4
+    XMFLOAT4X4 view, projection;
+    XMStoreFloat4x4(&view, viewMatrix);
+    XMStoreFloat4x4(&projection, projMatrix);
+    
+    // 渲染草地（传递deltaTime用于动画）
+    m_grassSystem->Render(m_context.Get(), view, projection, deltaTime);
 }
 
 // ============================================================================

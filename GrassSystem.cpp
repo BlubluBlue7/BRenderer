@@ -1,351 +1,188 @@
 #include "GrassSystem.h"
-#include "Terrain_new.h"
-#include <algorithm>
-#include <cmath>
-#include <random>
 #include <d3dcompiler.h>
+#include <fstream>
+#include <vector>
+#include <algorithm>
 
 #pragma comment(lib, "d3dcompiler.lib")
 
-using namespace DirectX;
+// 简单的顶点结构（只需要位置）
+struct GrassVertex
+{
+    XMFLOAT3 position;
+};
+
+// 常量缓冲区结构（与着色器中的cbuffer匹配）
+struct GrassConstantBuffer
+{
+    XMFLOAT4X4 view;
+    XMFLOAT4X4 projection;
+    XMFLOAT4X4 viewInverse;  // 视图矩阵的逆矩阵（用于billboard）
+    XMFLOAT3 cameraPosition; // 相机位置（世界空间）
+    float time;              // 时间（用于动画）
+    XMFLOAT3 windDirection;  // 风向
+    float windStrength;      // 风力强度
+    XMFLOAT3 windFieldCenter; // 风场中心位置
+    float windFieldRadius;    // 风场影响半径
+    float windFieldStrength;   // 风场强度
+    float padding[2];          // 对齐填充
+};
+
+// 实例数据结构（与着色器中的InstanceData匹配）
+struct GrassInstanceData
+{
+    XMFLOAT3 position;
+    float padding;  // 对齐到16字节
+};
 
 // ============================================================================
-// 构造函数和析构函数
+// 构造函数
 // ============================================================================
 GrassSystem::GrassSystem()
-    : m_terrain(nullptr)
-    , m_vertexCount(0)
-    , m_indexCount(0)
-    , m_instanceCount(0)
-    , m_time(0.0f)
-    , m_initialized(false)
 {
 }
 
+// ============================================================================
+// 析构函数
+// ============================================================================
 GrassSystem::~GrassSystem()
 {
     Cleanup();
 }
 
 // ============================================================================
-// 初始化
+// 初始化草地系统
 // ============================================================================
-bool GrassSystem::Initialize(ID3D11Device* device, const GrassParams& params, TerrainNew* terrain)
+bool GrassSystem::Initialize(ID3D11Device* device, ID3D11DeviceContext* context)
 {
-    OutputDebugStringW(L"[GrassSystem] Initialize called\n");
+    m_device = device;
+    m_context = context;
     
-    if (!device || !terrain)
-    {
-        OutputDebugStringW(L"[GrassSystem] Initialize failed: device or terrain is null\n");
-        return false;
-    }
-    
-    m_params = params;
-    m_terrain = terrain;
-    
-    OutputDebugStringW(L"[GrassSystem] Starting initialization...\n");
-    
-    // 1. 创建草的几何数据
+    // 创建几何体
     if (!CreateGrassGeometry(device))
     {
-        OutputDebugStringW(L"[GrassSystem] Failed to create grass geometry\n");
+        OutputDebugStringW(L"[GrassSystem] Failed to create grass geometry.\n");
         return false;
     }
     
-    // 2. 生成草地实例
-    GenerateInstances(terrain);
-    
-    // 3. 创建实例缓冲区
-    if (!CreateInstanceBuffer(device))
-    {
-        OutputDebugStringW(L"[GrassSystem] Failed to create instance buffer\n");
-        return false;
-    }
-    
-    // 4. 创建着色器
+    // 创建着色器
     if (!CreateShaders(device))
     {
-        OutputDebugStringW(L"[GrassSystem] Failed to create shaders\n");
+        OutputDebugStringW(L"[GrassSystem] Failed to create shaders.\n");
         return false;
     }
     
-    // 5. 创建纹理和采样器
-    if (!CreateTextureAndSampler(device))
+    // 创建输入布局
+    if (!CreateInputLayout(device))
     {
-        OutputDebugStringW(L"[GrassSystem] Failed to create texture and sampler\n");
+        OutputDebugStringW(L"[GrassSystem] Failed to create input layout.\n");
         return false;
     }
     
-    // 6. 创建常量缓冲区
-    // 常量缓冲区结构：worldViewProj(16) + world(16) + view(16) + cameraPosition(4) + windParams(4) + grassParams(4) + renderParams(4) + lightDirection(4) + lightColor(4) + ambientColor(4) = 76 floats
-    // 对齐到16字节边界：需要80 floats (320 bytes)
-    D3D11_BUFFER_DESC bd = {};
-    bd.Usage = D3D11_USAGE_DYNAMIC;
-    bd.ByteWidth = sizeof(float) * 80; // 足够大的缓冲区（对齐到16字节）
-    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-    bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-    
-    HRESULT hr = device->CreateBuffer(&bd, nullptr, m_constantBuffer.GetAddressOf());
-    if (FAILED(hr))
+    // 创建常量缓冲区
+    if (!CreateConstantBuffer(device))
     {
-        OutputDebugStringW(L"[GrassSystem] Failed to create constant buffer\n");
+        OutputDebugStringW(L"[GrassSystem] Failed to create constant buffer.\n");
         return false;
     }
     
-    // 7. 创建混合状态（Alpha blending - 标准alpha混合，用于透明草纹理）
-    D3D11_BLEND_DESC blendDesc = {};
-    blendDesc.RenderTarget[0].BlendEnable = TRUE;
-    blendDesc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA; // 源颜色乘以源alpha
-    blendDesc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA; // 目标颜色乘以(1-源alpha)
-    blendDesc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD; // 相加
-    blendDesc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE; // 源alpha直接使用
-    blendDesc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA; // 目标alpha乘以(1-源alpha)
-    blendDesc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
-    blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-    
-    hr = device->CreateBlendState(&blendDesc, m_blendState.GetAddressOf());
-    if (FAILED(hr))
+    // 创建实例缓冲区
+    if (!CreateInstanceBuffer(device))
     {
-        OutputDebugStringW(L"[GrassSystem] Failed to create blend state\n");
+        OutputDebugStringW(L"[GrassSystem] Failed to create instance buffer.\n");
         return false;
     }
     
-    // 8. 创建深度模板状态（启用深度测试和写入，使用LESS_EQUAL以允许草与地形融合）
-    D3D11_DEPTH_STENCIL_DESC depthDesc = {};
-    depthDesc.DepthEnable = TRUE;
-    depthDesc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL; // 启用深度写入，确保草正确遮挡
-    depthDesc.DepthFunc = D3D11_COMPARISON_LESS_EQUAL; // 使用LESS_EQUAL，允许草与地形在同一高度时可见
-    depthDesc.StencilEnable = FALSE;
-    
-    hr = device->CreateDepthStencilState(&depthDesc, m_depthStencilState.GetAddressOf());
-    if (FAILED(hr))
-    {
-        OutputDebugStringW(L"[GrassSystem] Failed to create depth stencil state\n");
-        return false;
-    }
-    
-    // 9. 创建光栅化状态（实心模式）
-    D3D11_RASTERIZER_DESC solidRasterizerDesc = {};
-    solidRasterizerDesc.FillMode = D3D11_FILL_SOLID;
-    solidRasterizerDesc.CullMode = D3D11_CULL_NONE; // 草是双面的，不剔除
-    solidRasterizerDesc.FrontCounterClockwise = false;
-    solidRasterizerDesc.DepthBias = 0;
-    solidRasterizerDesc.DepthBiasClamp = 0.0f;
-    solidRasterizerDesc.SlopeScaledDepthBias = 0.0f;
-    solidRasterizerDesc.DepthClipEnable = true;
-    solidRasterizerDesc.ScissorEnable = false;
-    solidRasterizerDesc.MultisampleEnable = false;
-    solidRasterizerDesc.AntialiasedLineEnable = false;
-    
-    hr = device->CreateRasterizerState(&solidRasterizerDesc, m_solidRasterizerState.GetAddressOf());
-    if (FAILED(hr))
-    {
-        OutputDebugStringW(L"[GrassSystem] Failed to create solid rasterizer state\n");
-        return false;
-    }
-    
-    // 10. 创建光栅化状态（线框模式）
-    D3D11_RASTERIZER_DESC wireframeRasterizerDesc = {};
-    wireframeRasterizerDesc.FillMode = D3D11_FILL_WIREFRAME;
-    wireframeRasterizerDesc.CullMode = D3D11_CULL_NONE; // 草是双面的，不剔除
-    wireframeRasterizerDesc.FrontCounterClockwise = false;
-    wireframeRasterizerDesc.DepthBias = -50; // 深度偏移，让线框稍微靠前
-    wireframeRasterizerDesc.DepthBiasClamp = 0.0f;
-    wireframeRasterizerDesc.SlopeScaledDepthBias = -0.5f;
-    wireframeRasterizerDesc.DepthClipEnable = true;
-    wireframeRasterizerDesc.ScissorEnable = false;
-    wireframeRasterizerDesc.MultisampleEnable = false;
-    wireframeRasterizerDesc.AntialiasedLineEnable = true; // 线条抗锯齿
-    
-    hr = device->CreateRasterizerState(&wireframeRasterizerDesc, m_wireframeRasterizerState.GetAddressOf());
-    if (FAILED(hr))
-    {
-        OutputDebugStringW(L"[GrassSystem] Failed to create wireframe rasterizer state\n");
-        return false;
-    }
-    
-    m_initialized = true;
-    
-    wchar_t msg[256];
-    swprintf_s(msg, L"[GrassSystem] Initialized successfully with %u instances\n", m_instanceCount);
-    OutputDebugStringW(msg);
-    
-    if (m_instanceCount == 0)
-    {
-        OutputDebugStringW(L"[GrassSystem] WARNING: No instances generated! Grass will not be visible.\n");
-    }
-    
+    OutputDebugStringW(L"[GrassSystem] Initialized successfully.\n");
     return true;
 }
 
 // ============================================================================
-// 创建草的几何数据（交叉四边形）
+// 清理资源
+// ============================================================================
+void GrassSystem::Cleanup()
+{
+    m_vertexBuffer.Reset();
+    m_indexBuffer.Reset();
+    m_vertexShader.Reset();
+    m_pixelShader.Reset();
+    m_inputLayout.Reset();
+    m_vsBlob.Reset();
+    m_constantBuffer.Reset();
+    m_instanceBuffer.Reset();
+    m_instanceBufferSRV.Reset();
+    m_visibleGrassPositions.clear();
+}
+
+// ============================================================================
+// 创建草的几何体（2个三角形组成一个面片）
 // ============================================================================
 bool GrassSystem::CreateGrassGeometry(ID3D11Device* device)
 {
-    // 创建一个交叉的四边形（X形状），从任何角度看都可见
-    // 每个四边形由两个三角形组成
+    // 创建一个简单的四边形面片（2个三角形）
+    // 草的高度设为1.0，宽度设为0.5
+    const float grassHeight = 1.0f;
+    const float grassWidth = 0.5f;
     
-    struct GrassVertex
-    {
-        XMFLOAT3 position;
-        XMFLOAT3 normal;
-        XMFLOAT2 texCoord;
+    // 4个顶点，组成一个垂直的面片
+    GrassVertex vertices[] = {
+        // 左下
+        { XMFLOAT3(-grassWidth * 0.5f, 0.0f, 0.0f) },
+        // 右下
+        { XMFLOAT3(grassWidth * 0.5f, 0.0f, 0.0f) },
+        // 左上
+        { XMFLOAT3(-grassWidth * 0.5f, grassHeight, 0.0f) },
+        // 右上
+        { XMFLOAT3(grassWidth * 0.5f, grassHeight, 0.0f) }
     };
     
-    std::vector<GrassVertex> vertices;
-    std::vector<UINT> indices;
+    // 索引：2个三角形
+    uint32_t indices[] = {
+        0, 1, 2,  // 第一个三角形
+        1, 3, 2   // 第二个三角形
+    };
     
-    float halfWidth = m_params.grassWidth * 0.5f;
-    float height = m_params.grassHeight;
-    
-    // 第一个四边形（沿X轴，在YZ平面上）
-    // 法线方向：对于YZ平面上的四边形，法线应该是(1,0,0)或(-1,0,0)
-    // 我们使用(1,0,0)，因为草是双面的，这个方向并不重要
-    // 底部
-    vertices.push_back({XMFLOAT3(-halfWidth, 0.0f, 0.0f), XMFLOAT3(1, 0, 0), XMFLOAT2(0.0f, 1.0f)});
-    vertices.push_back({XMFLOAT3(halfWidth, 0.0f, 0.0f), XMFLOAT3(1, 0, 0), XMFLOAT2(1.0f, 1.0f)});
-    // 顶部
-    vertices.push_back({XMFLOAT3(-halfWidth, height, 0.0f), XMFLOAT3(1, 0, 0), XMFLOAT2(0.0f, 0.0f)});
-    vertices.push_back({XMFLOAT3(halfWidth, height, 0.0f), XMFLOAT3(1, 0, 0), XMFLOAT2(1.0f, 0.0f)});
-    
-    // 第一个四边形的索引
-    UINT baseIndex = 0;
-    indices.push_back(baseIndex + 0);
-    indices.push_back(baseIndex + 2);
-    indices.push_back(baseIndex + 1);
-    indices.push_back(baseIndex + 1);
-    indices.push_back(baseIndex + 2);
-    indices.push_back(baseIndex + 3);
-    
-    // 第二个四边形（沿Z轴，在XY平面上）
-    // 法线方向：对于XY平面上的四边形，法线应该是(0,0,1)或(0,0,-1)
-    // 我们使用(0,0,1)
-    baseIndex = 4;
-    vertices.push_back({XMFLOAT3(0.0f, 0.0f, -halfWidth), XMFLOAT3(0, 0, 1), XMFLOAT2(0.0f, 1.0f)});
-    vertices.push_back({XMFLOAT3(0.0f, 0.0f, halfWidth), XMFLOAT3(0, 0, 1), XMFLOAT2(1.0f, 1.0f)});
-    vertices.push_back({XMFLOAT3(0.0f, height, -halfWidth), XMFLOAT3(0, 0, 1), XMFLOAT2(0.0f, 0.0f)});
-    vertices.push_back({XMFLOAT3(0.0f, height, halfWidth), XMFLOAT3(0, 0, 1), XMFLOAT2(1.0f, 0.0f)});
-    
-    // 第二个四边形的索引
-    indices.push_back(baseIndex + 0);
-    indices.push_back(baseIndex + 2);
-    indices.push_back(baseIndex + 1);
-    indices.push_back(baseIndex + 1);
-    indices.push_back(baseIndex + 2);
-    indices.push_back(baseIndex + 3);
-    
-    m_vertexCount = static_cast<UINT>(vertices.size());
-    m_indexCount = static_cast<UINT>(indices.size());
+    m_indexCount = 6;
     
     // 创建顶点缓冲区
-    D3D11_BUFFER_DESC bd = {};
-    bd.Usage = D3D11_USAGE_DEFAULT;
-    bd.ByteWidth = sizeof(GrassVertex) * m_vertexCount;
-    bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    D3D11_BUFFER_DESC vertexBufferDesc = {};
+    vertexBufferDesc.Usage = D3D11_USAGE_DEFAULT;
+    vertexBufferDesc.ByteWidth = sizeof(GrassVertex) * 4;
+    vertexBufferDesc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    vertexBufferDesc.CPUAccessFlags = 0;
     
-    D3D11_SUBRESOURCE_DATA initData = {};
-    initData.pSysMem = vertices.data();
+    D3D11_SUBRESOURCE_DATA vertexData = {};
+    vertexData.pSysMem = vertices;
+    vertexData.SysMemPitch = 0;
+    vertexData.SysMemSlicePitch = 0;
     
-    HRESULT hr = device->CreateBuffer(&bd, &initData, m_vertexBuffer.GetAddressOf());
+    HRESULT hr = device->CreateBuffer(&vertexBufferDesc, &vertexData, m_vertexBuffer.GetAddressOf());
     if (FAILED(hr))
+    {
+        OutputDebugStringW(L"[GrassSystem] Failed to create vertex buffer.\n");
         return false;
+    }
     
     // 创建索引缓冲区
-    bd.ByteWidth = sizeof(UINT) * m_indexCount;
-    bd.BindFlags = D3D11_BIND_INDEX_BUFFER;
-    initData.pSysMem = indices.data();
+    D3D11_BUFFER_DESC indexBufferDesc = {};
+    indexBufferDesc.Usage = D3D11_USAGE_DEFAULT;
+    indexBufferDesc.ByteWidth = sizeof(uint32_t) * m_indexCount;
+    indexBufferDesc.BindFlags = D3D11_BIND_INDEX_BUFFER;
+    indexBufferDesc.CPUAccessFlags = 0;
     
-    hr = device->CreateBuffer(&bd, &initData, m_indexBuffer.GetAddressOf());
+    D3D11_SUBRESOURCE_DATA indexData = {};
+    indexData.pSysMem = indices;
+    indexData.SysMemPitch = 0;
+    indexData.SysMemSlicePitch = 0;
+    
+    hr = device->CreateBuffer(&indexBufferDesc, &indexData, m_indexBuffer.GetAddressOf());
     if (FAILED(hr))
+    {
+        OutputDebugStringW(L"[GrassSystem] Failed to create index buffer.\n");
         return false;
+    }
     
     return true;
-}
-
-// ============================================================================
-// 生成草地实例
-// ============================================================================
-void GrassSystem::GenerateInstances(TerrainNew* terrain)
-{
-    if (!terrain)
-        return;
-    
-    m_instances.clear();
-    
-    // 计算需要的实例数量
-    float area = m_params.worldSizeX * m_params.worldSizeZ;
-    int targetCount = static_cast<int>(area * m_params.density);
-    
-    // 生成随机位置
-    // 注意：TerrainNew的GetHeightAt期望坐标范围是[-worldSizeX/2, worldSizeX/2]
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_real_distribution<float> xDist(-m_params.worldSizeX * 0.5f, m_params.worldSizeX * 0.5f);
-    std::uniform_real_distribution<float> zDist(-m_params.worldSizeZ * 0.5f, m_params.worldSizeZ * 0.5f);
-    std::uniform_real_distribution<float> rotDist(0.0f, 2.0f * 3.14159f);
-    std::uniform_real_distribution<float> scaleDist(0.8f, 1.2f);
-    std::uniform_real_distribution<float> colorDist(0.9f, 1.0f);
-    
-    m_instances.reserve(targetCount);
-    
-    for (int i = 0; i < targetCount; ++i)
-    {
-        float x = xDist(gen);
-        float z = zDist(gen);
-        
-        // 从地形获取高度
-        float height = terrain->GetHeightAt(x, z);
-        
-        // 检查高度范围
-        if (height < m_params.minHeight || height > m_params.maxHeight)
-            continue;
-        
-        GrassInstanceData instance;
-        instance.position = XMFLOAT3(x, height, z);
-        instance.rotation = rotDist(gen);
-        instance.scale = scaleDist(gen);
-        instance.heightVariation = scaleDist(gen);
-        
-        // 轻微的颜色变化（绿色系）
-        float colorVar = colorDist(gen);
-        instance.color = XMFLOAT4(colorVar, colorVar * 0.95f, colorVar * 0.8f, 1.0f);
-        
-        m_instances.push_back(instance);
-    }
-    
-    m_instanceCount = static_cast<UINT>(m_instances.size());
-    
-    // 调试输出
-    wchar_t msg[256];
-    swprintf_s(msg, L"[GrassSystem] Generated %u instances from %d attempts (area=%.0f, density=%.1f)\n", 
-               m_instanceCount, targetCount, area, m_params.density);
-    OutputDebugStringW(msg);
-    
-    if (m_instanceCount == 0)
-    {
-        OutputDebugStringW(L"[GrassSystem] WARNING: No grass instances generated! Check height range and terrain.\n");
-    }
-}
-
-// ============================================================================
-// 创建实例缓冲区
-// ============================================================================
-bool GrassSystem::CreateInstanceBuffer(ID3D11Device* device)
-{
-    if (m_instances.empty())
-        return false;
-    
-    D3D11_BUFFER_DESC bd = {};
-    bd.Usage = D3D11_USAGE_DEFAULT;
-    bd.ByteWidth = sizeof(GrassInstanceData) * m_instanceCount;
-    bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-    
-    D3D11_SUBRESOURCE_DATA initData = {};
-    initData.pSysMem = m_instances.data();
-    
-    HRESULT hr = device->CreateBuffer(&bd, &initData, m_instanceBuffer.GetAddressOf());
-    return SUCCEEDED(hr);
 }
 
 // ============================================================================
@@ -353,363 +190,530 @@ bool GrassSystem::CreateInstanceBuffer(ID3D11Device* device)
 // ============================================================================
 bool GrassSystem::CreateShaders(ID3D11Device* device)
 {
-    // 编译顶点着色器
-    OutputDebugStringW(L"[GrassSystem] Compiling vertex shader: Shaders/GrassVertexShader.hlsl\n");
-    Microsoft::WRL::ComPtr<ID3DBlob> errorBlob;
-    HRESULT hr = D3DCompileFromFile(
-        L"Shaders/GrassVertexShader.hlsl",
-        nullptr,
-        D3D_COMPILE_STANDARD_FILE_INCLUDE,
-        "VS",
-        "vs_5_0",
-        0,
-        0,
-        m_vsBlob.GetAddressOf(),
-        errorBlob.GetAddressOf()
-    );
-    
-    if (FAILED(hr))
+    // 获取着色器文件路径
+    wchar_t exePath[MAX_PATH] = { 0 };
+    if (GetModuleFileNameW(nullptr, exePath, MAX_PATH) == 0)
     {
-        if (errorBlob)
-        {
-            OutputDebugStringA((char*)errorBlob->GetBufferPointer());
-        }
-        OutputDebugStringW(L"[GrassSystem] Failed to compile vertex shader\n");
+        OutputDebugStringW(L"[GrassSystem] Failed to get executable path.\n");
         return false;
     }
     
-    hr = device->CreateVertexShader(m_vsBlob->GetBufferPointer(), m_vsBlob->GetBufferSize(),
-                                     nullptr, m_vertexShader.GetAddressOf());
-    if (FAILED(hr))
-        return false;
-    
-    // 编译像素着色器
-    OutputDebugStringW(L"[GrassSystem] Compiling pixel shader: Shaders/GrassPixelShader.hlsl\n");
-    Microsoft::WRL::ComPtr<ID3DBlob> psBlob;
-    hr = D3DCompileFromFile(
-        L"Shaders/GrassPixelShader.hlsl",
-        nullptr,
-        D3D_COMPILE_STANDARD_FILE_INCLUDE,
-        "PS",
-        "ps_5_0",
-        0,
-        0,
-        psBlob.GetAddressOf(),
-        errorBlob.GetAddressOf()
-    );
-    
-    if (FAILED(hr))
+    std::wstring exeDir = exePath;
+    size_t lastSlash = exeDir.find_last_of(L"\\/");
+    if (lastSlash != std::wstring::npos)
     {
-        wchar_t hrMsg[256];
-        swprintf_s(hrMsg, L"[GrassSystem] Failed to compile pixel shader, HRESULT: 0x%08X\n", hr);
-        OutputDebugStringW(hrMsg);
-        if (errorBlob)
-        {
-            OutputDebugStringA((char*)errorBlob->GetBufferPointer());
-        }
-        return false;
+        exeDir = exeDir.substr(0, lastSlash + 1);
     }
-    OutputDebugStringW(L"[GrassSystem] Pixel shader compiled successfully\n");
     
-    hr = device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(),
-                                   nullptr, m_pixelShader.GetAddressOf());
-    if (FAILED(hr))
-        return false;
-    
-    // 创建输入布局
-    D3D11_INPUT_ELEMENT_DESC layout[] =
+    std::wstring projectRoot = exeDir;
+    for (int i = 0; i < 2; ++i)
     {
-        // 顶点数据
-        {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
-        {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
-        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 24, D3D11_INPUT_PER_VERTEX_DATA, 0},
-        // 实例数据
-        {"POSITION", 1, DXGI_FORMAT_R32G32B32_FLOAT, 1, 0, D3D11_INPUT_PER_INSTANCE_DATA, 1},
-        {"ROTATION", 0, DXGI_FORMAT_R32_FLOAT, 1, 12, D3D11_INPUT_PER_INSTANCE_DATA, 1},
-        {"SCALE", 0, DXGI_FORMAT_R32_FLOAT, 1, 16, D3D11_INPUT_PER_INSTANCE_DATA, 1},
-        {"HEIGHT_VAR", 0, DXGI_FORMAT_R32_FLOAT, 1, 20, D3D11_INPUT_PER_INSTANCE_DATA, 1},
-        {"COLOR", 1, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 24, D3D11_INPUT_PER_INSTANCE_DATA, 1},
+        size_t slash = projectRoot.find_last_of(L"\\/", projectRoot.length() - 2);
+        if (slash != std::wstring::npos)
+            projectRoot = projectRoot.substr(0, slash + 1);
+    }
+    
+    // 尝试多个路径
+    std::vector<std::wstring> shaderPaths = {
+        projectRoot + L"Shaders/GrassVertexShader.hlsl",
+        exeDir + L"Shaders/GrassVertexShader.hlsl",
+        L"Shaders/GrassVertexShader.hlsl"
     };
     
-    hr = device->CreateInputLayout(layout, ARRAYSIZE(layout),
-                                    m_vsBlob->GetBufferPointer(), m_vsBlob->GetBufferSize(),
-                                    m_inputLayout.GetAddressOf());
-    return SUCCEEDED(hr);
+    // 编译顶点着色器
+    Microsoft::WRL::ComPtr<ID3DBlob> errorBlob;
+    bool shaderFound = false;
+    
+    for (const auto& path : shaderPaths)
+    {
+        HRESULT hr = D3DCompileFromFile(
+            path.c_str(),
+            nullptr,
+            D3D_COMPILE_STANDARD_FILE_INCLUDE,
+            "VS",
+            "vs_5_0",
+            0,
+            0,
+            m_vsBlob.GetAddressOf(),
+            errorBlob.GetAddressOf()
+        );
+        
+        if (SUCCEEDED(hr))
+        {
+            shaderFound = true;
+            break;
+        }
+    }
+    
+    if (!shaderFound)
+    {
+        if (errorBlob)
+        {
+            OutputDebugStringA((char*)errorBlob->GetBufferPointer());
+        }
+        OutputDebugStringW(L"[GrassSystem] Failed to compile vertex shader.\n");
+        return false;
+    }
+    
+    // 创建顶点着色器
+    HRESULT hr = device->CreateVertexShader(
+        m_vsBlob->GetBufferPointer(),
+        m_vsBlob->GetBufferSize(),
+        nullptr,
+        m_vertexShader.GetAddressOf()
+    );
+    
+    if (FAILED(hr))
+    {
+        OutputDebugStringW(L"[GrassSystem] Failed to create vertex shader.\n");
+        return false;
+    }
+    
+    // 编译像素着色器
+    std::vector<std::wstring> psPaths = {
+        projectRoot + L"Shaders/GrassPixelShader.hlsl",
+        exeDir + L"Shaders/GrassPixelShader.hlsl",
+        L"Shaders/GrassPixelShader.hlsl"
+    };
+    
+    Microsoft::WRL::ComPtr<ID3DBlob> psBlob;
+    shaderFound = false;
+    
+    for (const auto& path : psPaths)
+    {
+        hr = D3DCompileFromFile(
+            path.c_str(),
+            nullptr,
+            D3D_COMPILE_STANDARD_FILE_INCLUDE,
+            "PS",
+            "ps_5_0",
+            0,
+            0,
+            psBlob.GetAddressOf(),
+            errorBlob.GetAddressOf()
+        );
+        
+        if (SUCCEEDED(hr))
+        {
+            shaderFound = true;
+            break;
+        }
+    }
+    
+    if (!shaderFound)
+    {
+        if (errorBlob)
+        {
+            OutputDebugStringA((char*)errorBlob->GetBufferPointer());
+        }
+        OutputDebugStringW(L"[GrassSystem] Failed to compile pixel shader.\n");
+        return false;
+    }
+    
+    // 创建像素着色器
+    hr = device->CreatePixelShader(
+        psBlob->GetBufferPointer(),
+        psBlob->GetBufferSize(),
+        nullptr,
+        m_pixelShader.GetAddressOf()
+    );
+    
+    if (FAILED(hr))
+    {
+        OutputDebugStringW(L"[GrassSystem] Failed to create pixel shader.\n");
+        return false;
+    }
+    
+    return true;
 }
 
 // ============================================================================
-// 创建纹理和采样器
+// 创建输入布局
 // ============================================================================
-bool GrassSystem::CreateTextureAndSampler(ID3D11Device* device)
+bool GrassSystem::CreateInputLayout(ID3D11Device* device)
 {
-    // 创建一个简单的程序化纹理（如果没有外部纹理文件）
-    // 这里创建一个1x1的绿色纹理作为占位符
-    // 实际使用时应该加载真实的草纹理
+    // 定义输入元素（只有位置）
+    D3D11_INPUT_ELEMENT_DESC layout[] = {
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 }
+    };
     
-    D3D11_TEXTURE2D_DESC texDesc = {};
-    texDesc.Width = 1;
-    texDesc.Height = 1;
-    texDesc.MipLevels = 1;
-    texDesc.ArraySize = 1;
-    texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    texDesc.SampleDesc.Count = 1;
-    texDesc.Usage = D3D11_USAGE_DEFAULT;
-    texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    UINT numElements = ARRAYSIZE(layout);
     
-    // 创建绿色纹理数据
-    UINT greenColor = 0xFF4A8B3A; // ARGB格式
-    D3D11_SUBRESOURCE_DATA initData = {};
-    initData.pSysMem = &greenColor;
-    initData.SysMemPitch = 4;
+    HRESULT hr = device->CreateInputLayout(
+        layout,
+        numElements,
+        m_vsBlob->GetBufferPointer(),
+        m_vsBlob->GetBufferSize(),
+        m_inputLayout.GetAddressOf()
+    );
     
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
-    HRESULT hr = device->CreateTexture2D(&texDesc, &initData, texture.GetAddressOf());
     if (FAILED(hr))
+    {
+        OutputDebugStringW(L"[GrassSystem] Failed to create input layout.\n");
         return false;
+    }
     
+    return true;
+}
+
+// ============================================================================
+// 创建常量缓冲区
+// ============================================================================
+bool GrassSystem::CreateConstantBuffer(ID3D11Device* device)
+{
+    D3D11_BUFFER_DESC bufferDesc = {};
+    bufferDesc.Usage = D3D11_USAGE_DYNAMIC;
+    // 常量缓冲区大小必须是16字节的倍数
+    UINT bufferSize = (sizeof(GrassConstantBuffer) + 15) & ~15;
+    bufferDesc.ByteWidth = bufferSize;
+    bufferDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    bufferDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    
+    HRESULT hr = device->CreateBuffer(&bufferDesc, nullptr, m_constantBuffer.GetAddressOf());
+    if (FAILED(hr))
+    {
+        OutputDebugStringW(L"[GrassSystem] Failed to create constant buffer.\n");
+        return false;
+    }
+    
+    return true;
+}
+
+// ============================================================================
+// 创建实例缓冲区
+// ============================================================================
+bool GrassSystem::CreateInstanceBuffer(ID3D11Device* device)
+{
+    // 创建足够大的缓冲区（可以容纳所有草）
+    // 实际大小会在UpdateInstanceBuffer中动态调整
+    D3D11_BUFFER_DESC bufferDesc = {};
+    bufferDesc.Usage = D3D11_USAGE_DYNAMIC;
+    bufferDesc.ByteWidth = sizeof(GrassInstanceData) * 1024 * 1024;  // 最大1M个实例
+    bufferDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    bufferDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    bufferDesc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+    bufferDesc.StructureByteStride = sizeof(GrassInstanceData);
+    
+    HRESULT hr = device->CreateBuffer(&bufferDesc, nullptr, m_instanceBuffer.GetAddressOf());
+    if (FAILED(hr))
+    {
+        OutputDebugStringW(L"[GrassSystem] Failed to create instance buffer.\n");
+        return false;
+    }
+    
+    // 创建着色器资源视图
     D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-    srvDesc.Format = texDesc.Format;
-    srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-    srvDesc.Texture2D.MipLevels = 1;
+    srvDesc.Format = DXGI_FORMAT_UNKNOWN;
+    srvDesc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+    srvDesc.Buffer.FirstElement = 0;
+    srvDesc.Buffer.NumElements = 1024 * 1024;
     
-    hr = device->CreateShaderResourceView(texture.Get(), &srvDesc, m_grassTextureSRV.GetAddressOf());
+    hr = device->CreateShaderResourceView(m_instanceBuffer.Get(), &srvDesc, m_instanceBufferSRV.GetAddressOf());
     if (FAILED(hr))
+    {
+        OutputDebugStringW(L"[GrassSystem] Failed to create instance buffer SRV.\n");
         return false;
+    }
     
-    // 创建采样器
-    D3D11_SAMPLER_DESC samplerDesc = {};
-    samplerDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
-    samplerDesc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
-    samplerDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
-    samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-    samplerDesc.MaxLOD = D3D11_FLOAT32_MAX;
-    
-    hr = device->CreateSamplerState(&samplerDesc, m_samplerState.GetAddressOf());
-    return SUCCEEDED(hr);
+    return true;
 }
 
 // ============================================================================
-// 更新
+// 从视图投影矩阵提取视锥体平面
 // ============================================================================
-void GrassSystem::Update(float deltaTime)
+void GrassSystem::ExtractFrustumPlanes(const XMFLOAT4X4& viewProj, XMFLOAT4* planes) const
 {
-    if (!m_initialized)
-        return;
+    // 直接使用XMFLOAT4X4访问成员（不需要转换为XMMATRIX）
+    // 提取6个平面：左、右、下、上、近、远
+    // 平面方程：ax + by + cz + d = 0，存储为 (a, b, c, d)
     
-    m_time += deltaTime;
-}
-
-// ============================================================================
-// 更新常量缓冲区
-// ============================================================================
-void GrassSystem::UpdateConstantBuffer(ID3D11DeviceContext* context,
-                                       const DirectX::XMFLOAT4X4& viewMatrix,
-                                       const DirectX::XMFLOAT4X4& projMatrix,
-                                       const DirectX::XMFLOAT3& cameraPosition,
-                                       const DirectX::XMFLOAT4& lightDirection,
-                                       const DirectX::XMFLOAT4& lightColor,
-                                       const DirectX::XMFLOAT4& ambientColor)
-{
-    if (!context || !m_constantBuffer)
-        return;
+    // 左平面
+    planes[0].x = viewProj._14 + viewProj._11;
+    planes[0].y = viewProj._24 + viewProj._21;
+    planes[0].z = viewProj._34 + viewProj._31;
+    planes[0].w = viewProj._44 + viewProj._41;
     
-    // 计算世界-视图-投影矩阵
-    XMMATRIX world = XMMatrixIdentity();
-    XMMATRIX view = XMLoadFloat4x4(&viewMatrix);
-    XMMATRIX proj = XMLoadFloat4x4(&projMatrix);
-    XMMATRIX worldViewProj = world * view * proj;
+    // 右平面
+    planes[1].x = viewProj._14 - viewProj._11;
+    planes[1].y = viewProj._24 - viewProj._21;
+    planes[1].z = viewProj._34 - viewProj._31;
+    planes[1].w = viewProj._44 - viewProj._41;
     
-    // 归一化风向
-    XMVECTOR windDir = XMLoadFloat3(&m_params.windDirection);
-    windDir = XMVector3Normalize(windDir);
+    // 下平面
+    planes[2].x = viewProj._14 + viewProj._12;
+    planes[2].y = viewProj._24 + viewProj._22;
+    planes[2].z = viewProj._34 + viewProj._32;
+    planes[2].w = viewProj._44 + viewProj._42;
     
-    // 归一化光源方向
-    XMVECTOR lightDir = XMLoadFloat4(&lightDirection);
-    lightDir = XMVector3Normalize(lightDir);
-    XMFLOAT4 lightDirNormalized;
-    XMStoreFloat4(&lightDirNormalized, lightDir);
+    // 上平面
+    planes[3].x = viewProj._14 - viewProj._12;
+    planes[3].y = viewProj._24 - viewProj._22;
+    planes[3].z = viewProj._34 - viewProj._32;
+    planes[3].w = viewProj._44 - viewProj._42;
     
-    D3D11_MAPPED_SUBRESOURCE mapped;
-    if (SUCCEEDED(context->Map(m_constantBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+    // 近平面
+    planes[4].x = viewProj._13;
+    planes[4].y = viewProj._23;
+    planes[4].z = viewProj._33;
+    planes[4].w = viewProj._43;
+    
+    // 远平面
+    planes[5].x = viewProj._14 - viewProj._13;
+    planes[5].y = viewProj._24 - viewProj._23;
+    planes[5].z = viewProj._34 - viewProj._33;
+    planes[5].w = viewProj._44 - viewProj._43;
+    
+    // 归一化所有平面
+    for (int i = 0; i < 6; ++i)
     {
-        float* data = static_cast<float*>(mapped.pData);
-        
-        // worldViewProj (16 floats) - offset 0
-        XMStoreFloat4x4((XMFLOAT4X4*)&data[0], XMMatrixTranspose(worldViewProj));
-        
-        // world (16 floats) - offset 16
-        XMStoreFloat4x4((XMFLOAT4X4*)&data[16], XMMatrixTranspose(world));
-        
-        // view (16 floats) - offset 32
-        XMStoreFloat4x4((XMFLOAT4X4*)&data[32], XMMatrixTranspose(view));
-        
-        // cameraPosition (4 floats) - offset 48
-        data[48] = cameraPosition.x;
-        data[49] = cameraPosition.y;
-        data[50] = cameraPosition.z;
-        data[51] = 0.0f;
-        
-        // windParams (4 floats) - offset 52
-        XMFLOAT3 windDirFloat;
-        XMStoreFloat3(&windDirFloat, windDir);
-        data[52] = windDirFloat.x;
-        data[53] = windDirFloat.y;
-        data[54] = windDirFloat.z;
-        data[55] = m_time;
-        
-        // grassParams (4 floats) - offset 56
-        data[56] = m_params.grassHeight;
-        data[57] = m_params.grassWidth;
-        data[58] = m_params.windStrength;
-        data[59] = m_params.windSpeed;
-        
-        // renderParams (4 floats) - offset 60
-        data[60] = m_params.alphaTestThreshold;
-        data[61] = 0.0f;
-        data[62] = 0.0f;
-        data[63] = 0.0f;
-        
-        // lightDirection (4 floats) - offset 64
-        data[64] = lightDirNormalized.x;
-        data[65] = lightDirNormalized.y;
-        data[66] = lightDirNormalized.z;
-        data[67] = 0.0f;
-        
-        // lightColor (4 floats) - offset 68
-        data[68] = lightColor.x;
-        data[69] = lightColor.y;
-        data[70] = lightColor.z;
-        data[71] = 0.0f;
-        
-        // ambientColor (4 floats) - offset 72
-        data[72] = ambientColor.x;
-        data[73] = ambientColor.y;
-        data[74] = ambientColor.z;
-        data[75] = 0.0f;
-        
-        // padding to 80 floats (对齐到16字节边界)
-        data[76] = 0.0f;
-        data[77] = 0.0f;
-        data[78] = 0.0f;
-        data[79] = 0.0f;
-        
-        context->Unmap(m_constantBuffer.Get(), 0);
+        XMVECTOR plane = XMLoadFloat4(&planes[i]);
+        float length = XMVectorGetX(XMVector3Length(plane));
+        if (length > 0.0001f)
+        {
+            plane = XMVectorScale(plane, 1.0f / length);
+            XMStoreFloat4(&planes[i], plane);
+        }
     }
 }
 
 // ============================================================================
-// 渲染
+// 检查点是否在视锥体内
 // ============================================================================
-void GrassSystem::Render(ID3D11DeviceContext* context,
-                         const DirectX::XMFLOAT4X4& viewMatrix,
-                         const DirectX::XMFLOAT4X4& projMatrix,
-                         const DirectX::XMFLOAT3& cameraPosition,
-                         const DirectX::XMFLOAT4& lightDirection,
-                         const DirectX::XMFLOAT4& lightColor,
-                         const DirectX::XMFLOAT4& ambientColor)
+bool GrassSystem::IsPointInFrustum(const XMFLOAT3& point, const XMFLOAT4* planes) const
 {
-    if (!m_initialized || !context || m_instanceCount == 0)
+    XMVECTOR p = XMLoadFloat3(&point);
+    
+    // 检查点是否在所有平面的正面（或平面上）
+    for (int i = 0; i < 6; ++i)
+    {
+        XMVECTOR plane = XMLoadFloat4(&planes[i]);
+        float distance = XMVectorGetX(XMPlaneDotCoord(plane, p));
+        
+        // 如果点在平面背面，则不在视锥体内
+        if (distance < 0.0f)
+        {
+            return false;
+        }
+    }
+    
+    return true;
+}
+
+// ============================================================================
+// 更新实例缓冲区（根据视锥剔除结果）
+// ============================================================================
+void GrassSystem::UpdateInstanceBuffer(ID3D11DeviceContext* context, const XMFLOAT4X4& view, const XMFLOAT4X4& projection)
+{
+    if (m_grassPositions.empty())
+    {
+        m_visibleInstanceCount = 0;
         return;
-    
-    // 更新常量缓冲区
-    UpdateConstantBuffer(context, viewMatrix, projMatrix, cameraPosition, lightDirection, lightColor, ambientColor);
-    
-    // 保存当前状态
-    ID3D11BlendState* oldBlendState = nullptr;
-    FLOAT blendFactor[4] = {0};
-    UINT sampleMask = 0;
-    context->OMGetBlendState(&oldBlendState, blendFactor, &sampleMask);
-    
-    ID3D11DepthStencilState* oldDepthState = nullptr;
-    UINT stencilRef = 0;
-    context->OMGetDepthStencilState(&oldDepthState, &stencilRef);
-    
-    Microsoft::WRL::ComPtr<ID3D11RasterizerState> oldRasterizerState;
-    context->RSGetState(oldRasterizerState.GetAddressOf());
-    
-    // 检查当前是否是线框模式
-    bool isWireframe = false;
-    if (oldRasterizerState)
-    {
-        D3D11_RASTERIZER_DESC desc;
-        oldRasterizerState->GetDesc(&desc);
-        isWireframe = (desc.FillMode == D3D11_FILL_WIREFRAME);
     }
     
-    // 设置光栅化状态（根据当前模式）
-    if (isWireframe && m_wireframeRasterizerState)
+    // 计算视图投影矩阵
+    XMMATRIX viewMatrix = XMLoadFloat4x4(&view);
+    XMMATRIX projMatrix = XMLoadFloat4x4(&projection);
+    XMMATRIX viewProj = viewMatrix * projMatrix;
+    
+    XMFLOAT4X4 viewProjMatrix;
+    XMStoreFloat4x4(&viewProjMatrix, viewProj);
+    
+    // 提取视锥体平面
+    XMFLOAT4 frustumPlanes[6];
+    ExtractFrustumPlanes(viewProjMatrix, frustumPlanes);
+    
+    // 执行视锥剔除
+    m_visibleGrassPositions.clear();
+    m_visibleGrassPositions.reserve(m_grassPositions.size() / 4);  // 预估约25%可见
+    
+    for (const auto& pos : m_grassPositions)
     {
-        context->RSSetState(m_wireframeRasterizerState.Get());
-    }
-    else if (m_solidRasterizerState)
-    {
-        context->RSSetState(m_solidRasterizerState.Get());
+        // 检查草的位置是否在视锥体内
+        // 由于草是一个小的面片，我们只检查中心点
+        // 如果需要更精确的剔除，可以检查草的面片边界
+        if (IsPointInFrustum(pos, frustumPlanes))
+        {
+            m_visibleGrassPositions.push_back(pos);
+        }
     }
     
-    // 设置混合状态
-    context->OMSetBlendState(m_blendState.Get(), nullptr, 0xFFFFFFFF);
-    context->OMSetDepthStencilState(m_depthStencilState.Get(), 0);
+    m_visibleInstanceCount = (UINT)m_visibleGrassPositions.size();
+    
+    // 更新实例缓冲区
+    if (m_visibleInstanceCount > 0)
+    {
+        D3D11_MAPPED_SUBRESOURCE mappedResource;
+        HRESULT hr = context->Map(m_instanceBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedResource);
+        if (SUCCEEDED(hr))
+        {
+            GrassInstanceData* instanceData = (GrassInstanceData*)mappedResource.pData;
+            for (size_t i = 0; i < m_visibleGrassPositions.size(); ++i)
+            {
+                instanceData[i].position = m_visibleGrassPositions[i];
+                instanceData[i].padding = 0.0f;
+            }
+            context->Unmap(m_instanceBuffer.Get(), 0);
+        }
+    }
+}
+
+// ============================================================================
+// 渲染草地（使用实例化渲染、Billboard和顶点动画）
+// ============================================================================
+void GrassSystem::Render(ID3D11DeviceContext* context, const XMFLOAT4X4& view, const XMFLOAT4X4& projection, float deltaTime)
+{
+    if (!m_vertexBuffer || !m_indexBuffer || !m_vertexShader || !m_pixelShader || !m_inputLayout)
+    {
+        return;
+    }
+    
+    // 更新实例缓冲区（执行视锥剔除）
+    UpdateInstanceBuffer(context, view, projection);
+    
+    // 如果没有可见的草，直接返回
+    if (m_visibleInstanceCount == 0)
+    {
+        return;
+    }
+    
+    // 设置输入布局
+    context->IASetInputLayout(m_inputLayout.Get());
+    
+    // 设置图元类型
+    context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    
+    // 绑定顶点缓冲区
+    UINT stride = sizeof(GrassVertex);
+    UINT offset = 0;
+    context->IASetVertexBuffers(0, 1, m_vertexBuffer.GetAddressOf(), &stride, &offset);
+    
+    // 绑定索引缓冲区
+    context->IASetIndexBuffer(m_indexBuffer.Get(), DXGI_FORMAT_R32_UINT, 0);
     
     // 设置着色器
     context->VSSetShader(m_vertexShader.Get(), nullptr, 0);
     context->PSSetShader(m_pixelShader.Get(), nullptr, 0);
-    context->IASetInputLayout(m_inputLayout.Get());
     
-    // 设置常量缓冲区
-    ID3D11Buffer* cb = m_constantBuffer.Get();
-    context->VSSetConstantBuffers(0, 1, &cb);
-    context->PSSetConstantBuffers(0, 1, &cb);
+    // 计算视图矩阵的逆矩阵（用于提取相机位置）
+    XMMATRIX viewMatrix = XMLoadFloat4x4(&view);
+    XMMATRIX viewInverse = XMMatrixInverse(nullptr, viewMatrix);
+    XMMATRIX projMatrix = XMLoadFloat4x4(&projection);
     
-    // 设置纹理和采样器
-    ID3D11ShaderResourceView* srv = m_grassTextureSRV.Get();
-    context->PSSetShaderResources(0, 1, &srv);
-    ID3D11SamplerState* sampler = m_samplerState.Get();
-    context->PSSetSamplers(0, 1, &sampler);
+    // 从视图矩阵的逆矩阵中提取相机位置（最后一列的前三个元素）
+    XMFLOAT4X4 viewInverseMatrix;
+    XMStoreFloat4x4(&viewInverseMatrix, viewInverse);
+    XMFLOAT3 cameraPos;
+    cameraPos.x = viewInverseMatrix._41;
+    cameraPos.y = viewInverseMatrix._42;
+    cameraPos.z = viewInverseMatrix._43;
     
-    // 设置顶点和索引缓冲区
-    UINT strides[] = {sizeof(float) * 8, sizeof(GrassInstanceData)}; // 顶点: pos(3) + normal(3) + tex(2)
-    UINT offsets[] = {0, 0};
-    ID3D11Buffer* buffers[] = {m_vertexBuffer.Get(), m_instanceBuffer.Get()};
-    context->IASetVertexBuffers(0, 2, buffers, strides, offsets);
-    context->IASetIndexBuffer(m_indexBuffer.Get(), DXGI_FORMAT_R32_UINT, 0);
-    context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    // 累积时间（用于动画）
+    static float totalTime = 0.0f;
+    totalTime += deltaTime;
     
-    // 绘制所有实例
-    // 注意：完整的视锥剔除和距离剔除需要使用GPU计算着色器进行剔除
-    // 然后使用间接绘制（indirect draw），这需要较大的重构
-    // 当前实现渲染所有实例，由GPU的视锥剔除和early-Z测试来处理不可见的草
-    context->DrawIndexedInstanced(m_indexCount, m_instanceCount, 0, 0, 0);
+    // 更新常量缓冲区
+    D3D11_MAPPED_SUBRESOURCE mappedResource;
+    HRESULT hr = context->Map(m_constantBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedResource);
+    if (SUCCEEDED(hr))
+    {
+        GrassConstantBuffer* cb = (GrassConstantBuffer*)mappedResource.pData;
+        XMStoreFloat4x4(&cb->view, XMMatrixTranspose(viewMatrix));
+        XMStoreFloat4x4(&cb->projection, XMMatrixTranspose(projMatrix));
+        XMStoreFloat4x4(&cb->viewInverse, XMMatrixTranspose(viewInverse));
+        cb->cameraPosition = cameraPos;
+        cb->time = totalTime;
+        
+        // 全局风向（归一化）
+        XMVECTOR windDir = XMVectorSet(1.0f, 0.0f, 0.5f, 0.0f);
+        windDir = XMVector3Normalize(windDir);
+        XMStoreFloat3(&cb->windDirection, windDir);
+        cb->windStrength = 0.3f;  // 全局风力强度
+        
+        // 风场参数（在地形中心附近创建一个风场）
+        cb->windFieldCenter = XMFLOAT3(0.0f, 0.0f, 0.0f);  // 风场中心（地形中心）
+        cb->windFieldRadius = 200.0f;  // 风场影响半径（200单位）
+        cb->windFieldStrength = 0.5f;   // 风场强度
+        
+        context->Unmap(m_constantBuffer.Get(), 0);
+    }
     
-    // 恢复状态
-    context->OMSetBlendState(oldBlendState, blendFactor, sampleMask);
-    context->OMSetDepthStencilState(oldDepthState, stencilRef);
-    if (oldRasterizerState)
-        context->RSSetState(oldRasterizerState.Get());
+    // 绑定常量缓冲区
+    context->VSSetConstantBuffers(0, 1, m_constantBuffer.GetAddressOf());
     
-    if (oldBlendState) oldBlendState->Release();
-    if (oldDepthState) oldDepthState->Release();
+    // 绑定实例缓冲区（作为着色器资源）
+    context->VSSetShaderResources(0, 1, m_instanceBufferSRV.GetAddressOf());
+    
+    // 使用实例化渲染绘制所有可见的草
+    context->DrawIndexedInstanced(m_indexCount, m_visibleInstanceCount, 0, 0, 0);
 }
 
 // ============================================================================
-// 清理
+// 生成多个草的位置，铺满整个地形
 // ============================================================================
-void GrassSystem::Cleanup()
+void GrassSystem::GenerateGrassPositions(float terrainSizeX, float terrainSizeZ, float spacing, 
+                                        std::function<float(float, float)> getHeightFunc)
 {
-    m_vertexBuffer.Reset();
-    m_indexBuffer.Reset();
-    m_instanceBuffer.Reset();
-    m_vertexShader.Reset();
-    m_pixelShader.Reset();
-    m_inputLayout.Reset();
-    m_vsBlob.Reset();
-    m_grassTextureSRV.Reset();
-    m_samplerState.Reset();
-    m_constantBuffer.Reset();
-    m_blendState.Reset();
-    m_depthStencilState.Reset();
+    m_grassPositions.clear();
     
-    m_instances.clear();
-    m_instanceCount = 0;
-    m_initialized = false;
+    // 计算地形范围（从中心开始，地形中心在(0, 0)）
+    float halfSizeX = terrainSizeX * 0.5f;
+    float halfSizeZ = terrainSizeZ * 0.5f;
+    
+    // 计算需要创建的草的数量
+    int countX = (int)(terrainSizeX / spacing) + 1;
+    int countZ = (int)(terrainSizeZ / spacing) + 1;
+    
+    wchar_t msg[256];
+    swprintf_s(msg, L"[GrassSystem] Generating %d x %d = %d grass instances...\n", countX, countZ, countX * countZ);
+    OutputDebugStringW(msg);
+    
+    // 预分配空间以提高性能
+    m_grassPositions.reserve(countX * countZ);
+    
+    // 简单的伪随机数生成器（基于位置）
+    auto randomFloat = [](float x, float z) -> float {
+        // 使用简单的哈希函数生成伪随机数
+        float n = sin(x * 12.9898f + z * 78.233f) * 43758.5453f;
+        return n - floor(n);  // 返回0-1之间的值
+    };
+    
+    // 生成每个草的位置
+    for (int z = 0; z < countZ; ++z)
+    {
+        for (int x = 0; x < countX; ++x)
+        {
+            // 计算基础世界坐标（从 -halfSize 到 +halfSize）
+            float baseX = -halfSizeX + x * spacing;
+            float baseZ = -halfSizeZ + z * spacing;
+            
+            // 添加随机偏移（让草的位置更自然）
+            // 偏移范围：-spacing*0.3 到 +spacing*0.3
+            float offsetX = (randomFloat(baseX, baseZ) - 0.5f) * spacing * 0.6f;
+            float offsetZ = (randomFloat(baseZ, baseX) - 0.5f) * spacing * 0.6f;
+            
+            float worldX = baseX + offsetX;
+            float worldZ = baseZ + offsetZ;
+            
+            // 获取地形高度（如果有高度函数）
+            float height = 0.0f;
+            if (getHeightFunc)
+            {
+                height = getHeightFunc(worldX, worldZ);
+            }
+            
+            // 添加草的位置
+            m_grassPositions.push_back(XMFLOAT3(worldX, height, worldZ));
+        }
+        
+        // 每100行输出一次进度
+        if ((z + 1) % 100 == 0)
+        {
+            swprintf_s(msg, L"[GrassSystem] Generated %d rows...\n", z + 1);
+            OutputDebugStringW(msg);
+        }
+    }
+    
+    swprintf_s(msg, L"[GrassSystem] Generated %zu grass positions successfully.\n", m_grassPositions.size());
+    OutputDebugStringW(msg);
 }
 

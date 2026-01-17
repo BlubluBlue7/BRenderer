@@ -28,7 +28,7 @@
 class Camera;
 class Terrain;
 class TerrainNew;  // 前向声明
-class GrassSystem; // 前向声明
+class GrassSystem;  // 前向声明
 
 class Renderer
 {
@@ -133,7 +133,9 @@ private:
     
     // 地形相关
     TerrainNew* m_terrain = nullptr;  // 地形对象
-    GrassSystem* m_grassSystem = nullptr;  // 草地系统
+    
+    // 草地系统相关
+    GrassSystem* m_grassSystem = nullptr;  // 草地系统对象
     
     // Shadow Map相关资源
     static const int SHADOW_MAP_SIZE = 2048;  // Shadow map分辨率
@@ -200,6 +202,10 @@ private:
     bool CreateTerrainRasterizerStates();  // 创建地形光栅化状态（填充和线框）
     bool InitializeTerrain();  // 初始化地形
     void RenderTerrain();  // 渲染地形
+    
+    // 草地系统相关函数
+    bool InitializeGrassSystem();  // 初始化草地系统
+    void RenderGrassSystem(float deltaTime = 0.016f);  // 渲染草地系统
     
     // Shadow Map相关函数
     bool CreateShadowMap();  // 创建shadow map资源
