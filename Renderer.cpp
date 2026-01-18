@@ -42,6 +42,15 @@ struct ConstantBuffer
     XMFLOAT4X4 worldViewProj; // 组合矩阵
 };
 
+// Shadow Map常量缓冲区结构体（必须对齐到16字节边界）
+struct alignas(16) ShadowConstantBuffer
+{
+    XMFLOAT4X4 world;          // 世界变换矩阵
+    XMFLOAT4X4 lightView;       // 光源视图矩阵
+    XMFLOAT4X4 lightProjection; // 光源投影矩阵
+    XMFLOAT4X4 lightViewProj;  // 组合矩阵
+};
+
 // PBR 光照常量缓冲区结构体（必须对齐到16字节边界，大小必须是16字节的倍数）
 struct alignas(16) LightBuffer
 {
@@ -76,11 +85,12 @@ struct alignas(16) LightBuffer
     
     XMFLOAT4 ambientColor;     // 环境光颜色 (16 bytes) - 只使用xyz分量，float4本身已对齐，无需额外padding
     
-    // Shadow Map相关矩阵
+    // Shadow Map相关矩阵（添加到LightBuffer末尾）
     XMFLOAT4X4 lightView;       // 光源视图矩阵 (64 bytes)
     XMFLOAT4X4 lightProjection; // 光源投影矩阵 (64 bytes)
-    XMFLOAT4X4 lightWorldViewProj; // 光源世界-视图-投影矩阵 (64 bytes)
-    // 总共: 128 + 64 + 64 + 64 = 320 bytes (16字节的倍数)
+    XMFLOAT4X4 lightWorldViewProj; // 光源世界-视图-投影矩阵 (64 bytes) - 注意：这里使用单位world矩阵，因为地形world是单位矩阵
+
+    // 总共: 320 bytes (16字节的倍数)
 };
 
 // ============================================================================
@@ -90,6 +100,8 @@ bool Renderer::Initialize(HWND hwnd, int width, int height)
 {
     // 清除之前的错误信息
     m_lastError.clear();
+
+    // 初始化成员变量
     
     // 保存窗口尺寸
     m_width = width;
@@ -229,7 +241,22 @@ bool Renderer::Initialize(HWND hwnd, int width, int height)
         return false;
     }
     OutputDebugStringW(L"Skybox resources created successfully.\n");
-    
+
+    // ========================================================================
+    // 步骤 11.5: 创建光源可视化资源
+    // ========================================================================
+    if (!CreateLightVisualizationShaders())
+    {
+        OutputDebugStringW(L"Warning: Failed to create light visualization shaders.\n");
+        return false;
+    }
+    if (!CreateLightVisualizationGeometry())
+    {
+        OutputDebugStringW(L"Warning: Failed to create light visualization geometry.\n");
+        return false;
+    }
+    OutputDebugStringW(L"Light visualization resources created successfully.\n");
+
     // ========================================================================
     // 步骤 12: 创建地形shader
     // ========================================================================
@@ -263,19 +290,27 @@ bool Renderer::Initialize(HWND hwnd, int width, int height)
     }
     
     // ========================================================================
-    // 步骤 14: 创建Shadow Map
+    // 步骤 13.6: 创建Shadow Map资源
     // ========================================================================
     if (!CreateShadowMap())
     {
         OutputDebugStringW(L"Warning: Failed to create shadow map.\n");
     }
+    else
+    {
+        OutputDebugStringW(L"Shadow map created successfully.\n");
+    }
     
     // ========================================================================
-    // 步骤 15: 创建Shadow Shaders
+    // 步骤 13.7: 创建Shadow Map Shader
     // ========================================================================
-    if (!CreateShadowShaders())
+    if (!CreateShadowMapShaders())
     {
-        OutputDebugStringW(L"Warning: Failed to create shadow shaders.\n");
+        OutputDebugStringW(L"Warning: Failed to create shadow map shaders.\n");
+    }
+    else
+    {
+        OutputDebugStringW(L"Shadow map shaders created successfully.\n");
     }
     
     // ========================================================================
@@ -527,10 +562,6 @@ void Renderer::RenderFrame(float deltaTime)
     // 安全检查：确保设备上下文和渲染目标视图已创建
     if (!m_context || !m_rtv) return;
 
-    // ========================================================================
-    // 步骤 0: 渲染Shadow Map（在渲染主场景之前）
-    // ========================================================================
-    RenderShadowMap();
 
     // ========================================================================
     // 步骤 1: 设置渲染目标
@@ -582,6 +613,11 @@ void Renderer::RenderFrame(float deltaTime)
     UpdateConstantBuffers(deltaTime);
 
     // ========================================================================
+    // 步骤 4.5: 渲染Shadow Map（在场景渲染之前）
+    // ========================================================================
+    RenderShadowMap();
+
+    // ========================================================================
     // 步骤 5: 渲染天空盒（在场景之前渲染）
     // ========================================================================
     RenderSkybox();
@@ -602,7 +638,16 @@ void Renderer::RenderFrame(float deltaTime)
     // 步骤 6.6: 渲染草地系统（在地形之后渲染）
     // ========================================================================
     RenderGrassSystem(deltaTime);
-    
+
+    // ========================================================================
+    // 步骤 6.7: 渲染光源可视化立方体
+    // ========================================================================
+    if (m_camera)
+    {
+        // 使用可控制的光源位置
+        RenderLightVisualization(m_lightPosition);
+    }
+
     // ========================================================================
     // 步骤 7: 设置模型的 Shader 和输入布局
     // 地形渲染后，需要设置模型的shader
@@ -708,13 +753,7 @@ void Renderer::RenderFrame(float deltaTime)
                 };
                 m_context->PSSetShaderResources(3, 2, iblSRVs);
                 
-                // 绑定Shadow Map（t5）
-                if (m_shadowMapSRV)
-                {
-                    m_context->PSSetShaderResources(5, 1, m_shadowMapSRV.GetAddressOf());
-                }
-                
-                // 绑定采样器（s0用于普通纹理，s1用于IBL纹理，s2用于Shadow Map）
+                // 绑定采样器（s0用于普通纹理，s1用于IBL纹理）
                 if (m_samplerState)
                 {
                     m_context->PSSetSamplers(0, 1, m_samplerState.GetAddressOf());
@@ -722,10 +761,6 @@ void Renderer::RenderFrame(float deltaTime)
                 if (m_iblSamplerState)
                 {
                     m_context->PSSetSamplers(1, 1, m_iblSamplerState.GetAddressOf());
-                }
-                if (m_shadowMapSampler)
-                {
-                    m_context->PSSetSamplers(2, 1, m_shadowMapSampler.GetAddressOf());
                 }
                 
                 // 绘制该子网格
@@ -961,6 +996,16 @@ void Renderer::Cleanup()
     }
 
     // 释放所有 D3D11 资源（按创建顺序的逆序释放）
+    // Shadow Map资源
+    m_shadowMapConstantBuffer.Reset();  // Shadow map常量缓冲区
+    m_shadowMapInputLayout.Reset();     // Shadow map输入布局
+    m_shadowMapPS.Reset();              // Shadow map像素着色器
+    m_shadowMapVS.Reset();              // Shadow map顶点着色器
+    m_shadowMapSamplerState.Reset();    // Shadow map采样器状态
+    m_shadowMapSRV.Reset();             // Shadow map着色器资源视图
+    m_shadowMapDSV.Reset();             // Shadow map深度视图
+    m_shadowMapTexture.Reset();         // Shadow map纹理
+    
     m_lightBuffer.Reset();   // 光照常量缓冲区
     m_constantBuffer.Reset(); // 常量缓冲区
     m_inputLayout.Reset();   // 输入布局
@@ -2010,6 +2055,48 @@ bool Renderer::CreateConstantBuffers()
 }
 
 // ============================================================================
+// 获取角色位置（用于绘制模型）
+// ============================================================================
+XMFLOAT3 Renderer::GetCharacterPosition() const
+{
+    if (m_camera)
+    {
+        return m_camera->GetCharacterPosition();
+    }
+    // 如果没有相机，返回默认位置（地形中心）
+    return XMFLOAT3(0.0f, 0.0f, 0.0f);
+}
+
+// ============================================================================
+// 处理键盘输入（用于控制光源移动）
+// 控制方式：
+// - ↑ 上箭头：增加光源高度
+// - ↓ 下箭头：减少光源高度
+// - ← 左箭头：向左移动光源
+// - → 右箭头：向右移动光源
+// ============================================================================
+void Renderer::HandleKeyboardInput(float deltaTime, bool keyUp, bool keyLeft, bool keyDown, bool keyRight)
+{
+    // 光源移动速度（单位：米/秒）
+    float moveSpeed = 50.0f;
+
+    // 计算移动距离
+    float moveDistance = moveSpeed * deltaTime;
+
+    // 保存原始位置，用于调试
+    XMFLOAT3 oldPos = m_lightPosition;
+
+    // 根据方向键更新光源位置
+    if (keyUp) m_lightPosition.y += moveDistance;    // 上箭头：向上移动（增加高度）
+    if (keyDown) m_lightPosition.y -= moveDistance;  // 下箭头：向下移动（减少高度）
+    if (keyLeft) m_lightPosition.x -= moveDistance;  // 左箭头：向左移动（X轴负方向）
+    if (keyRight) m_lightPosition.x += moveDistance; // 右箭头：向右移动（X轴正方向）
+
+    // 限制光源高度在合理范围内
+    m_lightPosition.y = std::max(10.0f, std::min(300.0f, m_lightPosition.y));
+}
+
+// ============================================================================
 // 更新常量缓冲区
 // 每帧调用，更新变换矩阵和光照参数
 // ============================================================================
@@ -2026,14 +2113,21 @@ void Renderer::UpdateConstantBuffers(float deltaTime)
         
         // 创建变换矩阵（使用 XMMATRIX 进行计算）
         // 世界矩阵：物体在世界空间中的位置和方向
-        // 应用0.2倍缩放，使模型变小
+        // 应用0.2倍缩放，使模型放大10倍（原来的一半）
         XMMATRIX scale = XMMatrixScaling(0.2f, 0.2f, 0.2f);
         // 旋转模型摆正：从头顶看向脚底 -> 正常视角
         // 绕X轴旋转-90度（顺时针90度），让模型从躺着的状态变成站着的状态
-        XMMATRIX rotation = XMMatrixRotationX(-XM_PI / 2.0f);  // -90度 = -π/2弧度
-        // 将模型向上移动，确保在地形上方（地形高度范围是0-400米，模型中心在y=0，所以需要向上移动）
-        // 将角色放在地形上方约50米的位置，确保角色脚部在地形表面
-        XMMATRIX translation = XMMatrixTranslation(0.0f, 200.0f, 0.0f);  // 向上移动50个单位
+        XMMATRIX rotationX = XMMatrixRotationX(-XM_PI / 2.0f);  // -90度 = -π/2弧度
+        // 绕Y轴旋转180度，让角色朝向相反方向
+        XMMATRIX rotationY = XMMatrixRotationY(XM_PI);  // 180度 = π弧度
+        XMMATRIX rotation = rotationX * rotationY;  // 先X轴旋转，再Y轴旋转
+        // 使用角色位置来设置模型位置
+        // 获取角色位置（从相机获取，角色位置在地面上）
+        XMFLOAT3 charPos = GetCharacterPosition();
+        
+        // 模型中心在y=0，所以需要根据角色位置调整
+        // 角色位置是脚部位置，模型需要放在地面上
+        XMMATRIX translation = XMMatrixTranslation(charPos.x, charPos.y, charPos.z);
         // 组合变换：先缩放，再旋转，最后平移
         XMMATRIX world = scale * rotation * translation;
         
@@ -2084,25 +2178,33 @@ void Renderer::UpdateConstantBuffers(float deltaTime)
         // ========================================================================
         // 光源方向（归一化的方向向量，指向光源）
         // 让光源绕着角色缓慢旋转（在XZ平面上绕Y轴旋转）
-        // 光源高度保持一定（从上方照射），旋转速度：每15秒转一圈
+        // 光源高度保持一定（从上方向下照射），旋转速度：每15秒转一圈
         float rotationSpeed = 2.0f * XM_PI / 15.0f;  // 每15秒转一圈（2π弧度），缓慢旋转
         float angle = m_lightRotationTime * rotationSpeed;
         
-        // 计算光源位置（在XZ平面上的圆形轨道，Y轴保持一定高度）
-        // 光源距离角色的距离（在XZ平面上的半径）
-        float lightRadius = 1.0f;
-        // 光源高度（从上方照射，负值表示在Y轴上方）
-        float lightHeight = -0.5f;  // 从上方约30度角照射（更接近垂直，光照更强）
+        // 使用可控制的光源位置（不再跟随相机）
+        XMVECTOR lightPos = XMVectorSet(
+            m_lightPosition.x,
+            m_lightPosition.y,
+            m_lightPosition.z,
+            1.0f
+        );
         
-        // 计算光源在世界空间的位置（XZ平面上的圆形轨道）
-        float lightX = cosf(angle) * lightRadius;
-        float lightZ = sinf(angle) * lightRadius;
-        float lightY = lightHeight;
+        // 存储光源位置（用于后续计算）
+        XMFLOAT3 lightPosFloat;
+        XMStoreFloat3(&lightPosFloat, lightPos);
+        float lightX = lightPosFloat.x;
+        float lightY = lightPosFloat.y;
+        float lightZ = lightPosFloat.z;
         
-        // 光源方向（从角色位置(0,0,0)指向光源位置，然后归一化）
-        // 注意：lightDirection在shader中会被取反，所以这里存储的是从表面指向光源的方向
-        XMVECTOR lightPos = XMVectorSet(lightX, lightY, lightZ, 0.0f);
-        XMVECTOR lightDir = XMVector3Normalize(lightPos);  // 归一化
+        // 光源方向目标位置（与shadowmap一致，使用世界原点）
+        // 注意：必须与RenderShadowMap中使用相同的目标位置，否则shadowmap和光照计算会不一致
+        XMVECTOR targetPosForLight = XMVectorSet(0.0f, 0.0f, 0.0f, 1.0f);
+        
+        // 光源方向（从表面指向光源的方向，归一化）
+        // 光照计算需要从表面指向光源的方向（用于计算N·L点积）
+        // 光源在上面时，方向是向上的（Y正），这样才能正确照亮表面
+        XMVECTOR lightDir = XMVector3Normalize(XMVectorSubtract(lightPos, targetPosForLight));
         
         // 转换为XMFLOAT4并存储（匹配HLSL的float3对齐）
         XMFLOAT4 lightDirFloat4;
@@ -2153,33 +2255,35 @@ void Renderer::UpdateConstantBuffers(float deltaTime)
         }
         
         // ========================================================================
-        // Shadow Map: 光源视图和投影矩阵
+        // Shadow Map相关矩阵（光源视图和投影矩阵）
         // ========================================================================
-        // 重用上面计算的光源位置（lightX, lightY, lightZ已在上面定义）
-        // 注意：上面的lightPos是方向向量（w=0），这里需要位置向量（w=1）
-        XMVECTOR lightPosForView = XMVectorSet(lightX, lightY, lightZ, 1.0f);
-        XMVECTOR lightTarget = XMVectorSet(0.0f, 0.0f, 0.0f, 1.0f);  // 看向场景中心
+        // 使用动态光源位置
+        XMVECTOR lightPosForShadow = XMVectorSet(m_lightPosition.x, m_lightPosition.y, m_lightPosition.z, 1.0f);
+        XMVECTOR targetPos = XMVectorSet(0.0f, 0.0f, 0.0f, 1.0f); // 看向世界原点
+        
+        // 光源向上方向（Y轴正方向）
         XMVECTOR lightUp = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
         
-        // 创建光源视图矩阵（从光源看向场景中心）
-        XMMATRIX lightViewMatrix = XMMatrixLookAtLH(lightPosForView, lightTarget, lightUp);
+        // 创建光源视图矩阵（从光源位置看向角色位置）
+        XMMATRIX lightViewMatrix = XMMatrixLookAtLH(lightPosForShadow, targetPos, lightUp);
         
-        // 创建光源投影矩阵（正交投影，覆盖场景范围）
-        // 场景范围：地形大小约4096x4096，高度约400米
-        float shadowMapSize = 5000.0f;  // 覆盖范围
-        float shadowMapNear = 0.1f;
-        float shadowMapFar = 10000.0f;
-        XMMATRIX lightProjectionMatrix = XMMatrixOrthographicLH(shadowMapSize, shadowMapSize, shadowMapNear, shadowMapFar);
+        // 创建光源投影矩阵（正交投影）
+        // 对于角色阴影，使用适当的投影范围以增加精度
+        // shadowMapSize需要平衡：太小则角色占比大但覆盖范围小，太大则覆盖范围大但角色占比小
+        // 注意：这里的值必须与RenderShadowMap()中的值完全一致
+        float shadowMapSize = 50.0f;   // 缩小范围以让角色在阴影贴图中更大
+        float nearPlane = 0.1f;       // 近裁剪平面（靠近光源）
+        float farPlane = 300.0f;      // 远平面（从200米高到地形）
+        XMMATRIX lightProjectionMatrix = XMMatrixOrthographicLH(shadowMapSize, shadowMapSize, nearPlane, farPlane);
         
-        // 存储光源矩阵（转置）
+        // 对于地形，world矩阵是单位矩阵，所以lightWorldViewProj = lightView * lightProjection
+        XMMATRIX lightWorldViewProjMatrix = lightViewMatrix * lightProjectionMatrix;
+        
+        // 转置矩阵并存储（HLSL使用列主序）
         XMStoreFloat4x4(&lb->lightView, XMMatrixTranspose(lightViewMatrix));
         XMStoreFloat4x4(&lb->lightProjection, XMMatrixTranspose(lightProjectionMatrix));
-        
-        // 计算光源世界-视图-投影矩阵（单位世界矩阵）
-        XMMATRIX identity = XMMatrixIdentity();
-        XMMATRIX lightWorldViewProj = identity * lightViewMatrix * lightProjectionMatrix;
-        XMStoreFloat4x4(&lb->lightWorldViewProj, XMMatrixTranspose(lightWorldViewProj));
-        
+        XMStoreFloat4x4(&lb->lightWorldViewProj, XMMatrixTranspose(lightWorldViewProjMatrix));
+
         m_context->Unmap(m_lightBuffer.Get(), 0);
     }
 }
@@ -2917,6 +3021,207 @@ bool Renderer::CreateSkyboxGeometry()
 }
 
 // ============================================================================
+// 创建光源可视化椎体几何体
+// ============================================================================
+bool Renderer::CreateLightVisualizationGeometry()
+{
+    // 创建椎体的顶点（局部空间，底面在原点，顶点向下，大小为1x1x1）
+    struct LightConeVertex
+    {
+        float x, y, z;
+    };
+
+    // 创建椎体：底面圆（8边形），顶点向下
+    const int sides = 8;  // 8边形底面
+    const float radius = 0.5f;
+    const float height = 1.0f;
+
+    std::vector<LightConeVertex> vertices;
+    vertices.reserve(sides + 1);
+
+    // 底面顶点（在Y=0平面）
+    for (int i = 0; i < sides; ++i)
+    {
+        float angle = (float)i / sides * XM_2PI;
+        vertices.push_back({ radius * cosf(angle), 0.0f, radius * sinf(angle) });
+    }
+
+    // 椎体顶点（在Y=-height位置，向下）
+    vertices.push_back({ 0.0f, -height, 0.0f });
+
+    // 创建索引
+    std::vector<uint32_t> indices;
+    indices.reserve(sides * 6);  // 底面 + 侧面
+
+    // 底面三角形（扇形）
+    int apexIndex = sides;
+    for (int i = 0; i < sides; ++i)
+    {
+        int next = (i + 1) % sides;
+        indices.push_back(0);
+        indices.push_back(i);
+        indices.push_back(next);
+    }
+
+    // 侧面三角形（从底面到顶点）
+    for (int i = 0; i < sides; ++i)
+    {
+        int next = (i + 1) % sides;
+        indices.push_back(i);
+        indices.push_back(next);
+        indices.push_back(apexIndex);
+    }
+
+    // 创建顶点缓冲区
+    D3D11_BUFFER_DESC vbd = {};
+    vbd.Usage = D3D11_USAGE_DEFAULT;
+    vbd.ByteWidth = sizeof(LightConeVertex) * vertices.size();
+    vbd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    vbd.CPUAccessFlags = 0;
+
+    D3D11_SUBRESOURCE_DATA vinitData = {};
+    vinitData.pSysMem = vertices.data();
+
+    HRESULT hr = m_device->CreateBuffer(&vbd, &vinitData, m_lightCubeVertexBuffer.GetAddressOf());
+    if (FAILED(hr))
+        return false;
+
+    // 创建索引缓冲区
+    D3D11_BUFFER_DESC ibd = {};
+    ibd.Usage = D3D11_USAGE_DEFAULT;
+    ibd.ByteWidth = sizeof(uint32_t) * indices.size();
+    ibd.BindFlags = D3D11_BIND_INDEX_BUFFER;
+    ibd.CPUAccessFlags = 0;
+
+    D3D11_SUBRESOURCE_DATA iinitData = {};
+    iinitData.pSysMem = indices.data();
+
+    hr = m_device->CreateBuffer(&ibd, &iinitData, m_lightCubeIndexBuffer.GetAddressOf());
+    if (FAILED(hr))
+        return false;
+
+    // 保存索引数量用于渲染
+    m_lightConeIndexCount = indices.size();
+    return true;
+}
+
+// ============================================================================
+// 创建光源可视化椎体着色器
+// ============================================================================
+bool Renderer::CreateLightVisualizationShaders()
+{
+    // 顶点着色器
+    Microsoft::WRL::ComPtr<ID3DBlob> vsBlob;
+    if (!CompileShaderFromFile(L"Shaders\\VertexShader.hlsl", "VS", "vs_5_0", vsBlob.GetAddressOf()))
+        return false;
+
+    HRESULT hr = m_device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, m_lightCubeVS.GetAddressOf());
+    if (FAILED(hr))
+        return false;
+
+    // 创建输入布局（与天空盒使用相同的布局）
+    if (!m_skyboxInputLayout)
+    {
+        D3D11_INPUT_ELEMENT_DESC layout[] = {
+            { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 }
+        };
+
+        hr = m_device->CreateInputLayout(layout, ARRAYSIZE(layout), vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), m_skyboxInputLayout.GetAddressOf());
+        if (FAILED(hr))
+            return false;
+    }
+
+    // 像素着色器 - 使用简单的纯色着色器
+    const char* psCode = R"(
+        float4 PS(float4 position : SV_POSITION) : SV_TARGET
+        {
+            return float4(1.0, 1.0, 0.0, 1.0); // 亮黄色椎体
+        }
+    )";
+
+    Microsoft::WRL::ComPtr<ID3DBlob> psBlob;
+    hr = D3DCompile(psCode, strlen(psCode), nullptr, nullptr, nullptr, "PS", "ps_5_0", 0, 0, psBlob.GetAddressOf(), nullptr);
+    if (FAILED(hr))
+        return false;
+
+    hr = m_device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, m_lightCubePS.GetAddressOf());
+    return SUCCEEDED(hr);
+}
+
+
+// ============================================================================
+// 渲染光源可视化椎体
+// ============================================================================
+void Renderer::RenderLightVisualization(const DirectX::XMFLOAT3& lightPos)
+{
+    // 检查资源是否已创建
+    if (!m_lightCubeVertexBuffer || !m_lightCubeIndexBuffer || !m_lightCubeVS || !m_lightCubePS || !m_skyboxInputLayout)
+        return;
+
+    // 保存当前渲染状态
+    Microsoft::WRL::ComPtr<ID3D11RasterizerState> oldRasterizerState;
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilState> oldDepthStencilState;
+    UINT oldStencilRef;
+    m_context->RSGetState(oldRasterizerState.GetAddressOf());
+    m_context->OMGetDepthStencilState(oldDepthStencilState.GetAddressOf(), &oldStencilRef);
+
+    // 设置渲染状态：正常填充，无背面剔除
+    m_context->RSSetState(nullptr);
+
+    // 设置深度状态：正常深度测试和写入
+    m_context->OMSetDepthStencilState(m_depthStencilState.Get(), 0);
+
+    // 设置着色器
+    m_context->IASetInputLayout(m_skyboxInputLayout.Get());
+    m_context->VSSetShader(m_lightCubeVS.Get(), nullptr, 0);
+    m_context->PSSetShader(m_lightCubePS.Get(), nullptr, 0);
+
+    // 设置顶点和索引缓冲区
+    UINT stride = sizeof(float) * 3; // 只有位置数据
+    UINT offset = 0;
+    m_context->IASetVertexBuffers(0, 1, m_lightCubeVertexBuffer.GetAddressOf(), &stride, &offset);
+    m_context->IASetIndexBuffer(m_lightCubeIndexBuffer.Get(), DXGI_FORMAT_R32_UINT, 0);
+    m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+    // 创建变换矩阵 - 放大立方体并定位到光源位置
+    XMMATRIX scale = XMMatrixScaling(10.0f, 10.0f, 10.0f); // 放大10倍
+    XMMATRIX translation = XMMatrixTranslation(lightPos.x, lightPos.y, lightPos.z);
+    XMMATRIX world = scale * translation;
+
+    // 获取视图和投影矩阵
+    XMMATRIX viewMatrix = m_camera ? m_camera->GetViewMatrix() : XMMatrixIdentity();
+    float aspectRatio = m_camera ? (float)m_width / (float)m_height : 1.0f;
+    XMMATRIX projMatrix = m_camera ? m_camera->GetProjectionMatrix(aspectRatio) : XMMatrixIdentity();
+    XMMATRIX worldViewProj = world * viewMatrix * projMatrix;
+
+    // 更新常量缓冲区
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    HRESULT hr = m_context->Map(m_constantBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (SUCCEEDED(hr))
+    {
+        ConstantBuffer* cb = (ConstantBuffer*)mapped.pData;
+
+        XMMATRIX identity = XMMatrixIdentity();
+        XMStoreFloat4x4(&cb->world, XMMatrixTranspose(identity));
+        XMStoreFloat4x4(&cb->view, XMMatrixTranspose(viewMatrix));
+        XMStoreFloat4x4(&cb->projection, XMMatrixTranspose(projMatrix));
+        XMStoreFloat4x4(&cb->worldViewProj, XMMatrixTranspose(worldViewProj));
+
+        m_context->Unmap(m_constantBuffer.Get(), 0);
+    }
+
+    // 绑定常量缓冲区
+    m_context->VSSetConstantBuffers(0, 1, m_constantBuffer.GetAddressOf());
+
+    // 渲染椎体
+    m_context->DrawIndexed(m_lightConeIndexCount, 0, 0);
+
+    // 恢复之前的渲染状态
+    m_context->RSSetState(oldRasterizerState.Get());
+    m_context->OMSetDepthStencilState(oldDepthStencilState.Get(), oldStencilRef);
+}
+
+// ============================================================================
 // 创建天空盒深度状态（使用LESS_EQUAL，确保天空盒在最后绘制）
 // ============================================================================
 bool Renderer::CreateSkyboxDepthState()
@@ -3234,11 +3539,15 @@ void Renderer::RenderTerrain()
         m_context->PSSetSamplers(0, 1, m_samplerState.GetAddressOf());
     }
     
-    // 绑定Shadow Map到像素着色器（register t1）
-    if (m_shadowMapSRV && m_shadowMapSampler)
+    // ========================================================================
+    // 绑定Shadow Map资源（用于地形阴影计算）
+    // ========================================================================
+    if (m_shadowMapSRV && m_shadowMapSamplerState)
     {
+        // 绑定Shadow Map纹理到t1（地形shader中shadowMap在register(t1)）
         m_context->PSSetShaderResources(1, 1, m_shadowMapSRV.GetAddressOf());
-        m_context->PSSetSamplers(1, 1, m_shadowMapSampler.GetAddressOf());
+        // 绑定Shadow Map采样器到s1（地形shader中shadowSampler在register(s1)）
+        m_context->PSSetSamplers(1, 1, m_shadowMapSamplerState.GetAddressOf());
     }
     
     // 确保深度测试启用
@@ -3326,6 +3635,36 @@ void Renderer::ToggleTerrainLODDebug()
 }
 
 // ============================================================================
+// 切换地形深度调试可视化模式
+// ============================================================================
+void Renderer::ToggleTerrainDepthDebug()
+{
+    if (m_terrain)
+    {
+        m_terrain->ToggleDepthDebug();
+        bool enabled = m_terrain->IsDepthDebugEnabled();
+        wchar_t msg[256];
+        swprintf_s(msg, L"[TerrainNew] Depth Debug Visualization: %s\n", enabled ? L"Enabled" : L"Disabled");
+        OutputDebugStringW(msg);
+    }
+}
+
+// ============================================================================
+// 切换地形阴影调试可视化模式
+// ============================================================================
+void Renderer::ToggleTerrainShadowDebug()
+{
+    if (m_terrain)
+    {
+        m_terrain->ToggleShadowDebug();
+        bool enabled = m_terrain->IsShadowDebugEnabled();
+        wchar_t msg[256];
+        swprintf_s(msg, L"[TerrainNew] Shadow Debug Visualization: %s\n", enabled ? L"Enabled" : L"Disabled");
+        OutputDebugStringW(msg);
+    }
+}
+
+// ============================================================================
 // 初始化草地系统
 // ============================================================================
 bool Renderer::InitializeGrassSystem()
@@ -3390,334 +3729,6 @@ void Renderer::RenderGrassSystem(float deltaTime)
     
     // 渲染草地（传递deltaTime用于动画）
     m_grassSystem->Render(m_context.Get(), view, projection, deltaTime);
-}
-
-// ============================================================================
-// 创建Shadow Map资源
-// ============================================================================
-bool Renderer::CreateShadowMap()
-{
-    // 创建Shadow Map纹理（深度纹理）
-    D3D11_TEXTURE2D_DESC shadowMapDesc = {};
-    shadowMapDesc.Width = SHADOW_MAP_SIZE;
-    shadowMapDesc.Height = SHADOW_MAP_SIZE;
-    shadowMapDesc.MipLevels = 1;
-    shadowMapDesc.ArraySize = 1;
-    shadowMapDesc.Format = DXGI_FORMAT_R24G8_TYPELESS;  // 24位深度 + 8位模板
-    shadowMapDesc.SampleDesc.Count = 1;
-    shadowMapDesc.SampleDesc.Quality = 0;
-    shadowMapDesc.Usage = D3D11_USAGE_DEFAULT;
-    shadowMapDesc.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
-    shadowMapDesc.CPUAccessFlags = 0;
-    shadowMapDesc.MiscFlags = 0;
-    
-    HRESULT hr = m_device->CreateTexture2D(&shadowMapDesc, nullptr, m_shadowMapTexture.GetAddressOf());
-    if (FAILED(hr))
-    {
-        OutputDebugStringW(L"Failed to create shadow map texture.\n");
-        return false;
-    }
-    
-    // 创建深度模板视图
-    D3D11_DEPTH_STENCIL_VIEW_DESC dsvDesc = {};
-    dsvDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
-    dsvDesc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
-    dsvDesc.Texture2D.MipSlice = 0;
-    
-    hr = m_device->CreateDepthStencilView(m_shadowMapTexture.Get(), &dsvDesc, m_shadowMapDSV.GetAddressOf());
-    if (FAILED(hr))
-    {
-        OutputDebugStringW(L"Failed to create shadow map DSV.\n");
-        return false;
-    }
-    
-    // 创建着色器资源视图
-    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-    srvDesc.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
-    srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-    srvDesc.Texture2D.MipLevels = 1;
-    srvDesc.Texture2D.MostDetailedMip = 0;
-    
-    hr = m_device->CreateShaderResourceView(m_shadowMapTexture.Get(), &srvDesc, m_shadowMapSRV.GetAddressOf());
-    if (FAILED(hr))
-    {
-        OutputDebugStringW(L"Failed to create shadow map SRV.\n");
-        return false;
-    }
-    
-    // 创建Shadow Map采样器（PCF - Percentage Closer Filtering）
-    D3D11_SAMPLER_DESC samplerDesc = {};
-    samplerDesc.Filter = D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;  // PCF过滤
-    samplerDesc.AddressU = D3D11_TEXTURE_ADDRESS_BORDER;
-    samplerDesc.AddressV = D3D11_TEXTURE_ADDRESS_BORDER;
-    samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_BORDER;
-    samplerDesc.BorderColor[0] = 1.0f;  // 边界外的阴影值（1.0 = 不在阴影中）
-    samplerDesc.BorderColor[1] = 1.0f;
-    samplerDesc.BorderColor[2] = 1.0f;
-    samplerDesc.BorderColor[3] = 1.0f;
-    samplerDesc.ComparisonFunc = D3D11_COMPARISON_LESS_EQUAL;  // 深度比较函数
-    samplerDesc.MinLOD = 0;
-    samplerDesc.MaxLOD = D3D11_FLOAT32_MAX;
-    
-    hr = m_device->CreateSamplerState(&samplerDesc, m_shadowMapSampler.GetAddressOf());
-    if (FAILED(hr))
-    {
-        OutputDebugStringW(L"Failed to create shadow map sampler.\n");
-        return false;
-    }
-    
-    // 创建Shadow Map光栅化状态（启用深度偏移，减少阴影痤疮）
-    D3D11_RASTERIZER_DESC rasterizerDesc = {};
-    rasterizerDesc.FillMode = D3D11_FILL_SOLID;
-    rasterizerDesc.CullMode = D3D11_CULL_BACK;
-    rasterizerDesc.FrontCounterClockwise = false;
-    rasterizerDesc.DepthBias = 1000;  // 深度偏移（以最小可表示深度单位计算）
-    rasterizerDesc.DepthBiasClamp = 0.0f;
-    rasterizerDesc.SlopeScaledDepthBias = 2.0f;  // 斜率缩放深度偏移
-    rasterizerDesc.DepthClipEnable = true;
-    rasterizerDesc.ScissorEnable = false;
-    rasterizerDesc.MultisampleEnable = false;
-    rasterizerDesc.AntialiasedLineEnable = false;
-    
-    hr = m_device->CreateRasterizerState(&rasterizerDesc, m_shadowMapRasterizerState.GetAddressOf());
-    if (FAILED(hr))
-    {
-        OutputDebugStringW(L"Failed to create shadow map rasterizer state.\n");
-        return false;
-    }
-    
-    // 创建Shadow Pass常量缓冲区
-    D3D11_BUFFER_DESC cbDesc = {};
-    cbDesc.Usage = D3D11_USAGE_DYNAMIC;
-    cbDesc.ByteWidth = sizeof(XMFLOAT4X4) * 4;  // world, lightView, lightProjection, lightWorldViewProj
-    cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-    cbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-    
-    hr = m_device->CreateBuffer(&cbDesc, nullptr, m_shadowConstantBuffer.GetAddressOf());
-    if (FAILED(hr))
-    {
-        OutputDebugStringW(L"Failed to create shadow constant buffer.\n");
-        return false;
-    }
-    
-    OutputDebugStringW(L"Shadow map created successfully.\n");
-    return true;
-}
-
-// ============================================================================
-// 创建Shadow Shaders
-// ============================================================================
-bool Renderer::CreateShadowShaders()
-{
-    // 编译Shadow顶点着色器
-    Microsoft::WRL::ComPtr<ID3DBlob> vsBlob;
-    if (!CompileShaderFromFile(L"Shaders/ShadowVertexShader.hlsl", "VS", "vs_5_0", vsBlob.GetAddressOf()))
-    {
-        OutputDebugStringW(L"Failed to compile shadow vertex shader.\n");
-        return false;
-    }
-    
-    HRESULT hr = m_device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, m_shadowVS.GetAddressOf());
-    if (FAILED(hr))
-    {
-        OutputDebugStringW(L"Failed to create shadow vertex shader.\n");
-        return false;
-    }
-    
-    // 编译Shadow像素着色器
-    Microsoft::WRL::ComPtr<ID3DBlob> psBlob;
-    if (!CompileShaderFromFile(L"Shaders/ShadowPixelShader.hlsl", "PS", "ps_5_0", psBlob.GetAddressOf()))
-    {
-        OutputDebugStringW(L"Failed to compile shadow pixel shader.\n");
-        return false;
-    }
-    
-    hr = m_device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, m_shadowPS.GetAddressOf());
-    if (FAILED(hr))
-    {
-        OutputDebugStringW(L"Failed to create shadow pixel shader.\n");
-        return false;
-    }
-    
-    // 创建Shadow Pass输入布局（使用与普通模型相同的顶点格式）
-    D3D11_INPUT_ELEMENT_DESC layout[] = {
-        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
-        { "NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0 },
-        { "COLOR", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 24, D3D11_INPUT_PER_VERTEX_DATA, 0 },
-        { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 36, D3D11_INPUT_PER_VERTEX_DATA, 0 }
-    };
-    
-    hr = m_device->CreateInputLayout(layout, ARRAYSIZE(layout), vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), m_shadowInputLayout.GetAddressOf());
-    if (FAILED(hr))
-    {
-        OutputDebugStringW(L"Failed to create shadow input layout.\n");
-        return false;
-    }
-    
-    OutputDebugStringW(L"Shadow shaders created successfully.\n");
-    return true;
-}
-
-// ============================================================================
-// 获取光源视图矩阵（内部实现）
-// ============================================================================
-void Renderer::GetLightViewMatrixImpl(void* outMatrix) const
-{
-    float rotationSpeed = 2.0f * XM_PI / 15.0f;
-    float angle = m_lightRotationTime * rotationSpeed;
-    float lightRadius = 1.0f;
-    float lightHeight = -0.5f;
-    float lightX = cosf(angle) * lightRadius;
-    float lightZ = sinf(angle) * lightRadius;
-    float lightY = lightHeight;
-    
-    XMVECTOR lightPos = XMVectorSet(lightX, lightY, lightZ, 1.0f);
-    XMVECTOR lightTarget = XMVectorSet(0.0f, 0.0f, 0.0f, 1.0f);
-    XMVECTOR lightUp = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
-    
-    *static_cast<XMMATRIX*>(outMatrix) = XMMatrixLookAtLH(lightPos, lightTarget, lightUp);
-}
-
-// ============================================================================
-// 获取光源投影矩阵（内部实现）
-// ============================================================================
-void Renderer::GetLightProjectionMatrixImpl(void* outMatrix) const
-{
-    float shadowMapSize = 5000.0f;
-    float shadowMapNear = 0.1f;
-    float shadowMapFar = 10000.0f;
-    *static_cast<XMMATRIX*>(outMatrix) = XMMatrixOrthographicLH(shadowMapSize, shadowMapSize, shadowMapNear, shadowMapFar);
-}
-
-// ============================================================================
-// 渲染Shadow Map（从光源视角）
-// ============================================================================
-void Renderer::RenderShadowMap()
-{
-    if (!m_shadowMapDSV || !m_shadowVS || !m_shadowPS || !m_shadowInputLayout)
-        return;
-    
-    // 保存当前渲染目标
-    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> oldRTV;
-    Microsoft::WRL::ComPtr<ID3D11DepthStencilView> oldDSV;
-    m_context->OMGetRenderTargets(1, oldRTV.GetAddressOf(), oldDSV.GetAddressOf());
-    
-    // 保存当前光栅化状态
-    Microsoft::WRL::ComPtr<ID3D11RasterizerState> oldRasterizerState;
-    m_context->RSGetState(oldRasterizerState.GetAddressOf());
-    
-    // 设置Shadow Map为渲染目标（只渲染深度）
-    m_context->OMSetRenderTargets(0, nullptr, m_shadowMapDSV.Get());
-    
-    // 清空Shadow Map
-    m_context->ClearDepthStencilView(m_shadowMapDSV.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
-    
-    // 设置视口
-    D3D11_VIEWPORT viewport = {};
-    viewport.Width = (float)SHADOW_MAP_SIZE;
-    viewport.Height = (float)SHADOW_MAP_SIZE;
-    viewport.MinDepth = 0.0f;
-    viewport.MaxDepth = 1.0f;
-    m_context->RSSetViewports(1, &viewport);
-    
-    // 设置Shadow Pass shader
-    m_context->IASetInputLayout(m_shadowInputLayout.Get());
-    m_context->VSSetShader(m_shadowVS.Get(), nullptr, 0);
-    m_context->PSSetShader(m_shadowPS.Get(), nullptr, 0);
-    
-    // 设置Shadow Map光栅化状态（启用深度偏移）
-    m_context->RSSetState(m_shadowMapRasterizerState.Get());
-    
-    // 更新Shadow Pass常量缓冲区
-    XMMATRIX lightView, lightProjection;
-    GetLightViewMatrixImpl(&lightView);
-    GetLightProjectionMatrixImpl(&lightProjection);
-    
-    D3D11_MAPPED_SUBRESOURCE mapped;
-    HRESULT hr = m_context->Map(m_shadowConstantBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-    if (SUCCEEDED(hr))
-    {
-        XMFLOAT4X4* matrices = (XMFLOAT4X4*)mapped.pData;
-        
-        // 单位世界矩阵
-        XMMATRIX identity = XMMatrixIdentity();
-        XMStoreFloat4x4(&matrices[0], XMMatrixTranspose(identity));
-        XMStoreFloat4x4(&matrices[1], XMMatrixTranspose(lightView));
-        XMStoreFloat4x4(&matrices[2], XMMatrixTranspose(lightProjection));
-        
-        XMMATRIX lightWorldViewProj = identity * lightView * lightProjection;
-        XMStoreFloat4x4(&matrices[3], XMMatrixTranspose(lightWorldViewProj));
-        
-        m_context->Unmap(m_shadowConstantBuffer.Get(), 0);
-    }
-    
-    // 绑定Shadow Pass常量缓冲区
-    m_context->VSSetConstantBuffers(0, 1, m_shadowConstantBuffer.GetAddressOf());
-    
-    // 渲染地形到Shadow Map
-    // 注意：地形使用CDLOD系统，需要特殊的shadow pass处理
-    // 暂时跳过地形渲染到shadow map（地形本身不产生阴影，但会接收模型的阴影）
-    // 如果需要地形也产生阴影，需要为地形创建专门的shadow pass
-    // if (m_terrain && m_terrain->GetVertexBuffer())
-    // {
-    //     // 地形shadow pass需要特殊处理
-    // }
-    
-    // 渲染模型到Shadow Map
-    // 注意：模型需要使用与实际渲染相同的世界矩阵（缩放、旋转、平移）
-    if (m_meshMgr)
-    {
-        std::shared_ptr<MeshGPU> modelGPU = m_meshMgr->GetMeshGPU("Model");
-        if (!modelGPU)
-            modelGPU = m_meshMgr->GetMeshGPU("Triangle");
-        
-        if (modelGPU)
-        {
-            // 更新模型的世界矩阵（与实际渲染保持一致）
-            D3D11_MAPPED_SUBRESOURCE mapped;
-            HRESULT hr = m_context->Map(m_shadowConstantBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-            if (SUCCEEDED(hr))
-            {
-                XMFLOAT4X4* matrices = (XMFLOAT4X4*)mapped.pData;
-                
-                // 模型的世界矩阵：缩放0.2倍，旋转-90度，向上移动200单位
-                XMMATRIX scale = XMMatrixScaling(0.2f, 0.2f, 0.2f);
-                XMMATRIX rotation = XMMatrixRotationX(-XM_PI / 2.0f);
-                XMMATRIX translation = XMMatrixTranslation(0.0f, 200.0f, 0.0f);
-                XMMATRIX world = scale * rotation * translation;
-                
-                XMStoreFloat4x4(&matrices[0], XMMatrixTranspose(world));
-                
-                // 重新计算lightWorldViewProj
-                XMMATRIX lightWorldViewProj = world * lightView * lightProjection;
-                XMStoreFloat4x4(&matrices[3], XMMatrixTranspose(lightWorldViewProj));
-                
-                m_context->Unmap(m_shadowConstantBuffer.Get(), 0);
-            }
-            
-            modelGPU->Bind(m_context.Get());
-            
-            // 渲染所有子网格（使用MeshGPU的DrawSubmesh方法）
-            for (uint32_t i = 0; i < modelGPU->GetSubmeshCount(); ++i)
-            {
-                modelGPU->DrawSubmesh(m_context.Get(), i);
-            }
-        }
-    }
-    
-    // 恢复渲染目标和视口
-    m_context->OMSetRenderTargets(1, oldRTV.GetAddressOf(), oldDSV.Get());
-    
-    // 恢复视口
-    D3D11_VIEWPORT mainViewport = {};
-    mainViewport.Width = (float)m_width;
-    mainViewport.Height = (float)m_height;
-    mainViewport.MinDepth = 0.0f;
-    mainViewport.MaxDepth = 1.0f;
-    m_context->RSSetViewports(1, &mainViewport);
-    
-    // 恢复光栅化状态
-    m_context->RSSetState(oldRasterizerState.Get());
 }
 
 // ============================================================================
@@ -3882,4 +3893,568 @@ void Renderer::UpdateTriangleCount()
     }
     
     m_totalTriangles = m_terrainTriangles + m_meshTriangles;
+}
+
+// ============================================================================
+// 创建Shadow Map资源
+// ============================================================================
+bool Renderer::CreateShadowMap()
+{
+    // ========================================================================
+    // 步骤 1: 创建Shadow Map纹理
+    // Shadow Map是一个深度纹理，用于存储从光源视角看到的场景深度
+    // ========================================================================
+    D3D11_TEXTURE2D_DESC shadowMapDesc = {};
+    shadowMapDesc.Width = SHADOW_MAP_SIZE;              // Shadow map宽度（2048像素）
+    shadowMapDesc.Height = SHADOW_MAP_SIZE;             // Shadow map高度（2048像素）
+    shadowMapDesc.MipLevels = 1;                        // Mip级别（1表示不使用mipmap）
+    shadowMapDesc.ArraySize = 1;                        // 纹理数组大小（1表示单个纹理）
+    shadowMapDesc.Format = DXGI_FORMAT_R32_TYPELESS;   // 使用R32格式（32位深度，typeless允许同时作为深度和着色器资源）
+    shadowMapDesc.SampleDesc.Count = 1;                 // 多重采样数量（1表示不启用）
+    shadowMapDesc.SampleDesc.Quality = 0;               // 多重采样质量
+    shadowMapDesc.Usage = D3D11_USAGE_DEFAULT;          // 使用默认用法（GPU读写）
+    shadowMapDesc.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;  // 同时作为深度缓冲区和着色器资源
+    shadowMapDesc.CPUAccessFlags = 0;                   // CPU访问标志（0表示CPU不访问）
+    shadowMapDesc.MiscFlags = 0;                        // 其他标志
+    
+    HRESULT hr = m_device->CreateTexture2D(&shadowMapDesc, nullptr, m_shadowMapTexture.GetAddressOf());
+    if (FAILED(hr))
+    {
+        OutputDebugStringW(L"Failed to create shadow map texture.\n");
+        return false;
+    }
+    
+    // ========================================================================
+    // 步骤 2: 创建Shadow Map深度视图（DSV）
+    // DSV用于将纹理绑定为深度缓冲区，用于渲染shadow map
+    // ========================================================================
+    D3D11_DEPTH_STENCIL_VIEW_DESC dsvDesc = {};
+    dsvDesc.Format = DXGI_FORMAT_D32_FLOAT;             // 深度格式（32位浮点深度）
+    dsvDesc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;  // 2D纹理视图
+    dsvDesc.Texture2D.MipSlice = 0;                     // Mip切片（0表示使用第一个mip级别）
+    
+    hr = m_device->CreateDepthStencilView(m_shadowMapTexture.Get(), &dsvDesc, m_shadowMapDSV.GetAddressOf());
+    if (FAILED(hr))
+    {
+        OutputDebugStringW(L"Failed to create shadow map depth stencil view.\n");
+        return false;
+    }
+    
+    // ========================================================================
+    // 步骤 3: 创建Shadow Map着色器资源视图（SRV）
+    // SRV用于在像素着色器中采样shadow map，进行阴影计算
+    // ========================================================================
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Format = DXGI_FORMAT_R32_FLOAT;             // 着色器资源格式（32位浮点，用于采样深度值）
+    srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;  // 2D纹理视图
+    srvDesc.Texture2D.MipLevels = 1;                     // Mip级别数量
+    srvDesc.Texture2D.MostDetailedMip = 0;              // 最详细的mip级别
+    
+    hr = m_device->CreateShaderResourceView(m_shadowMapTexture.Get(), &srvDesc, m_shadowMapSRV.GetAddressOf());
+    if (FAILED(hr))
+    {
+        OutputDebugStringW(L"Failed to create shadow map shader resource view.\n");
+        return false;
+    }
+    
+    // ========================================================================
+    // 步骤 4: 创建Shadow Map采样器状态
+    // 采样器定义了如何从shadow map中采样深度值
+    // 使用比较采样器（Comparison Sampler）进行PCF（Percentage Closer Filtering）
+    // ========================================================================
+    D3D11_SAMPLER_DESC samplerDesc = {};
+    samplerDesc.Filter = D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;  // 比较过滤器（用于PCF）
+    samplerDesc.AddressU = D3D11_TEXTURE_ADDRESS_BORDER;  // U方向边界寻址（超出范围返回边界值）
+    samplerDesc.AddressV = D3D11_TEXTURE_ADDRESS_BORDER;  // V方向边界寻址
+    samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_BORDER;  // W方向边界寻址
+    samplerDesc.MipLODBias = 0.0f;                       // Mip LOD偏移
+    samplerDesc.MaxAnisotropy = 1;                       // 最大各向异性（1表示不启用）
+    samplerDesc.ComparisonFunc = D3D11_COMPARISON_LESS_EQUAL;  // 比较函数（小于等于时通过）
+    samplerDesc.BorderColor[0] = 1.0f;                   // 边界颜色（白色，表示无阴影）
+    samplerDesc.BorderColor[1] = 1.0f;
+    samplerDesc.BorderColor[2] = 1.0f;
+    samplerDesc.BorderColor[3] = 1.0f;
+    samplerDesc.MinLOD = 0.0f;                          // 最小LOD级别
+    samplerDesc.MaxLOD = D3D11_FLOAT32_MAX;             // 最大LOD级别
+    
+    hr = m_device->CreateSamplerState(&samplerDesc, m_shadowMapSamplerState.GetAddressOf());
+    if (FAILED(hr))
+    {
+        OutputDebugStringW(L"Failed to create shadow map sampler state.\n");
+        return false;
+    }
+    
+    // Shadow map资源创建成功
+    // 注意：目前不进行任何绘制，只是创建了资源
+    // 后续可以在RenderFrame中渲染shadow map
+    
+    return true;
+}
+
+// ============================================================================
+// 创建Shadow Map Shader
+// ============================================================================
+bool Renderer::CreateShadowMapShaders()
+{
+    // ========================================================================
+    // 编译Shadow Map顶点着色器
+    // ========================================================================
+    Microsoft::WRL::ComPtr<ID3DBlob> vsBlob;
+    if (!CompileShaderFromFile(L"Shaders/ShadowMapVertexShader.hlsl", "VS", "vs_5_0", vsBlob.GetAddressOf()))
+    {
+        OutputDebugStringW(L"Failed to compile ShadowMapVertexShader.hlsl (VS).\n");
+        return false;
+    }
+    
+    HRESULT hr = m_device->CreateVertexShader(
+        vsBlob->GetBufferPointer(),
+        vsBlob->GetBufferSize(),
+        nullptr,
+        m_shadowMapVS.GetAddressOf()
+    );
+    if (FAILED(hr))
+    {
+        OutputDebugStringW(L"Failed to create shadow map vertex shader.\n");
+        return false;
+    }
+    
+    // ========================================================================
+    // 编译Shadow Map像素着色器
+    // ========================================================================
+    Microsoft::WRL::ComPtr<ID3DBlob> psBlob;
+    if (!CompileShaderFromFile(L"Shaders/ShadowMapPixelShader.hlsl", "PS", "ps_5_0", psBlob.GetAddressOf()))
+    {
+        OutputDebugStringW(L"Failed to compile ShadowMapPixelShader.hlsl (PS).\n");
+        return false;
+    }
+    
+    hr = m_device->CreatePixelShader(
+        psBlob->GetBufferPointer(),
+        psBlob->GetBufferSize(),
+        nullptr,
+        m_shadowMapPS.GetAddressOf()
+    );
+    if (FAILED(hr))
+    {
+        OutputDebugStringW(L"Failed to create shadow map pixel shader.\n");
+        return false;
+    }
+    
+    // ========================================================================
+    // 创建Shadow Map输入布局（与标准shader相同）
+    // ========================================================================
+    D3D11_INPUT_ELEMENT_DESC shadowMapLayout[] =
+    {
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "COLOR", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 24, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 36, D3D11_INPUT_PER_VERTEX_DATA, 0 }
+    };
+    
+    hr = m_device->CreateInputLayout(
+        shadowMapLayout,
+        ARRAYSIZE(shadowMapLayout),
+        vsBlob->GetBufferPointer(),
+        vsBlob->GetBufferSize(),
+        m_shadowMapInputLayout.GetAddressOf()
+    );
+    if (FAILED(hr))
+    {
+        OutputDebugStringW(L"Failed to create shadow map input layout.\n");
+        return false;
+    }
+    
+    // ========================================================================
+    // 创建Shadow Map常量缓冲区
+    // ========================================================================
+    D3D11_BUFFER_DESC cbDesc = {};
+    cbDesc.Usage = D3D11_USAGE_DYNAMIC;
+    cbDesc.ByteWidth = sizeof(ShadowConstantBuffer);
+    cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    
+    hr = m_device->CreateBuffer(&cbDesc, nullptr, m_shadowMapConstantBuffer.GetAddressOf());
+    if (FAILED(hr))
+    {
+        OutputDebugStringW(L"Failed to create shadow map constant buffer.\n");
+        return false;
+    }
+    
+    return true;
+}
+
+// ============================================================================
+// 渲染Shadow Map（将角色模型绘制到shadow map）
+// ============================================================================
+void Renderer::RenderShadowMap()
+{
+    
+    // 检查资源是否已创建
+    if (!m_shadowMapDSV || !m_shadowMapVS || !m_shadowMapPS || !m_shadowMapInputLayout || !m_shadowMapConstantBuffer)
+    {
+        static bool resourceWarningLogged = false;
+        if (!resourceWarningLogged)
+        {
+            OutputDebugStringW(L"[ShadowMap] Warning: Shadow map resources not created!\n");
+            if (!m_shadowMapDSV) OutputDebugStringW(L"  - m_shadowMapDSV is null\n");
+            if (!m_shadowMapVS) OutputDebugStringW(L"  - m_shadowMapVS is null\n");
+            if (!m_shadowMapPS) OutputDebugStringW(L"  - m_shadowMapPS is null\n");
+            if (!m_shadowMapInputLayout) OutputDebugStringW(L"  - m_shadowMapInputLayout is null\n");
+            if (!m_shadowMapConstantBuffer) OutputDebugStringW(L"  - m_shadowMapConstantBuffer is null\n");
+            resourceWarningLogged = true;
+        }
+        return;
+    }
+    
+    // 检查是否有模型需要渲染（地形或模型都可以）
+    // 注意：即使没有模型，我们也可以渲染地形
+    std::shared_ptr<MeshGPU> modelGPU = nullptr;
+    if (m_meshMgr)
+    {
+        modelGPU = m_meshMgr->GetMeshGPU("Model");
+        if (!modelGPU)
+        {
+            modelGPU = m_meshMgr->GetMeshGPU("Triangle");
+        }
+    }
+    
+    // 如果没有地形也没有模型，提前返回
+    if (!m_terrain && !modelGPU)
+    {
+        static bool noObjectsWarningLogged = false;
+        if (!noObjectsWarningLogged)
+        {
+            OutputDebugStringW(L"[ShadowMap] Warning: No terrain or model to render!\n");
+            noObjectsWarningLogged = true;
+        }
+        return;
+    }
+    
+    // ========================================================================
+    // 保存当前渲染状态
+    // ========================================================================
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> oldRTV;
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilView> oldDSV;
+    m_context->OMGetRenderTargets(1, oldRTV.GetAddressOf(), oldDSV.GetAddressOf());
+    
+    D3D11_VIEWPORT oldViewport;
+    UINT numViewports = 1;
+    m_context->RSGetViewports(&numViewports, &oldViewport);
+    
+    // ========================================================================
+    // 设置Shadow Map为渲染目标（只使用深度缓冲区，不使用颜色缓冲区）
+    // ========================================================================
+    m_context->OMSetRenderTargets(0, nullptr, m_shadowMapDSV.Get());
+    
+    // ========================================================================
+    // 设置Shadow Map视口
+    // ========================================================================
+    D3D11_VIEWPORT shadowViewport = {};
+    shadowViewport.Width = (float)SHADOW_MAP_SIZE;
+    shadowViewport.Height = (float)SHADOW_MAP_SIZE;
+    shadowViewport.MinDepth = 0.0f;
+    shadowViewport.MaxDepth = 1.0f;
+    shadowViewport.TopLeftX = 0.0f;
+    shadowViewport.TopLeftY = 0.0f;
+    m_context->RSSetViewports(1, &shadowViewport);
+    
+    // ========================================================================
+    // 清空Shadow Map深度缓冲区
+    // ========================================================================
+    m_context->ClearDepthStencilView(m_shadowMapDSV.Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
+    
+    
+    // ========================================================================
+    // 计算光源的视图和投影矩阵
+    // 光源跟随相机，确保始终能看到角色
+    // 注意：这里必须与UpdateConstantBuffers中的计算完全一致
+    // ========================================================================
+    // 获取角色位置（不再需要，因为光源固定看向世界原点）
+    // XMFLOAT3 charPos = GetCharacterPosition();
+    
+    // 使用可控制的光源位置，与黄色立方体位置一致
+    XMVECTOR lightPos = XMVectorSet(m_lightPosition.x, m_lightPosition.y, m_lightPosition.z, 1.0f);
+
+    // 存储光源位置用于调试输出
+    XMFLOAT3 lightPosFloat;
+    XMStoreFloat3(&lightPosFloat, lightPos);
+    float lightX = lightPosFloat.x;
+    float lightY = lightPosFloat.y;
+    float lightZ = lightPosFloat.z;
+
+    // 目标位置固定（世界原点）
+    XMVECTOR targetPos = XMVectorSet(0.0f, 0.0f, 0.0f, 1.0f);
+
+    // 光源向上方向（Y轴正方向）
+    XMVECTOR lightUp = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+
+    // 创建光源视图矩阵
+    XMMATRIX lightView = XMMatrixLookAtLH(lightPos, targetPos, lightUp);
+    
+    // 创建光源投影矩阵（正交投影）
+    // 对于角色阴影，使用适当的投影范围以增加精度
+    // shadowMapSize需要平衡：太小则角色占比大但覆盖范围小，太大则覆盖范围大但角色占比小
+    float shadowMapSize = 50.0f;   // 缩小范围以让角色在阴影贴图中更大（50x50米）
+    float nearPlane = 0.1f;       // 近裁剪平面（靠近光源）
+    float farPlane = 300.0f;      // 远平面（从200米高到地形）
+    XMMATRIX lightProjection = XMMatrixOrthographicLH(shadowMapSize, shadowMapSize, nearPlane, farPlane);
+    
+    // 组合矩阵（注意：这里先不乘以world，world在更新常量缓冲区时再乘）
+    XMMATRIX lightViewProj = lightView * lightProjection;
+    
+    // 调试信息：输出光源视图和投影参数
+    static int shadowMapDebugFrame = 0;
+    if (shadowMapDebugFrame % 300 == 0)  // 每5秒输出一次（假设60fps）
+    {
+        wchar_t debugMsg[512];
+        swprintf_s(debugMsg, L"[ShadowMap] Light view params: pos=(%.2f,%.2f,%.2f), target=(%.2f,%.2f,%.2f), size=%.2f, near=%.2f, far=%.2f\n",
+                  lightX, lightY, lightZ, 0.0f, 0.0f, 0.0f, shadowMapSize, nearPlane, farPlane);
+        OutputDebugStringW(debugMsg);
+    }
+    shadowMapDebugFrame++;
+    
+    // ========================================================================
+    // 设置Shadow Map Shader和输入布局
+    // 注意：对于shadow map，使用null pixel shader，只输出深度值
+    // ========================================================================
+    m_context->IASetInputLayout(m_shadowMapInputLayout.Get());
+    m_context->VSSetShader(m_shadowMapVS.Get(), nullptr, 0);
+    m_context->PSSetShader(nullptr, nullptr, 0);  // 使用null pixel shader，只使用深度缓冲区
+    
+    // 绑定Shadow Map常量缓冲区
+    m_context->VSSetConstantBuffers(0, 1, m_shadowMapConstantBuffer.GetAddressOf());
+    
+    // ========================================================================
+    // 设置光栅化状态（确保正确渲染）
+    // ========================================================================
+    // 保存当前光栅化状态
+    Microsoft::WRL::ComPtr<ID3D11RasterizerState> oldRasterizerState;
+    m_context->RSGetState(oldRasterizerState.GetAddressOf());
+    
+    // 创建shadow map专用的光栅化状态（暂时不使用深度偏移，先确保能绘制）
+    static Microsoft::WRL::ComPtr<ID3D11RasterizerState> shadowMapRasterizerState;
+    if (!shadowMapRasterizerState)
+    {
+        D3D11_RASTERIZER_DESC rasterizerDesc = {};
+        rasterizerDesc.FillMode = D3D11_FILL_SOLID;                    // 实体填充
+        rasterizerDesc.CullMode = D3D11_CULL_BACK;                   // 背面剔除
+        rasterizerDesc.FrontCounterClockwise = FALSE;                // 顺时针为正面
+        rasterizerDesc.DepthBias = 0;                                // 深度偏移（暂时设为0，先确保能绘制）
+        rasterizerDesc.DepthBiasClamp = 0.0f;                        // 深度偏移钳制
+        rasterizerDesc.SlopeScaledDepthBias = 0.0f;                  // 斜率缩放深度偏移（暂时设为0）
+        rasterizerDesc.DepthClipEnable = TRUE;                        // 启用深度裁剪
+        rasterizerDesc.ScissorEnable = FALSE;                         // 不启用裁剪测试
+        rasterizerDesc.MultisampleEnable = FALSE;                     // 不启用多重采样
+        rasterizerDesc.AntialiasedLineEnable = FALSE;                 // 不启用线抗锯齿
+        
+        HRESULT hr = m_device->CreateRasterizerState(&rasterizerDesc, shadowMapRasterizerState.GetAddressOf());
+        if (FAILED(hr))
+        {
+            OutputDebugStringW(L"[ShadowMap] Warning: Failed to create rasterizer state, using default.\n");
+        }
+    }
+    
+    // 设置光栅化状态
+    if (shadowMapRasterizerState)
+    {
+        m_context->RSSetState(shadowMapRasterizerState.Get());
+    }
+    else
+    {
+        // 如果没有创建成功，使用默认状态（nullptr表示使用默认）
+        m_context->RSSetState(nullptr);
+    }
+    
+    // ========================================================================
+    // 设置深度状态（启用深度写入）
+    // 注意：必须在设置光栅化状态之后设置深度状态
+    // ========================================================================
+    // 确保深度测试和深度写入都启用
+    // m_depthStencilState已经配置为：
+    // - DepthEnable = TRUE
+    // - DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL
+    // - DepthFunc = D3D11_COMPARISON_LESS
+    m_context->OMSetDepthStencilState(m_depthStencilState.Get(), 0);
+    
+    // 调试信息：确认深度状态
+    static int depthStateDebugFrame = 0;
+    if (depthStateDebugFrame == 0)  // 只在第一帧输出
+    {
+        OutputDebugStringW(L"[ShadowMap] Depth state: Enabled, WriteMask=ALL, Func=LESS\n");
+    }
+    depthStateDebugFrame++;
+    
+    // ========================================================================
+    // 渲染角色模型到Shadow Map（暂时不渲染地形，因为地形系统需要不同的shader）
+    // ========================================================================
+    if (!modelGPU)
+    {
+        // 如果没有模型，恢复状态并提前返回
+        m_context->RSSetState(oldRasterizerState.Get());
+        m_context->OMSetRenderTargets(1, oldRTV.GetAddressOf(), oldDSV.Get());
+        m_context->RSSetViewports(1, &oldViewport);
+        return;
+    }
+    
+    if (modelGPU)
+    {
+        // 更新Shadow Map常量缓冲区（模型使用变换后的world矩阵）
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        HRESULT hr = m_context->Map(m_shadowMapConstantBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+        if (SUCCEEDED(hr))
+        {
+            ShadowConstantBuffer* cb = (ShadowConstantBuffer*)mapped.pData;
+            
+            // 获取角色位置（用于模型变换）
+            XMFLOAT3 charPos = GetCharacterPosition();
+            
+            // 获取模型的world矩阵（与正常渲染相同）
+            XMMATRIX scale = XMMatrixScaling(0.2f, 0.2f, 0.2f);
+            XMMATRIX rotationX = XMMatrixRotationX(-XM_PI / 2.0f);
+            XMMATRIX rotationY = XMMatrixRotationY(XM_PI);
+            XMMATRIX rotation = rotationX * rotationY;
+            XMMATRIX translation = XMMatrixTranslation(charPos.x, charPos.y, charPos.z);
+            XMMATRIX world = scale * rotation * translation;
+            
+            // 计算模型在光源投影空间的位置（用于调试，检查是否在视锥体内）
+            XMVECTOR modelCenterWorld = XMVectorSet(charPos.x, charPos.y, charPos.z, 1.0f);
+            XMVECTOR modelCenterLightProj = XMVector4Transform(modelCenterWorld, world * lightViewProj);
+            XMFLOAT4 modelCenterLightProjFloat;
+            XMStoreFloat4(&modelCenterLightProjFloat, modelCenterLightProj);
+            
+            // 对于正交投影，w分量应该接近1.0，深度值在[0,1]范围内
+            float depthValue = 0.0f;
+            if (abs(modelCenterLightProjFloat.w) > 0.0001f)
+            {
+                depthValue = modelCenterLightProjFloat.z / modelCenterLightProjFloat.w;
+            }
+            
+            // 调试信息：输出模型在光源投影空间的位置
+            static int debugFrameCount = 0;
+            if (debugFrameCount % 60 == 0)  // 每60帧输出一次
+            {
+                wchar_t debugMsg[512];
+                swprintf_s(debugMsg, L"[ShadowMap] Model center in light proj space: (%.3f, %.3f, %.3f, %.3f), depth=%.3f\n",
+                          modelCenterLightProjFloat.x, modelCenterLightProjFloat.y, 
+                          modelCenterLightProjFloat.z, modelCenterLightProjFloat.w, depthValue);
+                OutputDebugStringW(debugMsg);
+                
+                // 检查是否在视锥体内（对于正交投影，应该在[-1, 1]范围内）
+                bool inFrustum = (modelCenterLightProjFloat.x >= -1.0f && modelCenterLightProjFloat.x <= 1.0f &&
+                                 modelCenterLightProjFloat.y >= -1.0f && modelCenterLightProjFloat.y <= 1.0f &&
+                                 modelCenterLightProjFloat.z >= 0.0f && modelCenterLightProjFloat.z <= 1.0f);
+                
+                swprintf_s(debugMsg, L"[ShadowMap] Model in frustum: %s, Light pos: (%.2f, %.2f, %.2f), Char pos: (%.2f, %.2f, %.2f)\n",
+                          inFrustum ? L"YES" : L"NO", lightX, lightY, lightZ, charPos.x, charPos.y, charPos.z);
+                OutputDebugStringW(debugMsg);
+                
+                // 输出world矩阵信息
+                XMFLOAT4X4 worldMatrix;
+                XMStoreFloat4x4(&worldMatrix, world);
+                swprintf_s(debugMsg, L"[ShadowMap] World matrix scale: (%.3f, %.3f, %.3f), translation: (%.3f, %.3f, %.3f)\n",
+                          worldMatrix._11, worldMatrix._22, worldMatrix._33,
+                          worldMatrix._41, worldMatrix._42, worldMatrix._43);
+                OutputDebugStringW(debugMsg);
+            }
+            debugFrameCount++;
+            
+            // 转置矩阵并存储
+            XMStoreFloat4x4(&cb->world, XMMatrixTranspose(world));
+            XMStoreFloat4x4(&cb->lightView, XMMatrixTranspose(lightView));
+            XMStoreFloat4x4(&cb->lightProjection, XMMatrixTranspose(lightProjection));
+            XMStoreFloat4x4(&cb->lightViewProj, XMMatrixTranspose(world * lightViewProj));
+            
+            m_context->Unmap(m_shadowMapConstantBuffer.Get(), 0);
+        }
+        else
+        {
+            // 如果Map失败，输出错误信息
+            static bool mapErrorLogged = false;
+            if (!mapErrorLogged)
+            {
+                wchar_t msg[256];
+                swprintf_s(msg, L"[ShadowMap] Error: Failed to map constant buffer, HRESULT: 0x%08X\n", hr);
+                OutputDebugStringW(msg);
+                mapErrorLogged = true;
+            }
+        }
+        
+        // 绑定模型并绘制
+        modelGPU->Bind(m_context.Get());
+
+        // 调试信息：输出绘制信息
+        static int drawCallCount = 0;
+        static int debugDrawFrame = 0;
+        if (debugDrawFrame % 60 == 0)  // 每60帧输出一次
+        {
+            wchar_t msg[256];
+            swprintf_s(msg, L"[ShadowMap] Drawing to shadowmap: submeshCount=%d, drawCall=%d\n", 
+                      modelGPU->GetSubmeshCount(), drawCallCount);
+            OutputDebugStringW(msg);
+        }
+        debugDrawFrame++;
+
+        // 检查是否有子网格
+        if (modelGPU->GetSubmeshCount() > 0)
+        {
+            // 绘制所有子网格
+            for (uint32_t i = 0; i < modelGPU->GetSubmeshCount(); ++i)
+            {
+                // 在绘制前确保所有状态都正确设置
+                // 重新设置深度状态（确保深度写入启用）
+                m_context->OMSetDepthStencilState(m_depthStencilState.Get(), 0);
+
+                modelGPU->DrawSubmesh(m_context.Get(), i);
+                drawCallCount++;
+            }
+        }
+        else
+        {
+            // 没有子网格，使用传统方式绘制
+            // 在绘制前确保所有状态都正确设置
+            m_context->OMSetDepthStencilState(m_depthStencilState.Get(), 0);
+
+            modelGPU->Draw(m_context.Get());
+            drawCallCount++;
+        }
+        
+    }
+    
+    // ========================================================================
+    // 恢复光栅化状态
+    // ========================================================================
+    m_context->RSSetState(oldRasterizerState.Get());
+    
+    // ========================================================================
+    // 恢复之前的渲染状态
+    // ========================================================================
+    m_context->OMSetRenderTargets(1, oldRTV.GetAddressOf(), oldDSV.Get());
+    m_context->RSSetViewports(1, &oldViewport);
+}
+
+// ============================================================================
+// 切换相机到光源视角（用于调试shadow map）
+// ============================================================================
+void Renderer::SwitchCameraToLightView()
+{
+    if (!m_camera)
+    {
+        OutputDebugStringW(L"[Renderer] Warning: Cannot switch camera to light view: camera is null.\n");
+        return;
+    }
+    
+    // 光源位置
+    XMFLOAT3 lightPos = m_lightPosition;
+    
+    // 光源目标位置（世界原点，与shadow map计算一致）
+    XMFLOAT3 targetPos(0.0f, 0.0f, 0.0f);
+    
+    // 设置相机到光源位置和方向
+    m_camera->SetPositionAndLookAt(lightPos, targetPos);
+    
+    // 输出调试信息
+    wchar_t msg[256];
+    swprintf_s(msg, L"[Renderer] Camera switched to light view. Position: (%.2f, %.2f, %.2f), Target: (%.2f, %.2f, %.2f)\n",
+               lightPos.x, lightPos.y, lightPos.z, targetPos.x, targetPos.y, targetPos.z);
+    OutputDebugStringW(msg);
 }

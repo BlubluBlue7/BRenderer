@@ -40,6 +40,9 @@ public:
     // 设置相机
     void SetCamera(Camera* camera) { m_camera = camera; }
     
+    // 切换相机到光源视角（用于调试shadow map）
+    void SwitchCameraToLightView();
+    
     // 获取最后的错误信息
     const wchar_t* GetLastError() const { return m_lastError.c_str(); }
     
@@ -64,8 +67,20 @@ public:
     // 切换地形LOD调试可视化模式
     void ToggleTerrainLODDebug();
 
+    // 切换地形深度调试可视化模式
+    void ToggleTerrainDepthDebug();
+
+    // 切换地形阴影调试可视化模式
+    void ToggleTerrainShadowDebug();
+
     // 获取地形
     TerrainNew* GetTerrain() const { return m_terrain; }
+
+    // 获取角色位置（用于绘制模型）
+    DirectX::XMFLOAT3 GetCharacterPosition() const;
+
+    // 处理键盘输入（用于控制光源移动）
+    void HandleKeyboardInput(float deltaTime, bool keyW, bool keyA, bool keyS, bool keyD);
 
 private:
     // 从文件编译 Shader
@@ -96,6 +111,13 @@ private:
     Microsoft::WRL::ComPtr<ID3D11VertexShader>    m_skyboxVS;
     Microsoft::WRL::ComPtr<ID3D11PixelShader>     m_skyboxPS;
     Microsoft::WRL::ComPtr<ID3D11InputLayout>     m_skyboxInputLayout;
+
+    // 光源可视化椎体相关资源
+    Microsoft::WRL::ComPtr<ID3D11Buffer>          m_lightCubeVertexBuffer;
+    Microsoft::WRL::ComPtr<ID3D11Buffer>          m_lightCubeIndexBuffer;
+    Microsoft::WRL::ComPtr<ID3D11VertexShader>    m_lightCubeVS;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader>     m_lightCubePS;
+    UINT                                        m_lightConeIndexCount;     // 椎体索引数量
     
     // 地形相关shader资源
     Microsoft::WRL::ComPtr<ID3D11VertexShader>    m_terrainVS;
@@ -128,6 +150,17 @@ private:
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_brdfLutSRV;         // BRDF查找表（用于镜面反射IBL）
     float m_environmentMapIntensity = 1.0f;  // 环境贴图强度
     
+    // Shadow Map相关资源
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_shadowMapTexture;           // Shadow map纹理
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilView> m_shadowMapDSV;         // Shadow map深度视图
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_shadowMapSRV;      // Shadow map着色器资源视图
+    Microsoft::WRL::ComPtr<ID3D11SamplerState> m_shadowMapSamplerState;   // Shadow map采样器状态
+    Microsoft::WRL::ComPtr<ID3D11VertexShader> m_shadowMapVS;             // Shadow map顶点着色器
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> m_shadowMapPS;              // Shadow map像素着色器
+    Microsoft::WRL::ComPtr<ID3D11InputLayout> m_shadowMapInputLayout;     // Shadow map输入布局
+    Microsoft::WRL::ComPtr<ID3D11Buffer> m_shadowMapConstantBuffer;       // Shadow map常量缓冲区
+    static const UINT SHADOW_MAP_SIZE = 4096;  // Shadow map分辨率
+    
     MeshMgr* m_meshMgr;
     Camera* m_camera = nullptr;  // 相机指针
     
@@ -137,24 +170,15 @@ private:
     // 草地系统相关
     GrassSystem* m_grassSystem = nullptr;  // 草地系统对象
     
-    // Shadow Map相关资源
-    static const int SHADOW_MAP_SIZE = 2048;  // Shadow map分辨率
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_shadowMapTexture;  // Shadow map纹理
-    Microsoft::WRL::ComPtr<ID3D11DepthStencilView> m_shadowMapDSV;  // Shadow map深度视图
-    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_shadowMapSRV;  // Shadow map着色器资源视图
-    Microsoft::WRL::ComPtr<ID3D11SamplerState> m_shadowMapSampler;  // Shadow map采样器（PCF）
-    Microsoft::WRL::ComPtr<ID3D11RasterizerState> m_shadowMapRasterizerState;  // Shadow map光栅化状态（启用深度偏移）
-    Microsoft::WRL::ComPtr<ID3D11VertexShader> m_shadowVS;  // Shadow pass顶点着色器
-    Microsoft::WRL::ComPtr<ID3D11PixelShader> m_shadowPS;  // Shadow pass像素着色器
-    Microsoft::WRL::ComPtr<ID3D11Buffer> m_shadowConstantBuffer;  // Shadow pass常量缓冲区
-    Microsoft::WRL::ComPtr<ID3D11InputLayout> m_shadowInputLayout;  // Shadow pass输入布局
-
     int m_width = 0;
     int m_height = 0;
     std::wstring m_lastError;  // 最后的错误信息
     float m_lightRotationTime = 0.0f;  // 光源旋转累积时间
     bool m_lightRotationPaused = false;  // 光源旋转是否暂停
     bool m_terrainWireframe = false;  // 地形是否使用线框模式
+
+    // 光源位置（可通过方向键控制移动，默认位于地形中心正上方）
+    DirectX::XMFLOAT3 m_lightPosition = DirectX::XMFLOAT3(0.0f, 200.0f, 0.0f);
     
     // DirectWrite文字渲染相关
     Microsoft::WRL::ComPtr<IDWriteFactory> m_dwriteFactory;
@@ -194,6 +218,13 @@ private:
     // 天空盒相关函数
     bool CreateSkyboxShaders();  // 创建天空盒shader
     bool CreateSkyboxGeometry();  // 创建天空盒几何体
+
+    // 光源可视化相关
+    bool CreateLightVisualizationShaders();  // 创建光源可视化shader
+    bool CreateLightVisualizationGeometry(); // 创建光源可视化椎体几何体
+    void RenderLightVisualization(const DirectX::XMFLOAT3& lightPos); // 渲染光源可视化椎体
+
+    // 阴影调试相关
     bool CreateSkyboxDepthState();  // 创建天空盒深度状态
     void RenderSkybox();  // 渲染天空盒
     
@@ -209,8 +240,8 @@ private:
     
     // Shadow Map相关函数
     bool CreateShadowMap();  // 创建shadow map资源
-    bool CreateShadowShaders();  // 创建shadow pass shader
-    void RenderShadowMap();  // 渲染shadow map（从光源视角）
+    bool CreateShadowMapShaders();  // 创建shadow map shader
+    void RenderShadowMap();  // 渲染shadow map（将角色模型绘制到shadow map）
     
     // 文字渲染相关函数
     bool InitializeTextRendering();  // 初始化DirectWrite文字渲染
@@ -218,8 +249,5 @@ private:
     void UpdateFPS(float deltaTime);  // 更新FPS
     void UpdateTriangleCount();  // 更新面数统计
 private:
-    // 内部辅助函数（使用void*避免XMMATRIX类型在头文件中的问题）
-    void GetLightViewMatrixImpl(void* outMatrix) const;  // 获取光源视图矩阵（outMatrix是XMMATRIX*）
-    void GetLightProjectionMatrixImpl(void* outMatrix) const;  // 获取光源投影矩阵（outMatrix是XMMATRIX*）
 public:
 };

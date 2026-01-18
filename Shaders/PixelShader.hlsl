@@ -239,7 +239,8 @@ float4 PS(PSInput input) : SV_TARGET
     float3 V = normalize(cameraPosition.xyz - input.worldPos);
     // 光源方向（从表面指向光源）
     // 注意：lightDirection是float4，只使用xyz分量
-    float3 L = normalize(-lightDirection.xyz);  // 假设lightDirection是从表面指向光源
+    // lightDirection存储的是从表面指向光源的方向，直接用于光照计算
+    float3 L = normalize(lightDirection.xyz);  // 从表面指向光源的方向
     
     // 半角向量（视角方向和光源方向的中间向量）
     float3 H = normalize(V + L);
@@ -451,5 +452,6 @@ float4 PS(PSInput input) : SV_TARGET
     // 最终亮度增强（确保画面足够亮）
     // finalColor = finalColor * 1.3f;  // 整体亮度提升30%
     
+    // 原始PBR渲染（角色正常渲染，不受阴影调试影响）
     return float4(finalColor, baseColorSample.a);
 }

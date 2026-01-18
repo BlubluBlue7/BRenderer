@@ -30,6 +30,8 @@ TerrainNew::TerrainNew()
     , m_chunkCountZ(0)
     , m_useGPUDriven(false)  // 默认使用CPU Driven，GPU Driven需要手动启用
     , m_showLODDebug(false)  // 默认不显示LOD调试（正常渲染模式）
+    , m_showDepthDebug(false) // 默认不显示深度调试（正常渲染模式）
+    , m_showShadowDebug(false) // 默认不显示阴影调试（正常渲染模式）
 {
 }
 
@@ -1617,15 +1619,15 @@ void TerrainNew::Render(ID3D11DeviceContext* context, const DirectX::XMFLOAT3& c
         // 绑定chunk常量缓冲区到顶点着色器 slot 2
         ID3D11Buffer* cb_ptr = m_chunkConstantBuffer.Get();
         context->VSSetConstantBuffers(2, 1, &cb_ptr);
-        
+
         // 更新并绑定地形调试常量缓冲区到像素着色器 slot 3
         D3D11_MAPPED_SUBRESOURCE debugMapped;
         if (SUCCEEDED(context->Map(m_terrainDebugBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &debugMapped)))
         {
             float* debugData = static_cast<float*>(debugMapped.pData);
             debugData[0] = m_showLODDebug ? 1.0f : 0.0f;  // showLODDebug
-            debugData[1] = 0.0f;  // padding
-            debugData[2] = 0.0f;  // padding
+            debugData[1] = m_showDepthDebug ? 1.0f : 0.0f; // showDepthDebug
+            debugData[2] = m_showShadowDebug ? 1.0f : 0.0f; // showShadowDebug
             debugData[3] = 0.0f;  // padding
             context->Unmap(m_terrainDebugBuffer.Get(), 0);
         }
@@ -2382,14 +2384,14 @@ void TerrainNew::RenderGPUDriven(ID3D11DeviceContext* context, const DirectX::XM
         {
             float* debugData = static_cast<float*>(debugMapped.pData);
             debugData[0] = m_showLODDebug ? 1.0f : 0.0f;  // showLODDebug
-            debugData[1] = 0.0f;  // padding
-            debugData[2] = 0.0f;  // padding
+            debugData[1] = m_showDepthDebug ? 1.0f : 0.0f; // showDepthDebug
+            debugData[2] = m_showShadowDebug ? 1.0f : 0.0f; // showShadowDebug
             debugData[3] = 0.0f;  // padding
             context->Unmap(m_terrainDebugBuffer.Get(), 0);
         }
         ID3D11Buffer* debugCb_ptr = m_terrainDebugBuffer.Get();
         context->PSSetConstantBuffers(3, 1, &debugCb_ptr);
-        
+
         // 执行间接绘制
         // 注意：DrawIndexedInstancedIndirect会自动从drawCommandsBuffer读取绘制参数
         context1Raw->DrawIndexedInstancedIndirect(m_drawCommandsBuffer.Get(), 0);

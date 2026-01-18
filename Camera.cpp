@@ -18,7 +18,8 @@ inline float clamp(float value, float min, float max)
 // ============================================================================
 Camera::Camera()
     : m_position(0.0f, 100.0f, 0.0f)     // 初始位置：地形中心附近，高度待地形查询后设置
-    , m_pitch(-0.2f)                      // 初始俯仰角：稍微向下看（第一人称视角）
+    , m_characterPosition(0.0f, 0.0f, 0.0f)  // 角色初始位置：地形中心
+    , m_pitch(-0.3f)                      // 初始俯仰角：稍微向下看（第三人称视角）
     , m_yaw(0.0f)                         // 初始偏航角：朝向+X方向
     , m_moveSpeed(10.0f)                  // 移动速度：10米/秒（适合角色移动）
     , m_rotationSpeed(2.0f)               // 旋转速度：2弧度/秒
@@ -31,6 +32,8 @@ Camera::Camera()
     , m_moveDown(false)
     , m_characterHeight(1.7f)             // 角色高度：1.7米（眼睛高度）
     , m_followTerrain(true)               // 默认启用地形跟随
+    , m_thirdPersonDistance(5.0f)         // 第三人称相机距离：5米
+    , m_thirdPersonHeight(5.0f)           // 第三人称相机高度偏移：5米（再抬高2米）
 {
 }
 
@@ -81,7 +84,7 @@ void Camera::Update(float deltaTime)
     // 根据地形跟随模式处理移动
     if (m_followTerrain)
     {
-        // 地形跟随模式：只允许水平移动，垂直位置由地形高度决定
+        // 地形跟随模式（第三人称视角）：控制角色移动，相机跟随角色
         // 忽略上下移动（Space/Ctrl）
         
         // 归一化移动方向并应用速度
@@ -90,27 +93,25 @@ void Camera::Update(float deltaTime)
         if (length > 0.0001f)
         {
             moveDir = XMVector3Normalize(moveDir);
-            XMVECTOR position = XMLoadFloat3(&m_position);
+            XMVECTOR charPos = XMLoadFloat3(&m_characterPosition);
             
-            // 只更新X和Z坐标（水平移动）
+            // 只更新角色X和Z坐标（水平移动）
             XMVECTOR horizontalMove = XMVectorScale(moveDir, m_moveSpeed * deltaTime);
             horizontalMove = XMVectorSetY(horizontalMove, 0.0f);  // 确保Y分量为0
-            position = XMVectorAdd(position, horizontalMove);
-            XMStoreFloat3(&m_position, position);
+            charPos = XMVectorAdd(charPos, horizontalMove);
+            XMStoreFloat3(&m_characterPosition, charPos);
             
-            // 查询地形高度并设置相机高度
-            if (m_terrain)
-            {
-                float terrainHeight = m_terrain->GetHeightAt(m_position.x, m_position.z);
-                m_position.y = terrainHeight + m_characterHeight;
-            }
+            // 查询地形高度并设置角色高度
+            UpdateCharacterHeight();
         }
         else if (m_terrain)
         {
             // 即使没有移动，也更新高度（处理地形变化的情况）
-            float terrainHeight = m_terrain->GetHeightAt(m_position.x, m_position.z);
-            m_position.y = terrainHeight + m_characterHeight;
+            UpdateCharacterHeight();
         }
+        
+        // 更新相机位置（第三人称视角：相机跟随角色）
+        UpdateCameraPositionForThirdPerson();
     }
     else
     {
@@ -142,11 +143,26 @@ void Camera::Update(float deltaTime)
 // ============================================================================
 XMMATRIX Camera::GetViewMatrix() const
 {
-    XMFLOAT3 forward = GetForwardVector();
     XMFLOAT3 up = GetUpVector();
     
     XMVECTOR eye = XMLoadFloat3(&m_position);
-    XMVECTOR at = XMVectorAdd(eye, XMLoadFloat3(&forward));
+    
+    // 第三人称视角：相机朝向角色
+    // 第一人称视角：相机朝向前方向
+    XMVECTOR at;
+    if (m_followTerrain)
+    {
+        // 第三人称视角：朝向角色
+        at = XMLoadFloat3(&m_characterPosition);
+        at = XMVectorSetY(at, m_characterPosition.y + m_characterHeight);  // 看向角色眼睛位置
+    }
+    else
+    {
+        // 第一人称视角：朝向前方向
+        XMFLOAT3 forward = GetForwardVector();
+        at = XMVectorAdd(eye, XMLoadFloat3(&forward));
+    }
+    
     XMVECTOR upVec = XMLoadFloat3(&up);
     
     return XMMatrixLookAtLH(eye, at, upVec);
@@ -223,5 +239,104 @@ XMFLOAT3 Camera::GetRightVector() const
 XMFLOAT3 Camera::GetUpVector() const
 {
     return XMFLOAT3(0.0f, 1.0f, 0.0f);
+}
+
+// ============================================================================
+// 设置地形引用并初始化高度
+// ============================================================================
+void Camera::SetTerrain(TerrainNew* terrain)
+{
+    m_terrain = terrain;
+    
+    // 如果启用了地形跟随，立即更新角色高度和相机位置
+    if (m_terrain && m_followTerrain)
+    {
+        UpdateCharacterHeight();
+        UpdateCameraPositionForThirdPerson();
+    }
+    else if (m_terrain)
+    {
+        // 第一人称视角时，只更新相机高度
+        UpdateHeight();
+    }
+}
+
+// ============================================================================
+// 更新高度（根据当前XZ位置查询地形高度）
+// ============================================================================
+void Camera::UpdateHeight()
+{
+    if (m_terrain)
+    {
+        float terrainHeight = m_terrain->GetHeightAt(m_position.x, m_position.z);
+        m_position.y = terrainHeight + m_characterHeight;
+    }
+}
+
+// ============================================================================
+// 更新角色高度（根据角色XZ位置查询地形高度）
+// ============================================================================
+void Camera::UpdateCharacterHeight()
+{
+    if (m_terrain)
+    {
+        float terrainHeight = m_terrain->GetHeightAt(m_characterPosition.x, m_characterPosition.z);
+        m_characterPosition.y = terrainHeight;  // 角色位置在地面上（脚部）
+    }
+}
+
+// ============================================================================
+// 更新相机位置（第三人称视角时，相机跟随角色）
+// ============================================================================
+void Camera::UpdateCameraPositionForThirdPerson()
+{
+    // 计算相机的目标位置：在角色后方一定距离
+    // 使用相机的偏航角来确定相机在角色后方的方向
+    
+    // 相机相对于角色的偏移方向（在角色后方）
+    float offsetX = -sinf(m_yaw) * m_thirdPersonDistance;
+    float offsetZ = -cosf(m_yaw) * m_thirdPersonDistance;
+    float offsetY = m_thirdPersonHeight;
+    
+    // 计算相机位置（角色位置 + 偏移）
+    m_position.x = m_characterPosition.x + offsetX;
+    m_position.y = m_characterPosition.y + offsetY;
+    m_position.z = m_characterPosition.z + offsetZ;
+    
+    // 相机朝向角色
+    // GetViewMatrix会根据相机位置和朝向计算视图矩阵，所以这里只需要更新位置
+}
+
+// ============================================================================
+// 设置相机位置和朝向（从位置看向目标点）
+// ============================================================================
+void Camera::SetPositionAndLookAt(const DirectX::XMFLOAT3& position, const DirectX::XMFLOAT3& target)
+{
+    // 设置相机位置
+    m_position = position;
+    
+    // 计算从位置到目标的方向向量
+    XMVECTOR posVec = XMLoadFloat3(&position);
+    XMVECTOR targetVec = XMLoadFloat3(&target);
+    XMVECTOR direction = XMVectorSubtract(targetVec, posVec);
+    direction = XMVector3Normalize(direction);
+    
+    // 提取方向向量的分量
+    XMFLOAT3 dirFloat;
+    XMStoreFloat3(&dirFloat, direction);
+    
+    // 根据方向向量计算yaw（水平旋转）
+    // yaw = atan2(x, z)
+    m_yaw = atan2f(dirFloat.x, dirFloat.z);
+    
+    // 根据方向向量计算pitch（垂直旋转）
+    // pitch = asin(y)（因为方向向量已归一化）
+    m_pitch = asinf(dirFloat.y);
+    
+    // 限制pitch范围（避免翻转）
+    m_pitch = clamp(m_pitch, -XM_PI / 2.0f + 0.1f, XM_PI / 2.0f - 0.1f);
+    
+    // 禁用地形跟随模式，使用自由相机模式
+    m_followTerrain = false;
 }
 

@@ -140,12 +140,11 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
     // 注意：地形在 Initialize 中创建，所以需要在地形初始化之后设置
     if (renderer.GetTerrain())
     {
-        camera.SetTerrain(renderer.GetTerrain());
         camera.SetCharacterHeight(1.7f);  // 设置角色高度为1.7米（眼睛高度）
         camera.SetFollowTerrain(true);    // 启用地形跟随
+        camera.SetTerrain(renderer.GetTerrain());  // 设置地形引用（会自动初始化高度）
         
-        // 初始化相机位置：设置在地形中心附近，高度会在第一帧 Update 时自动调整
-        // 相机位置会在第一帧 Update 时自动调整到地形高度 + 角色高度
+        // 相机位置已通过SetTerrain自动初始化到地形高度 + 角色高度
     }
 
     // ========================================================================
@@ -161,8 +160,16 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
         camera.OnMouseWheel(delta);
     });
 
-    // 键盘回调：WASD 移动相机，P键暂停/继续光源旋转
-    window.SetKeyCallback([&camera, &renderer](int key, bool pressed) {
+    // 键盘回调：WASD 移动相机，方向键移动光源，P键暂停/继续光源旋转
+    // 方向键状态结构体
+    struct KeyStates {
+        bool up = false;
+        bool down = false;
+        bool left = false;
+        bool right = false;
+    } keyStates;
+
+    window.SetKeyCallback([&camera, &renderer, &keyStates](int key, bool pressed) {
         switch (key)
         {
         case 'W':
@@ -180,6 +187,18 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
         case 'D':
         case 'd':
             camera.SetMoveRight(pressed);
+            break;
+        case VK_UP:
+            keyStates.up = pressed;
+            break;
+        case VK_DOWN:
+            keyStates.down = pressed;
+            break;
+        case VK_LEFT:
+            keyStates.left = pressed;
+            break;
+        case VK_RIGHT:
+            keyStates.right = pressed;
             break;
         case VK_SPACE:
             camera.SetMoveUp(pressed);
@@ -203,12 +222,36 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
                 renderer.ToggleTerrainLODLock();
             }
             break;
+        case 'K':
+        case 'k':
+            // K键：切换相机到光源视角（用于调试shadow map）
+            if (pressed)
+            {
+                renderer.SwitchCameraToLightView();
+            }
+            break;
         case 'N':
         case 'n':
             // N键：切换地形LOD调试可视化模式
             if (pressed)
             {
                 renderer.ToggleTerrainLODDebug();
+            }
+            break;
+        case 'B':
+        case 'b':
+            // B键：切换地形深度调试可视化模式
+            if (pressed)
+            {
+                renderer.ToggleTerrainDepthDebug();
+            }
+            break;
+        case 'H':
+        case 'h':
+            // H键：切换地形阴影调试模式
+            if (pressed)
+            {
+                renderer.ToggleTerrainShadowDebug();
             }
             break;
         case '1':
@@ -281,7 +324,10 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
         
         // 更新相机（基于输入和 deltaTime）
         camera.Update(deltaTime);
-        
+
+        // 处理光源控制输入（方向键）
+        renderer.HandleKeyboardInput(deltaTime, keyStates.up, keyStates.left, keyStates.down, keyStates.right);
+
         // 渲染一帧（清屏、绘制模型、交换缓冲区）
         renderer.RenderFrame(deltaTime);
     }
@@ -291,7 +337,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
     // 释放所有 D3D11 资源
     // ========================================================================
     renderer.Cleanup();
-    
+
     // 清理COM
     CoUninitialize();
     

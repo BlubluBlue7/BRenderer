@@ -300,6 +300,16 @@ public:
     void ToggleLODDebug() { m_showLODDebug = !m_showLODDebug; }
     void SetLODDebug(bool show) { m_showLODDebug = show; }
     bool IsLODDebugEnabled() const { return m_showLODDebug; }
+
+    // 切换深度调试可视化模式
+    void ToggleDepthDebug() { m_showDepthDebug = !m_showDepthDebug; }
+    void SetDepthDebug(bool show) { m_showDepthDebug = show; }
+    bool IsDepthDebugEnabled() const { return m_showDepthDebug; }
+
+    // 切换阴影调试可视化模式
+    void ToggleShadowDebug() { m_showShadowDebug = !m_showShadowDebug; }
+    void SetShadowDebug(bool show) { m_showShadowDebug = show; }
+    bool IsShadowDebugEnabled() const { return m_showShadowDebug; }
     
     // 获取统计信息
     struct RenderStats
@@ -434,6 +444,8 @@ private:
     
     // LOD调试可视化
     bool m_showLODDebug;  // 是否显示LOD调试颜色
+    bool m_showDepthDebug; // 是否显示深度调试
+    bool m_showShadowDebug; // 是否显示阴影调试
     
     // GPU端Structured Buffer
     Microsoft::WRL::ComPtr<ID3D11Buffer> m_chunkDataBuffer;          // Chunk数据（SRV）

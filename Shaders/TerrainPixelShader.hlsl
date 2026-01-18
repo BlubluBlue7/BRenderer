@@ -59,8 +59,8 @@ cbuffer LightBuffer : register(b1)
 cbuffer TerrainDebugBuffer : register(b3)
 {
     float showLODDebug;       // 是否显示LOD调试颜色 (1.0 = 显示, 0.0 = 不显示)
-    float paddingDebug1;
-    float paddingDebug2;
+    float showDepthDebug;     // 是否显示深度调试 (1.0 = 显示光源空间深度, 0.0 = 正常渲染)
+    float showShadowDebug;    // 是否显示阴影调试 (1.0 = 显示黑白阴影图, 0.0 = 正常渲染)
     float paddingDebug3;
 };
 
@@ -190,37 +190,43 @@ float4 PS(PSInput input) : SV_TARGET
     
     // 将世界坐标转换到光源空间
     float4 lightSpacePos = mul(float4(input.worldPos, 1.0), lightWorldViewProj);
-    
+        // 直接转换到NDC空间（-1到1）
+    // 注意：正交投影的lightSpacePos已经在NDC空间附近，只需要确保在[-1,1]范围内
+    float3 ndcPos = lightSpacePos.xyz;
+
+    // 可选：缩放和平移以更好地观察
+    float2 uv = ndcPos.xy * 0.5 + 0.5;  // 转换到[0,1]范围
+    float depth = ndcPos.z;  // 正交投影的深度通常是[0,1]或[-1,1]
+
     // 透视除法
-    float w = lightSpacePos.w;
-    if (abs(w) > 0.0001)  // 避免除零
-    {
-        lightSpacePos.xyz /= w;
-    }
+    lightSpacePos.xyz /= lightSpacePos.w;
     
     // 转换到纹理坐标（0-1范围）
+    // 对于正交投影，NDC坐标范围是[-1, 1]，需要转换到[0, 1]
     float2 shadowUV = lightSpacePos.xy * 0.5 + 0.5;
-    shadowUV.y = 1.0 - shadowUV.y;  // 翻转Y轴
+    shadowUV.y = 1.0 - shadowUV.y;  // 翻转Y轴（DirectX纹理坐标Y轴向下）
     
-    // 检查是否在shadow map范围内（使用更宽松的范围检查）
+    // 检查是否在shadow map范围内（使用更宽松的范围检查，与角色着色器一致）
     if (shadowUV.x >= -0.1 && shadowUV.x <= 1.1 && shadowUV.y >= -0.1 && shadowUV.y <= 1.1)
     {
-        // 深度值（在光源空间中的深度，需要归一化到0-1范围）
-        // 对于正交投影，深度值已经在0-1范围内
+        // 深度值（在光源空间中的深度，对于正交投影，NDC的z值在[0, 1]范围内）
         float lightDepth = lightSpacePos.z;
         
         // 确保深度值在有效范围内
         if (lightDepth >= 0.0 && lightDepth <= 1.0)
         {
             // 添加深度偏移，减少阴影痤疮
+            // 注意：深度偏移对于避免阴影痤疮很重要，但如果太大可能导致漏光
+            // 与角色着色器使用相同的偏移值
             lightDepth -= 0.0005;
+            lightDepth = max(lightDepth, 0.0);  // 确保深度值不为负
             
             // 限制UV在有效范围内
             shadowUV = saturate(shadowUV);
             
             // 使用PCF采样shadow map（3x3采样，9个样本）
             float shadowSum = 0.0;
-            float texelSize = 1.0 / 2048.0;  // Shadow map分辨率
+            float texelSize = 1.0 / 4096.0;  // Shadow map分辨率
             
             for (int x = -1; x <= 1; ++x)
             {
@@ -231,37 +237,45 @@ float4 PS(PSInput input) : SV_TARGET
                     // 确保采样UV在有效范围内
                     if (sampleUV.x >= 0.0 && sampleUV.x <= 1.0 && sampleUV.y >= 0.0 && sampleUV.y <= 1.0)
                     {
+                        // SampleCmpLevelZero返回0.0（在阴影中）或1.0（不在阴影中）
                         shadowSum += shadowMap.SampleCmpLevelZero(shadowSampler, sampleUV, lightDepth);
                     }
                     else
                     {
-                        // 边界外视为不在阴影中
+                        // 边界外视为不在阴影中（返回1.0表示不在阴影中）
                         shadowSum += 1.0;
                     }
                 }
             }
             
-            shadowFactor = shadowSum / 9.0;  // 9个样本的平均值
+            // 计算平均值（固定9个样本，与角色着色器一致）
+            shadowFactor = shadowSum / 9.0;
         }
     }
     
     // ========================================================================
     // 光照计算
     // ========================================================================
-    float3 lightDir = normalize(-lightDirection.xyz);
+    // 光源方向（从表面指向光源）
+    // lightDirection存储的是从表面指向光源的方向，直接用于光照计算
+    float3 lightDir = normalize(lightDirection.xyz);
     float NdotL = max(dot(normal, lightDir), 0.0);
     
     // 环境光遮蔽（简化版，基于法线Y分量）
     float ao = saturate(normal.y * 0.5 + 0.5);
     
-    // 环境光
-    float3 ambient = heightColor * 0.35 * ao;
+    // 环境光（基础亮度，即使在阴影中也应该有基础光照）
+    // 使用更合理的环境光强度，确保阴影区域不会太暗
+    float3 ambient = heightColor * 0.3;
     
     // 漫反射（应用阴影）
-    float3 diffuse = heightColor * NdotL * lightIntensity * 0.65 * shadowFactor;
-    
-    // 合成颜色
-    float3 finalColor = ambient + diffuse;
+    // 调整光照计算：使用更合理的光照强度，避免过曝
+    // shadowFactor=1时，ambient+diffuse总和应该接近heightColor但不超过
+    // shadowFactor=0时，只有ambient，应该足够暗但仍然可见（不是纯黑）
+    // 使用lerp在阴影和非阴影之间平滑过渡
+    float3 litColor = heightColor * (0.3 + NdotL * lightIntensity * 0.4);  // 非阴影时的颜色
+    float3 shadowColor = heightColor * 0.3;  // 阴影时的颜色（纯环境光）
+    float3 finalColor = lerp(shadowColor, litColor, shadowFactor);
     
     // ========================================================================
     // 大气透视/雾效果（可选，适配大规模地形）
@@ -295,7 +309,102 @@ float4 PS(PSInput input) : SV_TARGET
     // 否则使用正常渲染（不显示LOD颜色）
     
     // ========================================================================
-    // 输出
+    // 调试选项：将地形渲染为光源空间下的深度值
+    // ========================================================================
+    if (showDepthDebug > 0.5)
+    {
+        // 将世界坐标转换到光源视图空间
+        float4 lightViewPos = mul(float4(input.worldPos, 1.0), lightView);
+
+        // lightViewPos.z 是光源视图空间中的深度值
+        float depth = lightViewPos.z;
+
+        // 显示原始深度值（带符号）
+        // 正值显示为绿色，负值显示为红色，零显示为蓝色
+        if (depth > 0.1) {
+            // 正深度：绿色，亮度表示大小
+            float intensity = saturate(depth / 100.0);
+            return float4(0, intensity, 0, 1.0);
+        } else if (depth < -0.1) {
+            // 负深度：红色，亮度表示大小
+            float intensity = saturate(-depth / 100.0);
+            return float4(intensity, 0, 0, 1.0);
+        } else {
+            // 接近零的深度：蓝色
+            return float4(0, 0, 1, 1.0);
+        }
+    }
+
+    // ========================================================================
+    // 阴影调试模式：将地形渲染为黑白阴影图
+    // ========================================================================
+    if (showShadowDebug > 0.5)
+    {
+        // 计算阴影因子（复用角色着色器的阴影计算逻辑）
+        float shadowFactor = 1.0;  // 1.0 = 不在阴影中，0.0 = 在阴影中
+
+        // 将世界坐标转换到光源空间
+        float4 lightSpacePos = mul(float4(input.worldPos, 1.0), lightWorldViewProj);
+
+        // 透视除法
+        lightSpacePos.xyz /= lightSpacePos.w;
+
+        // 转换到纹理坐标（0-1范围）
+        float2 shadowUV = lightSpacePos.xy * 0.5 + 0.5;
+        shadowUV.y = 1.0 - shadowUV.y;  // 翻转Y轴
+
+        // 检查是否在shadow map范围内
+        if (shadowUV.x >= -0.1 && shadowUV.x <= 1.1 && shadowUV.y >= -0.1 && shadowUV.y <= 1.1)
+        {
+            // 深度值
+            float lightDepth = lightSpacePos.z;
+
+            // 确保深度值在有效范围内
+            if (lightDepth >= 0.0 && lightDepth <= 1.0)
+            {
+                // 添加深度偏移
+                lightDepth -= 0.0005;
+
+                // 限制UV在有效范围内
+                shadowUV = saturate(shadowUV);
+
+                // 使用PCF采样shadow map（3x3采样，9个样本）
+                float shadowSum = 0.0;
+                float texelSize = 1.0 / 4096.0;  // Shadow map分辨率
+
+                for (int x = -1; x <= 1; ++x)
+                {
+                    for (int y = -1; y <= 1; ++y)
+                    {
+                        float2 offset = float2(x, y) * texelSize;
+                        float2 sampleUV = shadowUV + offset;
+                        // 确保采样UV在有效范围内
+                        if (sampleUV.x >= 0.0 && sampleUV.x <= 1.0 && sampleUV.y >= 0.0 && sampleUV.y <= 1.0)
+                        {
+                            shadowSum += shadowMap.SampleCmpLevelZero(shadowSampler, sampleUV, lightDepth);
+                        }
+                        else
+                        {
+                            // 边界外视为不在阴影中
+                            shadowSum += 1.0;
+                        }
+                    }
+                }
+
+                shadowFactor = shadowSum / 9.0;  // 9个样本的平均值
+            }
+        }
+
+        // 黑白阴影图：非阴影部分白色，阴影区域黑色
+        if (shadowFactor > 0.5) {
+            return float4(1.0, 1.0, 1.0, 1.0); // 白色：非阴影
+        } else {
+            return float4(0.0, 0.0, 0.0, 1.0); // 黑色：阴影
+        }
+    }
+
+    // ========================================================================
+    // 正常渲染模式
     // ========================================================================
     return float4(saturate(finalColor), 1.0);
 }
