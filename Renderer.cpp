@@ -640,8 +640,7 @@ void Renderer::RenderFrame(float deltaTime)
     // ========================================================================
     // 步骤 6.6: 渲染草地系统（在地形之后渲染）
     // ========================================================================
-    // 暂时关闭草地渲染，方便查看地形
-    // RenderGrassSystem(deltaTime);
+    RenderGrassSystem(deltaTime);
 
     // ========================================================================
     // 步骤 6.7: 渲染光源可视化立方体
@@ -2117,13 +2116,18 @@ void Renderer::UpdateConstantBuffers(float deltaTime)
         
         // 创建变换矩阵（使用 XMMATRIX 进行计算）
         // 世界矩阵：物体在世界空间中的位置和方向
-        // 应用0.2倍缩放，使模型放大10倍（原来的一半）
-        XMMATRIX scale = XMMatrixScaling(0.2f, 0.2f, 0.2f);
+        // 应用0.02倍缩放，使模型缩小10倍（原来是0.2倍，现在缩小到0.02倍）
+        XMMATRIX scale = XMMatrixScaling(0.02f, 0.02f, 0.02f);
         // 旋转模型摆正：从头顶看向脚底 -> 正常视角
         // 绕X轴旋转-90度（顺时针90度），让模型从躺着的状态变成站着的状态
         XMMATRIX rotationX = XMMatrixRotationX(-XM_PI / 2.0f);  // -90度 = -π/2弧度
-        // 绕Y轴旋转180度，让角色朝向相反方向
-        XMMATRIX rotationY = XMMatrixRotationY(XM_PI);  // 180度 = π弧度
+        // 绕Y轴旋转：使用角色朝向（m_characterYaw）
+        float characterYaw = 0.0f;
+        if (m_camera)
+        {
+            characterYaw = m_camera->GetCharacterYaw();
+        }
+        XMMATRIX rotationY = XMMatrixRotationY(characterYaw);  // 角色朝向
         XMMATRIX rotation = rotationX * rotationY;  // 先X轴旋转，再Y轴旋转
         // 使用角色位置来设置模型位置
         // 获取角色位置（从相机获取，角色位置在地面上）
@@ -2276,21 +2280,45 @@ void Renderer::UpdateConstantBuffers(float deltaTime)
         // ========================================================================
         // Shadow Map相关矩阵（光源视图和投影矩阵）
         // ========================================================================
-        // 使用动态光源位置
-        XMVECTOR lightPosForShadow = XMVectorSet(m_lightPosition.x, m_lightPosition.y, m_lightPosition.z, 1.0f);
-        XMVECTOR targetPos = XMVectorSet(0.0f, 0.0f, 0.0f, 1.0f); // 看向世界原点
+        // 使用方向光：方向光没有位置，只有方向
+        // LightView = LookAt(center - lightDir * d, center, up)
+        // 其中center是相机视锥体中心
+        
+        // 计算相机视锥体中心
+        XMVECTOR center;
+        if (m_camera)
+        {
+            // 使用角色位置作为中心（相机通常看向角色）
+            XMFLOAT3 charPos = GetCharacterPosition();
+            center = XMVectorSet(charPos.x, charPos.y, charPos.z, 1.0f);
+        }
+        else
+        {
+            // 如果没有相机，使用世界原点
+            center = XMVectorSet(0.0f, 0.0f, 0.0f, 1.0f);
+        }
+        
+        // 光源方向（从表面指向光源的方向，对于方向光需要取反）
+        // lightDir是从世界原点指向光源的，需要取反作为光的方向
+        XMVECTOR lightDirVec = XMVectorNegate(lightDir);
         
         // 光源向上方向（Y轴正方向）
         XMVECTOR lightUp = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
         
-        // 创建光源视图矩阵（从光源位置看向角色位置）
-        XMMATRIX lightViewMatrix = XMMatrixLookAtLH(lightPosForShadow, targetPos, lightUp);
+        // 计算"相机"位置：center - lightDir * d
+        // d是距离，选择足够大的值以确保覆盖整个场景
+        float d = 100.0f;  // 距离（米）
+        XMVECTOR lightEyePos = XMVectorSubtract(center, XMVectorScale(lightDirVec, d));
+        
+        // 创建方向光的视图矩阵
+        XMMATRIX lightViewMatrix = XMMatrixLookAtLH(lightEyePos, center, lightUp);
         
         // 创建光源投影矩阵（正交投影）
         // 对于角色阴影，使用适当的投影范围以增加精度
         // shadowMapSize需要平衡：太小则角色占比大但覆盖范围小，太大则覆盖范围大但角色占比小
         // 注意：这里的值必须与RenderShadowMap()中的值完全一致
-        float shadowMapSize = 500.0f;   // 增大范围以覆盖更大的地形（500x500米）
+        // 角色已缩小10倍（0.02倍），所以缩小shadowmap范围以便角色在shadowmap中占比更大
+        float shadowMapSize = 50.0f;   // 缩小范围以便角色阴影更清晰（50x50米）
         float nearPlane = 0.1f;       // 近裁剪平面（靠近光源）
         float farPlane = 300.0f;      // 远平面（从200米高到地形）
         XMMATRIX lightProjectionMatrix = XMMatrixOrthographicLH(shadowMapSize, shadowMapSize, nearPlane, farPlane);
@@ -4217,29 +4245,44 @@ void Renderer::RenderShadowMap()
     // 获取角色位置（不再需要，因为光源固定看向世界原点）
     // XMFLOAT3 charPos = GetCharacterPosition();
     
-    // 使用可控制的光源位置，与黄色立方体位置一致
-    XMVECTOR lightPos = XMVectorSet(m_lightPosition.x, m_lightPosition.y, m_lightPosition.z, 1.0f);
-
-    // 存储光源位置用于调试输出
-    XMFLOAT3 lightPosFloat;
-    XMStoreFloat3(&lightPosFloat, lightPos);
+    // 使用方向光：方向光没有位置，只有方向
+    // LightView = LookAt(center - lightDir * d, center, up)
+    // 其中center是相机视锥体中心
+    
+    // 计算相机视锥体中心（使用角色位置）
+    XMVECTOR center;
+    XMFLOAT3 charPos = GetCharacterPosition();
+    center = XMVectorSet(charPos.x, charPos.y, charPos.z, 1.0f);
+    
+    // 光源方向（从UpdateConstantBuffers中获取）
+    // 注意：这里需要重新计算lightDir，与UpdateConstantBuffers中的计算一致
+    XMVECTOR lightPosVec = XMVectorSet(m_lightPosition.x, m_lightPosition.y, m_lightPosition.z, 1.0f);
+    XMVECTOR targetPosVec = XMVectorSet(0.0f, 0.0f, 0.0f, 1.0f);
+    XMVECTOR lightDirVec = XMVector3Normalize(XMVectorSubtract(lightPosVec, targetPosVec));
+    // 方向光的方向：取反（从光源指向表面的方向）
+    lightDirVec = XMVectorNegate(lightDirVec);
+    
+    // 光源向上方向（Y轴正方向）
+    XMVECTOR lightUp = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+    
+    // 计算"相机"位置：center - lightDir * d
+    float d = 100.0f;  // 距离（米）
+    XMVECTOR lightEyePos = XMVectorSubtract(center, XMVectorScale(lightDirVec, d));
+    
+    // 创建方向光的视图矩阵
+    XMMATRIX lightView = XMMatrixLookAtLH(lightEyePos, center, lightUp);
+    
+    // 存储光源位置用于调试输出（仍使用m_lightPosition，用于显示黄色椎体）
+    XMFLOAT3 lightPosFloat = m_lightPosition;
     float lightX = lightPosFloat.x;
     float lightY = lightPosFloat.y;
     float lightZ = lightPosFloat.z;
-
-    // 目标位置固定（世界原点）
-    XMVECTOR targetPos = XMVectorSet(0.0f, 0.0f, 0.0f, 1.0f);
-
-    // 光源向上方向（Y轴正方向）
-    XMVECTOR lightUp = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
-
-    // 创建光源视图矩阵
-    XMMATRIX lightView = XMMatrixLookAtLH(lightPos, targetPos, lightUp);
     
     // 创建光源投影矩阵（正交投影）
     // 对于角色阴影，使用适当的投影范围以增加精度
     // shadowMapSize需要平衡：太小则角色占比大但覆盖范围小，太大则覆盖范围大但角色占比小
-    float shadowMapSize = 500.0f;   // 增大范围以覆盖更大的地形（500x500米）
+    // 角色已缩小10倍（0.02倍），所以缩小shadowmap范围以便角色在shadowmap中占比更大
+    float shadowMapSize = 50.0f;   // 缩小范围以便角色阴影更清晰（50x50米）
     float nearPlane = 0.1f;       // 近裁剪平面（靠近光源）
     float farPlane = 300.0f;      // 远平面（从200米高到地形）
     XMMATRIX lightProjection = XMMatrixOrthographicLH(shadowMapSize, shadowMapSize, nearPlane, farPlane);
@@ -4354,9 +4397,15 @@ void Renderer::RenderShadowMap()
             XMFLOAT3 charPos = GetCharacterPosition();
             
             // 获取模型的world矩阵（与正常渲染相同）
-            XMMATRIX scale = XMMatrixScaling(0.2f, 0.2f, 0.2f);
+            XMMATRIX scale = XMMatrixScaling(0.02f, 0.02f, 0.02f);
             XMMATRIX rotationX = XMMatrixRotationX(-XM_PI / 2.0f);
-            XMMATRIX rotationY = XMMatrixRotationY(XM_PI);
+            // 使用角色朝向（与正常渲染保持一致）
+            float characterYaw = 0.0f;
+            if (m_camera)
+            {
+                characterYaw = m_camera->GetCharacterYaw();
+            }
+            XMMATRIX rotationY = XMMatrixRotationY(characterYaw);
             XMMATRIX rotation = rotationX * rotationY;
             XMMATRIX translation = XMMatrixTranslation(charPos.x, charPos.y, charPos.z);
             XMMATRIX world = scale * rotation * translation;

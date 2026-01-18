@@ -37,6 +37,9 @@ public:
     // 获取角色位置
     DirectX::XMFLOAT3 GetCharacterPosition() const { return m_characterPosition; }
     
+    // 获取角色朝向
+    float GetCharacterYaw() const { return m_characterYaw; }
+    
     // 鼠标输入处理
     void OnMouseMove(int deltaX, int deltaY);
     void OnMouseWheel(int delta);
@@ -79,6 +82,9 @@ private:
     
     // 角色位置（第三人称视角时使用）
     DirectX::XMFLOAT3 m_characterPosition;
+    
+    // 角色朝向（地形跟随模式下，角色独立于相机的朝向）
+    float m_characterYaw;  // 角色左右旋转（弧度）
     
     // 相机旋转（俯仰角和偏航角）
     float m_pitch;  // 上下旋转（弧度）

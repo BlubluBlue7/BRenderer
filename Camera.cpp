@@ -19,6 +19,7 @@ inline float clamp(float value, float min, float max)
 Camera::Camera()
     : m_position(0.0f, 100.0f, 0.0f)     // 初始位置：地形中心附近，高度待地形查询后设置
     , m_characterPosition(0.0f, 0.0f, 0.0f)  // 角色初始位置：地形中心
+    , m_characterYaw(0.0f)                // 角色初始朝向：朝向+X方向
     , m_pitch(-0.3f)                      // 初始俯仰角：稍微向下看（第三人称视角）
     , m_yaw(0.0f)                         // 初始偏航角：朝向+X方向
     , m_moveSpeed(10.0f)                  // 移动速度：10米/秒（适合角色移动）
@@ -45,47 +46,33 @@ void Camera::Update(float deltaTime)
     // 限制俯仰角范围（避免翻转）
     m_pitch = clamp(m_pitch, -XM_PI / 2.0f + 0.1f, XM_PI / 2.0f - 0.1f);
     
-    // 计算移动方向（只考虑水平方向，不包含垂直移动）
-    XMFLOAT3 forward = GetForwardVector();
-    XMFLOAT3 right = GetRightVector();
-    
-    XMVECTOR moveDir = XMVectorSet(0.0f, 0.0f, 0.0f, 0.0f);
-    
-    // 前后移动（只使用水平分量）
-    XMVECTOR forwardVec = XMLoadFloat3(&forward);
-    XMVECTOR forwardHorizontal = XMVectorSetY(forwardVec, 0.0f);  // 移除垂直分量
-    float forwardLen = 0.0f;
-    XMStoreFloat(&forwardLen, XMVector3Length(forwardHorizontal));
-    if (forwardLen > 0.0001f)
-    {
-        forwardHorizontal = XMVector3Normalize(forwardHorizontal);
-    }
-    
-    if (m_moveForward)
-        moveDir = XMVectorAdd(moveDir, forwardHorizontal);
-    if (m_moveBackward)
-        moveDir = XMVectorSubtract(moveDir, forwardHorizontal);
-    
-    // 左右移动（只使用水平分量）
-    XMVECTOR rightVec = XMLoadFloat3(&right);
-    XMVECTOR rightHorizontal = XMVectorSetY(rightVec, 0.0f);  // 移除垂直分量
-    float rightLen = 0.0f;
-    XMStoreFloat(&rightLen, XMVector3Length(rightHorizontal));
-    if (rightLen > 0.0001f)
-    {
-        rightHorizontal = XMVector3Normalize(rightHorizontal);
-    }
-    
-    if (m_moveRight)
-        moveDir = XMVectorAdd(moveDir, rightHorizontal);
-    if (m_moveLeft)
-        moveDir = XMVectorSubtract(moveDir, rightHorizontal);
-    
     // 根据地形跟随模式处理移动
     if (m_followTerrain)
     {
         // 地形跟随模式（第三人称视角）：控制角色移动，相机跟随角色
-        // 忽略上下移动（Space/Ctrl）
+        // A/D 控制角色左右转向，W/S 控制角色朝向前后移动
+        
+        // A/D 控制角色转向（修改 m_characterYaw）
+        if (m_moveLeft)
+            m_characterYaw -= m_rotationSpeed * deltaTime;
+        if (m_moveRight)
+            m_characterYaw += m_rotationSpeed * deltaTime;
+        
+        // 根据角色朝向计算前进方向（水平方向）
+        float forwardX = sinf(m_characterYaw);
+        float forwardZ = cosf(m_characterYaw);
+        
+        XMVECTOR moveDir = XMVectorSet(0.0f, 0.0f, 0.0f, 0.0f);
+        
+        // W/S 控制角色前后移动（基于角色朝向）
+        if (m_moveForward)
+        {
+            moveDir = XMVectorAdd(moveDir, XMVectorSet(forwardX, 0.0f, forwardZ, 0.0f));
+        }
+        if (m_moveBackward)
+        {
+            moveDir = XMVectorSubtract(moveDir, XMVectorSet(forwardX, 0.0f, forwardZ, 0.0f));
+        }
         
         // 归一化移动方向并应用速度
         float length = 0.0f;
@@ -115,6 +102,43 @@ void Camera::Update(float deltaTime)
     }
     else
     {
+        // 自由相机模式：使用原来的移动逻辑（WASD 控制相机移动）
+        // 计算移动方向（只考虑水平方向，不包含垂直移动）
+        XMFLOAT3 forward = GetForwardVector();
+        XMFLOAT3 right = GetRightVector();
+        
+        XMVECTOR moveDir = XMVectorSet(0.0f, 0.0f, 0.0f, 0.0f);
+        
+        // 前后移动（只使用水平分量）
+        XMVECTOR forwardVec = XMLoadFloat3(&forward);
+        XMVECTOR forwardHorizontal = XMVectorSetY(forwardVec, 0.0f);  // 移除垂直分量
+        float forwardLen = 0.0f;
+        XMStoreFloat(&forwardLen, XMVector3Length(forwardHorizontal));
+        if (forwardLen > 0.0001f)
+        {
+            forwardHorizontal = XMVector3Normalize(forwardHorizontal);
+        }
+        
+        if (m_moveForward)
+            moveDir = XMVectorAdd(moveDir, forwardHorizontal);
+        if (m_moveBackward)
+            moveDir = XMVectorSubtract(moveDir, forwardHorizontal);
+        
+        // 左右移动（只使用水平分量）
+        XMVECTOR rightVec = XMLoadFloat3(&right);
+        XMVECTOR rightHorizontal = XMVectorSetY(rightVec, 0.0f);  // 移除垂直分量
+        float rightLen = 0.0f;
+        XMStoreFloat(&rightLen, XMVector3Length(rightHorizontal));
+        if (rightLen > 0.0001f)
+        {
+            rightHorizontal = XMVector3Normalize(rightHorizontal);
+        }
+        
+        if (m_moveRight)
+            moveDir = XMVectorAdd(moveDir, rightHorizontal);
+        if (m_moveLeft)
+            moveDir = XMVectorSubtract(moveDir, rightHorizontal);
+        
         // 自由相机模式：允许完全自由的移动，包括垂直移动
         XMFLOAT3 up = GetUpVector();
         if (m_moveUp)
@@ -291,12 +315,19 @@ void Camera::UpdateCharacterHeight()
 void Camera::UpdateCameraPositionForThirdPerson()
 {
     // 计算相机的目标位置：在角色后方一定距离
-    // 使用相机的偏航角来确定相机在角色后方的方向
+    // 使用角色的朝向（m_characterYaw）和相机的俯仰角（m_pitch）来确定相机在角色后方的方向
+    
+    // 根据俯仰角计算相机在垂直方向上的偏移
+    // pitch > 0: 相机在角色上方（俯视）
+    // pitch < 0: 相机在角色下方（仰视）
+    float horizontalDistance = m_thirdPersonDistance * cosf(m_pitch);
+    float verticalOffset = m_thirdPersonDistance * sinf(m_pitch);
     
     // 相机相对于角色的偏移方向（在角色后方）
-    float offsetX = -sinf(m_yaw) * m_thirdPersonDistance;
-    float offsetZ = -cosf(m_yaw) * m_thirdPersonDistance;
-    float offsetY = m_thirdPersonHeight;
+    // 使用角色朝向（m_characterYaw）而不是相机朝向（m_yaw），让相机跟随角色转动
+    float offsetX = -sinf(m_characterYaw) * horizontalDistance;
+    float offsetZ = -cosf(m_characterYaw) * horizontalDistance;
+    float offsetY = m_thirdPersonHeight + verticalOffset;
     
     // 计算相机位置（角色位置 + 偏移）
     m_position.x = m_characterPosition.x + offsetX;
