@@ -21,16 +21,8 @@ cbuffer LightBuffer : register(b1)
     float padding1c;
     
     float4 lightColor;
-    float padding1;
-    float padding1d;
-    float padding1e;
-    float padding1f;
     
     float4 cameraPosition;
-    float padding2;
-    float padding2a;
-    float padding2b;
-    float padding2c;
     
     float4 albedo;
     float metallic;
@@ -44,10 +36,9 @@ cbuffer LightBuffer : register(b1)
     float padding3c;
     
     float4 ambientColor;
-    float padding4;
-    float padding4a;
-    float padding4b;
-    float padding4c;
+    
+    // 光源位置（世界空间）
+    float4 lightPosition;  // 光源位置（世界空间）- 只使用xyz
     
     // Shadow Map相关矩阵
     float4x4 lightView;       // 光源视图矩阵
@@ -190,15 +181,9 @@ float4 PS(PSInput input) : SV_TARGET
     
     // 将世界坐标转换到光源空间
     float4 lightSpacePos = mul(float4(input.worldPos, 1.0), lightWorldViewProj);
-        // 直接转换到NDC空间（-1到1）
-    // 注意：正交投影的lightSpacePos已经在NDC空间附近，只需要确保在[-1,1]范围内
-    float3 ndcPos = lightSpacePos.xyz;
-
-    // 可选：缩放和平移以更好地观察
-    float2 uv = ndcPos.xy * 0.5 + 0.5;  // 转换到[0,1]范围
-    float depth = ndcPos.z;  // 正交投影的深度通常是[0,1]或[-1,1]
-
-    // 透视除法
+    
+    // 对于正交投影，需要透视除法（虽然w分量应该接近1.0）
+    // 但为了通用性，还是进行透视除法
     lightSpacePos.xyz /= lightSpacePos.w;
     
     // 转换到纹理坐标（0-1范围）
@@ -209,7 +194,8 @@ float4 PS(PSInput input) : SV_TARGET
     // 检查是否在shadow map范围内（使用更宽松的范围检查，与角色着色器一致）
     if (shadowUV.x >= -0.1 && shadowUV.x <= 1.1 && shadowUV.y >= -0.1 && shadowUV.y <= 1.1)
     {
-        // 深度值（在光源空间中的深度，对于正交投影，NDC的z值在[0, 1]范围内）
+        // 深度值（在光源空间中的深度，对于正交投影，透视除法后的z值在[0, 1]范围内）
+        // 注意：对于正交投影，NDC的z值范围是[0, 1]（左手法则），直接使用
         float lightDepth = lightSpacePos.z;
         
         // 确保深度值在有效范围内
@@ -309,30 +295,61 @@ float4 PS(PSInput input) : SV_TARGET
     // 否则使用正常渲染（不显示LOD颜色）
     
     // ========================================================================
-    // 调试选项：将地形渲染为光源空间下的深度值
+    // 调试选项：将地形渲染为光源空间坐标
     // ========================================================================
     if (showDepthDebug > 0.5)
     {
-        // 将世界坐标转换到光源视图空间
-        float4 lightViewPos = mul(float4(input.worldPos, 1.0), lightView);
-
-        // lightViewPos.z 是光源视图空间中的深度值
-        float depth = lightViewPos.z;
-
-        // 显示原始深度值（带符号）
-        // 正值显示为绿色，负值显示为红色，零显示为蓝色
-        if (depth > 0.1) {
-            // 正深度：绿色，亮度表示大小
-            float intensity = saturate(depth / 100.0);
-            return float4(0, intensity, 0, 1.0);
-        } else if (depth < -0.1) {
-            // 负深度：红色，亮度表示大小
-            float intensity = saturate(-depth / 100.0);
-            return float4(intensity, 0, 0, 1.0);
-        } else {
-            // 接近零的深度：蓝色
-            return float4(0, 0, 1, 1.0);
+        // 计算地形点到光源的世界空间距离
+        float3 lightPos = lightPosition.xyz;
+        float3 worldPos = input.worldPos;
+        
+        // 调试：如果光源位置为0或异常，直接显示红色
+        // 正常情况下光源位置不应该为(0,0,0)或接近0
+        if (length(lightPos) < 0.001)
+        {
+            // 光源位置异常，显示洋红色（便于识别）
+            return float4(1.0, 0.0, 1.0, 1.0);
         }
+        
+        float3 toLight = lightPos - worldPos;
+        float distance = length(toLight);
+        
+        // 将距离映射到颜色
+        // 使用较小的范围以便看到变化（假设地形在原点附近，光源在几百米外）
+        // 调整范围以适应实际距离
+        float minDistance = 0.0;      // 最小距离（米）
+        float maxDistance = 1000.0;   // 最大距离（米）- 缩小范围以便看到变化
+        float normalizedDistance = saturate((distance - minDistance) / (maxDistance - minDistance));
+        
+        // 使用距离值作为颜色
+        // 颜色渐变：近=红色，中=黄色，远=绿色，最远=蓝色
+        float3 color;
+        if (normalizedDistance < 0.25)
+        {
+            // 最近：红色到橙色
+            float t = normalizedDistance / 0.25;
+            color = lerp(float3(1.0, 0.0, 0.0), float3(1.0, 0.5, 0.0), t);
+        }
+        else if (normalizedDistance < 0.5)
+        {
+            // 近：橙色到黄色
+            float t = (normalizedDistance - 0.25) / 0.25;
+            color = lerp(float3(1.0, 0.5, 0.0), float3(1.0, 1.0, 0.0), t);
+        }
+        else if (normalizedDistance < 0.75)
+        {
+            // 中：黄色到绿色
+            float t = (normalizedDistance - 0.5) / 0.25;
+            color = lerp(float3(1.0, 1.0, 0.0), float3(0.0, 1.0, 0.0), t);
+        }
+        else
+        {
+            // 远：绿色到蓝色
+            float t = (normalizedDistance - 0.75) / 0.25;
+            color = lerp(float3(0.0, 1.0, 0.0), float3(0.0, 0.0, 1.0), t);
+        }
+        
+        return float4(color, 1.0);
     }
 
     // ========================================================================

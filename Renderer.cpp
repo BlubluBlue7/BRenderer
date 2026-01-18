@@ -85,12 +85,15 @@ struct alignas(16) LightBuffer
     
     XMFLOAT4 ambientColor;     // 环境光颜色 (16 bytes) - 只使用xyz分量，float4本身已对齐，无需额外padding
     
+    // 光源位置（世界空间）
+    XMFLOAT4 lightPosition;  // 光源位置（世界空间）- 只使用xyz，float4本身已对齐，无需额外padding (16 bytes)
+    
     // Shadow Map相关矩阵（添加到LightBuffer末尾）
     XMFLOAT4X4 lightView;       // 光源视图矩阵 (64 bytes)
     XMFLOAT4X4 lightProjection; // 光源投影矩阵 (64 bytes)
     XMFLOAT4X4 lightWorldViewProj; // 光源世界-视图-投影矩阵 (64 bytes) - 注意：这里使用单位world矩阵，因为地形world是单位矩阵
 
-    // 总共: 320 bytes (16字节的倍数)
+    // 总共: 336 bytes (16字节的倍数)
 };
 
 // ============================================================================
@@ -637,7 +640,8 @@ void Renderer::RenderFrame(float deltaTime)
     // ========================================================================
     // 步骤 6.6: 渲染草地系统（在地形之后渲染）
     // ========================================================================
-    RenderGrassSystem(deltaTime);
+    // 暂时关闭草地渲染，方便查看地形
+    // RenderGrassSystem(deltaTime);
 
     // ========================================================================
     // 步骤 6.7: 渲染光源可视化立方体
@@ -2215,6 +2219,21 @@ void Renderer::UpdateConstantBuffers(float deltaTime)
         lb->lightColor = XMFLOAT4(1.0f, 1.0f, 1.0f, 0.0f);  // 白色光
         lb->lightIntensity = 2.0f;                     // 光源强度（提高亮度）
         
+        // 光源位置（世界空间）
+        lb->lightPosition = XMFLOAT4(lightPosFloat.x, lightPosFloat.y, lightPosFloat.z, 0.0f);
+        
+        // 调试输出：检查光源位置是否正确传递（每5秒输出一次）
+        static int lightPosDebugFrame = 0;
+        if (lightPosDebugFrame % 300 == 0)  // 每5秒输出一次（假设60fps）
+        {
+            wchar_t lightPosMsg[256];
+            swprintf_s(lightPosMsg, L"[LightPos] Light position in buffer: (%.2f, %.2f, %.2f), m_lightPosition: (%.2f, %.2f, %.2f)\n",
+                      lb->lightPosition.x, lb->lightPosition.y, lb->lightPosition.z,
+                      m_lightPosition.x, m_lightPosition.y, m_lightPosition.z);
+            OutputDebugStringW(lightPosMsg);
+        }
+        lightPosDebugFrame++;
+        
         // ========================================================================
         // PBR 材质参数
         // ========================================================================
@@ -2271,7 +2290,7 @@ void Renderer::UpdateConstantBuffers(float deltaTime)
         // 对于角色阴影，使用适当的投影范围以增加精度
         // shadowMapSize需要平衡：太小则角色占比大但覆盖范围小，太大则覆盖范围大但角色占比小
         // 注意：这里的值必须与RenderShadowMap()中的值完全一致
-        float shadowMapSize = 50.0f;   // 缩小范围以让角色在阴影贴图中更大
+        float shadowMapSize = 500.0f;   // 增大范围以覆盖更大的地形（500x500米）
         float nearPlane = 0.1f;       // 近裁剪平面（靠近光源）
         float farPlane = 300.0f;      // 远平面（从200米高到地形）
         XMMATRIX lightProjectionMatrix = XMMatrixOrthographicLH(shadowMapSize, shadowMapSize, nearPlane, farPlane);
@@ -2283,6 +2302,32 @@ void Renderer::UpdateConstantBuffers(float deltaTime)
         XMStoreFloat4x4(&lb->lightView, XMMatrixTranspose(lightViewMatrix));
         XMStoreFloat4x4(&lb->lightProjection, XMMatrixTranspose(lightProjectionMatrix));
         XMStoreFloat4x4(&lb->lightWorldViewProj, XMMatrixTranspose(lightWorldViewProjMatrix));
+        
+        // 调试信息：输出光源方向和位置（每5秒输出一次）
+        static int lightDebugFrame = 0;
+        if (lightDebugFrame % 300 == 0)  // 每5秒输出一次（假设60fps）
+        {
+            XMFLOAT3 lightDirFloat3;
+            XMStoreFloat3(&lightDirFloat3, lightDir);
+            wchar_t debugMsg[512];
+            swprintf_s(debugMsg, L"[Light] Light pos: (%.2f, %.2f, %.2f), Light dir: (%.3f, %.3f, %.3f), Target: (0, 0, 0), ShadowMapSize: %.2f\n",
+                      lightPosFloat.x, lightPosFloat.y, lightPosFloat.z,
+                      lightDirFloat3.x, lightDirFloat3.y, lightDirFloat3.z,
+                      shadowMapSize);
+            OutputDebugStringW(debugMsg);
+            
+            // 输出矩阵信息用于调试
+            XMFLOAT4X4 lightViewFloat, lightProjFloat, lightWorldViewProjFloat;
+            XMStoreFloat4x4(&lightViewFloat, lightViewMatrix);
+            XMStoreFloat4x4(&lightProjFloat, lightProjectionMatrix);
+            XMStoreFloat4x4(&lightWorldViewProjFloat, lightWorldViewProjMatrix);
+            
+            wchar_t matrixMsg[512];
+            swprintf_s(matrixMsg, L"[Light] lightViewProj[3][3] (w分量): %.6f, lightProj[3][3]: %.6f\n",
+                      lightWorldViewProjFloat.m[3][3], lightProjFloat.m[3][3]);
+            OutputDebugStringW(matrixMsg);
+        }
+        lightDebugFrame++;
 
         m_context->Unmap(m_lightBuffer.Get(), 0);
     }
@@ -4194,7 +4239,7 @@ void Renderer::RenderShadowMap()
     // 创建光源投影矩阵（正交投影）
     // 对于角色阴影，使用适当的投影范围以增加精度
     // shadowMapSize需要平衡：太小则角色占比大但覆盖范围小，太大则覆盖范围大但角色占比小
-    float shadowMapSize = 50.0f;   // 缩小范围以让角色在阴影贴图中更大（50x50米）
+    float shadowMapSize = 500.0f;   // 增大范围以覆盖更大的地形（500x500米）
     float nearPlane = 0.1f;       // 近裁剪平面（靠近光源）
     float farPlane = 300.0f;      // 远平面（从200米高到地形）
     XMMATRIX lightProjection = XMMatrixOrthographicLH(shadowMapSize, shadowMapSize, nearPlane, farPlane);
