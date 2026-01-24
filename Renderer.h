@@ -29,6 +29,7 @@ class Camera;
 class Terrain;
 class TerrainNew;  // 前向声明
 class GrassSystem;  // 前向声明
+class WaterSystem;  // 前向声明
 
 class Renderer
 {
@@ -170,6 +171,9 @@ private:
     // 草地系统相关
     GrassSystem* m_grassSystem = nullptr;  // 草地系统对象
     
+    // 水体系统相关
+    WaterSystem* m_waterSystem = nullptr;  // 水体系统对象
+    
     int m_width = 0;
     int m_height = 0;
     std::wstring m_lastError;  // 最后的错误信息
@@ -237,6 +241,10 @@ private:
     // 草地系统相关函数
     bool InitializeGrassSystem();  // 初始化草地系统
     void RenderGrassSystem(float deltaTime = 0.016f);  // 渲染草地系统
+    
+    // 水体系统相关函数
+    bool InitializeWaterSystem();  // 初始化水体系统
+    void RenderWaterSystem(float deltaTime = 0.016f);  // 渲染水体系统
     
     // Shadow Map相关函数
     bool CreateShadowMap();  // 创建shadow map资源

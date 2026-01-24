@@ -40,8 +40,10 @@ public:
     // terrainSizeX, terrainSizeZ: 地形大小（世界空间单位）
     // spacing: 草之间的间距（世界空间单位，默认1.0）
     // getHeightFunc: 获取地形高度的函数（可以为nullptr，如果为nullptr则高度为0）
+    // includeFunc: 是否在该点生成草（返回true生成，false跳过；可用于剔除水域等）
     void GenerateGrassPositions(float terrainSizeX, float terrainSizeZ, float spacing = 1.0f, 
-                                std::function<float(float, float)> getHeightFunc = nullptr);
+                                std::function<float(float, float)> getHeightFunc = nullptr,
+                                std::function<bool(float, float, float)> includeFunc = nullptr);
 
 private:
     // 创建草的几何体（2个三角形组成一个面片）

@@ -48,6 +48,9 @@
     <ClCompile Include="Terrain.cpp">
       <Filter>BRenderer</Filter>
     </ClCompile>
+    <ClCompile Include="WaterSystem.cpp">
+      <Filter>BRenderer</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Camera.h">
@@ -72,6 +75,9 @@
       <Filter>BRenderer</Filter>
     </ClInclude>
     <ClInclude Include="Terrain.h">
+      <Filter>BRenderer</Filter>
+    </ClInclude>
+    <ClInclude Include="WaterSystem.h">
       <Filter>BRenderer</Filter>
     </ClInclude>
   </ItemGroup>

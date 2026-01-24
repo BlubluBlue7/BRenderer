@@ -651,7 +651,8 @@ void GrassSystem::Render(ID3D11DeviceContext* context, const XMFLOAT4X4& view, c
 // 生成多个草的位置，铺满整个地形
 // ============================================================================
 void GrassSystem::GenerateGrassPositions(float terrainSizeX, float terrainSizeZ, float spacing, 
-                                        std::function<float(float, float)> getHeightFunc)
+                                        std::function<float(float, float)> getHeightFunc,
+                                        std::function<bool(float, float, float)> includeFunc)
 {
     m_grassPositions.clear();
     
@@ -699,6 +700,12 @@ void GrassSystem::GenerateGrassPositions(float terrainSizeX, float terrainSizeZ,
             if (getHeightFunc)
             {
                 height = getHeightFunc(worldX, worldZ);
+            }
+
+            // 可选过滤：例如水域不生成草
+            if (includeFunc && !includeFunc(worldX, worldZ, height))
+            {
+                continue;
             }
             
             // 添加草的位置

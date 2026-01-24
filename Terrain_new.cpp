@@ -83,6 +83,30 @@ bool TerrainNew::CreateFromHeightmap(ID3D11Device* device, const std::wstring& h
     // 构建四叉树
     BuildQuadTree();
 
+     // 创建GPU Driven资源（如果启用）
+    if (m_useGPUDriven)
+    {
+        if (!CreateComputeShader(device))
+        {
+            OutputDebugStringW(L"[TerrainNew] Failed to create Compute Shader, GPU Driven disabled\n");
+            m_useGPUDriven = false;
+        }
+        else if (!CreateUnifiedBuffers(device))
+        {
+            OutputDebugStringW(L"[TerrainNew] Failed to create unified buffers, GPU Driven disabled\n");
+            m_useGPUDriven = false;
+        }
+        else if (!CreateGPUBuffers(device))
+        {
+            OutputDebugStringW(L"[TerrainNew] Failed to create GPU buffers, GPU Driven disabled\n");
+            m_useGPUDriven = false;
+        }
+        else
+        {
+            OutputDebugStringW(L"[TerrainNew] GPU Driven resources created successfully\n");
+        }
+    }
+
     wchar_t msg[256];
     swprintf_s(msg, L"[TerrainNew] Terrain created: %dx%d chunks, %dx%d grid\n",
                m_chunkCountX, m_chunkCountZ, m_params.gridWidth, m_params.gridHeight);

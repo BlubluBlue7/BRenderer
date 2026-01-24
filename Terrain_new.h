@@ -320,6 +320,10 @@ public:
     };
     const RenderStats& GetStats() const { return m_renderStats; }
 
+    // 暴露高度图资源（用于水体等系统在shader中采样地形高度）
+    ID3D11ShaderResourceView* GetHeightmapSRV() const { return m_heightmapSRV.Get(); }
+    ID3D11SamplerState* GetHeightmapSampler() const { return m_heightmapSampler.Get(); }
+
 private:
     // 加载高度图
     bool LoadHeightmap(const std::wstring& path);

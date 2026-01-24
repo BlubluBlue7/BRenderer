@@ -12,6 +12,7 @@
 #include "Terrain.h"
 #include "Terrain_new.h"
 #include "GrassSystem.h"
+#include "WaterSystem.h"
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
@@ -23,6 +24,7 @@
 #include <cstring>
 #include <memory>
 #include <algorithm>  // for std::max, std::transform
+#include <cfloat>
 
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "dxguid.lib")
@@ -285,7 +287,16 @@ bool Renderer::Initialize(HWND hwnd, int width, int height)
     }
     
     // ========================================================================
-    // 步骤 13.5: 初始化草地系统（必须在地形初始化之后）
+    // 步骤 13.5: 初始化水体系统（必须在地形初始化之后）
+    // 说明：草地生成需要知道水位，以便水域不生成草，因此水体先初始化
+    // ========================================================================
+    if (!InitializeWaterSystem())
+    {
+        OutputDebugStringW(L"Warning: Failed to initialize water system.\n");
+    }
+
+    // ========================================================================
+    // 步骤 13.6: 初始化草地系统（必须在地形初始化之后）
     // ========================================================================
     if (!InitializeGrassSystem())
     {
@@ -638,6 +649,11 @@ void Renderer::RenderFrame(float deltaTime)
     RenderTerrain();
     
     // ========================================================================
+    // 步骤 6.5.5: 渲染水体系统（在地形之后，草地之前）
+    // ========================================================================
+    RenderWaterSystem(deltaTime);
+    
+    // ========================================================================
     // 步骤 6.6: 渲染草地系统（在地形之后渲染）
     // ========================================================================
     RenderGrassSystem(deltaTime);
@@ -982,6 +998,14 @@ void Renderer::Cleanup()
         m_grassSystem->Cleanup();
         delete m_grassSystem;
         m_grassSystem = nullptr;
+    }
+    
+    // 释放水体系统
+    if (m_waterSystem)
+    {
+        m_waterSystem->Cleanup();
+        delete m_waterSystem;
+        m_waterSystem = nullptr;
     }
     
     // 释放地形
@@ -3765,14 +3789,21 @@ bool Renderer::InitializeGrassSystem()
         auto getHeightFunc = [this](float x, float z) -> float {
             return m_terrain->GetHeightAt(x, z);
         };
+
+        // 过滤：水域不生成草
+        float waterLevel = (m_waterSystem) ? m_waterSystem->GetWaterLevel() : -FLT_MAX;
+        auto includeFunc = [waterLevel](float x, float z, float height) -> bool {
+            // 水位以下（含水位）都认为是水域，不生成草
+            return height > waterLevel;
+        };
         
         // 生成草的位置，每隔1个单位创建一个
-        m_grassSystem->GenerateGrassPositions(terrainSizeX, terrainSizeZ, 1.0f, getHeightFunc);
+        m_grassSystem->GenerateGrassPositions(terrainSizeX, terrainSizeZ, 1.0f, getHeightFunc, includeFunc);
     }
     else
     {
         // 如果没有地形，生成默认位置的草（高度为0）
-        m_grassSystem->GenerateGrassPositions(1024.0f, 1024.0f, 1.0f, nullptr);
+        m_grassSystem->GenerateGrassPositions(1024.0f, 1024.0f, 1.0f, nullptr, nullptr);
         OutputDebugStringW(L"[GrassSystem] Warning: No terrain found, generating grass at height 0\n");
     }
     
@@ -3802,6 +3833,78 @@ void Renderer::RenderGrassSystem(float deltaTime)
     
     // 渲染草地（传递deltaTime用于动画）
     m_grassSystem->Render(m_context.Get(), view, projection, deltaTime);
+}
+
+// ============================================================================
+// 初始化水体系统
+// ============================================================================
+bool Renderer::InitializeWaterSystem()
+{
+    // 创建水体系统对象
+    m_waterSystem = new WaterSystem();
+    
+    // 初始化水体系统（需要地形对象来查询高度）
+    if (!m_waterSystem->Initialize(m_device.Get(), m_context.Get(), m_terrain))
+    {
+        OutputDebugStringW(L"[WaterSystem] Failed to initialize water system.\n");
+        delete m_waterSystem;
+        m_waterSystem = nullptr;
+        return false;
+    }
+    
+    OutputDebugStringW(L"[WaterSystem] Water system initialized successfully.\n");
+    return true;
+}
+
+// ============================================================================
+// 渲染水体系统
+// ============================================================================
+void Renderer::RenderWaterSystem(float deltaTime)
+{
+    if (!m_waterSystem || !m_camera)
+    {
+        return;
+    }
+    
+    // 获取相机的视图和投影矩阵
+    XMMATRIX viewMatrix = m_camera->GetViewMatrix();
+    float aspect = (float)m_width / (float)m_height;
+    XMMATRIX projMatrix = m_camera->GetProjectionMatrix(aspect);
+    
+    // 转换为XMFLOAT4X4
+    XMFLOAT4X4 view, projection;
+    XMStoreFloat4x4(&view, viewMatrix);
+    XMStoreFloat4x4(&projection, projMatrix);
+    
+    // 获取相机位置
+    XMFLOAT3 cameraPosition = m_camera->GetPosition();
+    
+    // 绑定LightBuffer常量缓冲区（水体shader需要光照信息）
+    if (m_lightBuffer)
+    {
+        m_context->PSSetConstantBuffers(1, 1, m_lightBuffer.GetAddressOf());
+    }
+    
+    // 绑定Shadow Map纹理和采样器（如果可用）
+    if (m_shadowMapSRV && m_shadowMapSamplerState)
+    {
+        // 绑定Shadow Map纹理到t1（水体shader中shadowMap在register(t1)）
+        m_context->PSSetShaderResources(1, 1, m_shadowMapSRV.GetAddressOf());
+        // 绑定Shadow Map采样器到s1（水体shader中shadowSampler在register(s1)）
+        m_context->PSSetSamplers(1, 1, m_shadowMapSamplerState.GetAddressOf());
+    }
+
+    // 绑定地形高度图到t0/s0（用于水域裁剪：只在低处显示）
+    if (m_terrain && m_terrain->GetHeightmapSRV() && m_terrain->GetHeightmapSampler())
+    {
+        ID3D11ShaderResourceView* hSRV = m_terrain->GetHeightmapSRV();
+        ID3D11SamplerState* hSamp = m_terrain->GetHeightmapSampler();
+        m_context->PSSetShaderResources(0, 1, &hSRV);
+        m_context->PSSetSamplers(0, 1, &hSamp);
+    }
+    
+    // 渲染水体（传递deltaTime用于未来动画）
+    m_waterSystem->Render(m_context.Get(), view, projection, cameraPosition, deltaTime);
 }
 
 // ============================================================================
